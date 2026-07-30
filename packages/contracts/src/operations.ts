@@ -3,11 +3,11 @@ export type OperationStatus = "pending" | "running" | "succeeded" | "partial" | 
 export type OperationStepStatus = "pending" | "running" | "succeeded" | "failed" | "skipped";
 
 export const queueNames = {
-  operations: "masterdns:operations",
-  health: "masterdns:health",
-  reconcile: "masterdns:reconcile",
-  sync: "masterdns:sync",
-  notifications: "masterdns:notifications",
+  operations: "masterdns-operations",
+  health: "masterdns-health",
+  reconcile: "masterdns-reconcile",
+  sync: "masterdns-sync",
+  notifications: "masterdns-notifications",
 } as const;
 
 export type OperationJob = { operationId: string };
@@ -21,7 +21,8 @@ export type HealthCheckJob = {
 export type PoolReconcileJob = {
   poolId: string;
   eventId: string;
-  trigger: "failure" | "recovery" | "rebalance" | "configuration";
+  trigger: "failure" | "recovery" | "rebalance" | "configuration" | "repair";
+  source?: OperationSource;
   endpointId?: string;
   force?: boolean;
 };

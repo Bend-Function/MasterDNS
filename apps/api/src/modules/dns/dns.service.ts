@@ -7,6 +7,7 @@ import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import { OperationsService } from "../operations/operations.service.js";
+import { normalizeRecordName } from "./dns-name.js";
 
 @Injectable()
 export class DnsService {
@@ -108,13 +109,4 @@ export class DnsService {
     if (!record || record.deletedAt) throw new NotFoundException("解析记录不存在");
     return record;
   }
-}
-
-function normalizeRecordName(record: DnsRecordInput, zoneName: string): DnsRecordInput {
-  const name = record.name.replace(/\.$/, "").toLowerCase();
-  const zone = zoneName.replace(/\.$/, "").toLowerCase();
-  if (name === "@" || name === zone) return { ...record, name: zone };
-  if (name.endsWith(`.${zone}`)) return { ...record, name };
-  if (!name.includes(".")) return { ...record, name: `${name}.${zone}` };
-  throw new ConflictException("主机记录不属于当前域名");
 }

@@ -17,6 +17,7 @@ import type { AuthUser } from "../../auth/auth.types.js";
 import { env } from "../../config/env.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
+import { normalizeDdnsSourceIp, parseDdnsBearerToken } from "./ddns-auth.js";
 import type { HeartbeatInput } from "./ddns.schemas.js";
 
 @Injectable()
@@ -121,7 +122,7 @@ export class DdnsService {
   }
 
   async heartbeat(authorization: string | undefined, input: HeartbeatInput, sourceIp: string) {
-    const token = bearerToken(authorization);
+    const token = parseDdnsBearerToken(authorization);
     const runtimeTokenHash = hashToken(token);
     const [owned] = await this.database.db.select({ agent: ddnsAgents, endpoint: endpoints, pool: endpointPools })
       .from(ddnsAgents).innerJoin(endpoints, eq(ddnsAgents.endpointId, endpoints.id))
@@ -133,7 +134,7 @@ export class DdnsService {
       )).limit(1);
     if (!owned) throw new UnauthorizedException("DDNS 运行 Token 无效或已吊销");
 
-    const inferred = normalizeSourceIp(sourceIp);
+    const inferred = normalizeDdnsSourceIp(sourceIp);
     const reported: { family: "4" | "6"; address: string }[] = [];
     if (input.ipv4) reported.push({ family: "4", address: input.ipv4 });
     if (input.ipv6) reported.push({ family: "6", address: input.ipv6 });
@@ -235,17 +236,6 @@ export class DdnsService {
     if (!row) throw new NotFoundException("DDNS 节点不存在");
     return row;
   }
-}
-
-function bearerToken(authorization: string | undefined): string {
-  const match = authorization?.match(/^Bearer\s+(.+)$/i);
-  if (!match?.[1] || match[1].length < 32 || match[1].length > 256) throw new UnauthorizedException("缺少有效的 DDNS 运行 Token");
-  return match[1];
-}
-
-function normalizeSourceIp(value: string): string | undefined {
-  const unwrapped = value.startsWith("::ffff:") ? value.slice(7) : value;
-  return isIP(unwrapped) ? unwrapped : undefined;
 }
 
 function publicAgent(agent: typeof ddnsAgents.$inferSelect) {

@@ -26,7 +26,7 @@
 | 密码 | Argon2id |
 | 凭证加密 | AES-256-GCM |
 | 实时更新 | Server-Sent Events |
-| 测试 | Vitest、Playwright、Testcontainers |
+| 测试 | Vitest、浏览器回归、真实 Provider 隔离脚本 |
 | 部署 | Docker Compose |
 
 ## 3. 代码组织
@@ -42,8 +42,7 @@ packages/
 ├── checkers/             # HTTP、TCP Checker 及扩展注册表
 ├── automation/           # 健康状态和 Pool 策略状态机
 ├── crypto/               # 凭证加解密、Token hash、签名
-├── contracts/            # DTO、事件、内部错误码
-└── observability/        # 日志、指标、trace、脱敏
+└── contracts/            # DTO、事件、内部错误码
 ```
 
 ## 4. 运行时拓扑
@@ -78,7 +77,7 @@ Web 不直接连接数据库或厂商。API 不执行长期检查。Worker 不�
 ### 5.2 Provider Accounts
 
 - 验证、加密和轮换 Cloudflare/阿里云凭证。
-- 创建按账号缓存的 SDK Client；凭证只在 Worker 内短暂解密。
+- 接入与轮换时短暂验证明文凭证；后续仅在 Worker 调用厂商时解密。
 - 账号停用后停止同步和写操作，但保留历史。
 
 ### 5.3 DNS Inventory
@@ -217,7 +216,7 @@ sequenceDiagram
 - 每个 Zone 的写操作串行化，避免同一远端记录竞争。
 - Operation 使用数据库唯一幂等键；Redis 锁只是性能优化。
 - Worker 获取任务后先比较期望版本，过期决策直接标记 `superseded`。
-- 使用事务外盒模式保存数据库事件，再可靠投递队列。
+- 先持久化 Operation/Delivery 状态，再投递队列；Worker 周期扫描数据库恢复未完成任务。
 
 ### 8.2 重试原则
 

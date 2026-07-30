@@ -107,6 +107,24 @@ describe("pool strategy", () => {
     expect(result.decisions).toEqual([]);
   });
 
+  it("repairs records without reassigning a healthy current endpoint", () => {
+    const result = evaluateStrategy(context({
+      trigger: "repair",
+      endpoints: endpoints.map((endpoint) => endpoint.id === "a" ? { ...endpoint, healthState: "healthy" } : endpoint),
+      bindings: [{ id: "site", originalEndpointId: "a", currentEndpointIds: ["c"] }],
+    }));
+    expect(result.decisions[0]).toMatchObject({ desiredEndpointIds: ["c"], reason: "rebalance" });
+  });
+
+  it("emits healthy-set repair decisions even when assignments are unchanged", () => {
+    const result = evaluateStrategy(context({
+      trigger: "repair",
+      strategy: "healthy_set",
+      bindings: [{ id: "site", currentEndpointIds: ["b", "c"] }],
+    }));
+    expect(result.decisions[0]?.desiredEndpointIds).toEqual(["b", "c"]);
+  });
+
   it("does not mutate caller assignment counts", () => {
     const input = endpoints.map((endpoint) => ({ ...endpoint }));
     evaluateStrategy(context({ selectionMode: "least_assigned", endpoints: input }));

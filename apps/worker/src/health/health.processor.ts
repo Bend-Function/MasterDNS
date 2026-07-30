@@ -173,7 +173,7 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
           .where(eq(endpointPools.id, target.pool.id));
       }
 
-      if (promoted) return { trigger: "configuration" as const, previous: observation.state, next: next.state };
+      if (promoted) return { trigger: "repair" as const, previous: observation.state, next: next.state };
       if (next.state === observation.state) return null;
       if (next.state === "unhealthy") return { trigger: "failure" as const, previous: observation.state, next: next.state };
       if (next.state === "healthy" && observation.state !== "healthy") return { trigger: "recovery" as const, previous: observation.state, next: next.state };
@@ -186,6 +186,9 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
         poolId: target.pool.id,
         eventId,
         trigger: transition.trigger,
+        source: target.address.state === "candidate" && target.address.source === "ddns"
+          ? "ddns"
+          : transition.trigger === "recovery" ? "recovery" : "failover",
         endpointId: target.endpoint.id,
       };
       const delay = recoveryReconcileDelayMs({

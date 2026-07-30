@@ -2,6 +2,7 @@ import { ArgumentsHost, Catch, HttpException, HttpStatus, type ExceptionFilter }
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { ProviderError } from "@masterdns/contracts";
 import { ZodError } from "zod";
+import { publicDatabaseError } from "./database-error.js";
 
 @Catch()
 export class ApiExceptionFilter implements ExceptionFilter {
@@ -32,6 +33,14 @@ export class ApiExceptionFilter implements ExceptionFilter {
       request.log.warn({ provider: exception.provider, code: exception.code }, "Provider request failed");
       return response.status(status).send({
         error: { code: exception.code, message: exception.message },
+        requestId: request.id,
+      });
+    }
+    const databaseError = publicDatabaseError(exception);
+    if (databaseError) {
+      request.log.warn({ code: databaseError.code }, "Database constraint rejected API request");
+      return response.status(databaseError.status).send({
+        error: { code: databaseError.code, message: databaseError.message },
         requestId: request.id,
       });
     }

@@ -6,6 +6,7 @@ import { dnsRecords, operationSteps, operations, providerAccounts, zones } from 
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
+import { sameDnsOperationRequest } from "./operation-idempotency.js";
 
 type DnsOperationInput = {
   ownerUserId: string;
@@ -27,6 +28,11 @@ export class OperationsService {
   constructor(private readonly database: DatabaseService, private readonly queues: QueueService) {}
 
   async createDnsOperation(input: DnsOperationInput) {
+    const stepInput = {
+      zoneExternalId: input.zoneExternalId,
+      ...(input.recordExternalId ? { recordExternalId: input.recordExternalId } : {}),
+      ...(input.record ? { record: input.record } : {}),
+    };
     const result = await this.database.db.transaction(async (tx) => {
       const [operation] = await tx.insert(operations).values({
         ownerUserId: input.ownerUserId,
@@ -42,6 +48,19 @@ export class OperationsService {
         const [existing] = await tx.select().from(operations).where(eq(operations.idempotencyKey, input.idempotencyKey)).limit(1);
         if (!existing) throw new Error("Idempotent operation lookup returned no row");
         if (existing.ownerUserId !== input.ownerUserId) throw new ConflictException("幂等键已被其他资源使用");
+        const [existingStep] = await tx.select().from(operationSteps).where(eq(operationSteps.operationId, existing.id)).limit(1);
+        if (existing.actorUserId !== input.actorUserId
+          || existing.source !== input.source
+          || !existingStep
+          || !sameDnsOperationRequest(existingStep, {
+            providerAccountId: input.providerAccountId,
+            zoneId: input.zoneId,
+            dnsRecordId: input.dnsRecordId,
+            action: input.action,
+            input: stepInput,
+          })) {
+          throw new ConflictException("幂等键已用于不同的 DNS 请求");
+        }
         return { operation: existing, created: false };
       }
       await tx.insert(operationSteps).values({
@@ -51,11 +70,7 @@ export class OperationsService {
         zoneId: input.zoneId,
         ...(input.dnsRecordId ? { dnsRecordId: input.dnsRecordId } : {}),
         action: input.action,
-        input: {
-          zoneExternalId: input.zoneExternalId,
-          ...(input.recordExternalId ? { recordExternalId: input.recordExternalId } : {}),
-          ...(input.record ? { record: input.record } : {}),
-        },
+        input: stepInput,
       });
       return { operation, created: true };
     });

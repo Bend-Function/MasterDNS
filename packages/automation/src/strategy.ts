@@ -24,7 +24,8 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
       && binding.originalEndpointId !== undefined
       && bindingHealthy.some((endpoint) => endpoint.id === binding.originalEndpointId)
       && !binding.currentEndpointIds.includes(binding.originalEndpointId);
-    const shouldSelect = context.trigger === "rebalance" || context.trigger === "configuration" || !currentHealthy || recoverOriginal;
+    const repairing = context.trigger === "repair";
+    const shouldSelect = context.trigger === "rebalance" || context.trigger === "configuration" || repairing || !currentHealthy || recoverOriginal;
     if (!shouldSelect) continue;
 
     for (const endpointId of binding.currentEndpointIds) {
@@ -34,7 +35,9 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
 
     const selected = recoverOriginal
       ? bindingHealthy.find((endpoint) => endpoint.id === binding.originalEndpointId)
-      : selectEndpoint(bindingHealthy, context.selectionMode, context.eventId, binding, cursor);
+      : repairing && currentHealthy
+        ? binding.currentEndpointIds.map((id) => bindingHealthy.find((endpoint) => endpoint.id === id)).find(Boolean)
+        : selectEndpoint(bindingHealthy, context.selectionMode, context.eventId, binding, cursor);
     if (!selected) {
       for (const endpointId of binding.currentEndpointIds) {
         const current = healthy.find((endpoint) => endpoint.id === endpointId);
@@ -51,12 +54,12 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
     }
     cursor = context.selectionMode === "round_robin" ? selected.id : cursor;
     selected.activeBindingCount += 1;
-    if (context.trigger !== "configuration" && binding.currentEndpointIds.length === 1 && binding.currentEndpointIds[0] === selected.id) continue;
+    if (!repairing && context.trigger !== "configuration" && binding.currentEndpointIds.length === 1 && binding.currentEndpointIds[0] === selected.id) continue;
     decisions.push({
       bindingId: binding.id,
       previousEndpointIds: binding.currentEndpointIds,
       desiredEndpointIds: [selected.id],
-      reason: recoverOriginal ? "recovery" : context.trigger === "rebalance" || context.trigger === "configuration" ? "rebalance" : "failure",
+      reason: recoverOriginal ? "recovery" : context.trigger === "rebalance" || context.trigger === "configuration" || repairing ? "rebalance" : "failure",
     });
   }
 
@@ -77,12 +80,12 @@ function evaluateHealthySet(context: StrategyContext, healthy: StrategyEndpoint[
     if (desired.length === 0) {
       return [{ bindingId: binding.id, previousEndpointIds: current, desiredEndpointIds: current, reason: "no_healthy_endpoint" }];
     }
-    if (context.trigger !== "configuration" && sameIds(current, desired)) return [];
+    if (context.trigger !== "configuration" && context.trigger !== "repair" && sameIds(current, desired)) return [];
     return [{
       bindingId: binding.id,
       previousEndpointIds: current,
       desiredEndpointIds: desired,
-      reason: context.trigger === "configuration" ? "rebalance" : desired.length > current.length ? "recovery" : "failure",
+      reason: context.trigger === "configuration" || context.trigger === "repair" ? "rebalance" : desired.length > current.length ? "recovery" : "failure",
     }];
   });
   return { eventId: context.eventId, decisions, noHealthyEndpoints };

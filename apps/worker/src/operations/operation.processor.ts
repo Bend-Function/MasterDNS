@@ -19,7 +19,7 @@ import {
   providerAccounts,
   zones,
 } from "@masterdns/db";
-import { providerRecordHash } from "@masterdns/providers";
+import { dnsRecordMatches, providerRecordHash } from "@masterdns/providers";
 import { Job, Worker } from "bullmq";
 import { z } from "zod";
 import { DatabaseService } from "../database.service.js";
@@ -246,7 +246,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
       if (!input.record || !input.recordExternalId) throw new ProviderError("Update step is incomplete", "validation_failed", adapter.provider);
       const existing = await adapter.getRecord(input.zoneExternalId, input.recordExternalId);
       if (!existing) throw new ProviderError("DNS record no longer exists", "not_found", adapter.provider);
-      remote = recordMatches(existing, input.record)
+      remote = dnsRecordMatches(existing, input.record)
         ? existing
         : await adapter.updateRecord(input.zoneExternalId, input.recordExternalId, input.record);
       remote = await verifyRemoteRecord(adapter, input.zoneExternalId, remote.externalId, input.record);
@@ -366,7 +366,7 @@ async function findMatchingRecord(adapter: Awaited<ReturnType<ProviderRuntimeSer
   let cursor: string | undefined;
   do {
     const page = await adapter.listRecords(zoneId, cursor);
-    const match = page.items.find((record) => recordMatches(record, expected));
+    const match = page.items.find((record) => dnsRecordMatches(record, expected));
     if (match) return match;
     cursor = page.nextCursor;
   } while (cursor);
@@ -380,34 +380,10 @@ async function verifyRemoteRecord(
   expected: DnsRecordInput,
 ): Promise<ProviderRecord> {
   const verified = await adapter.getRecord(zoneId, recordId);
-  if (!verified || !recordMatches(verified, expected)) {
+  if (!verified || !dnsRecordMatches(verified, expected)) {
     throw new ProviderError("DNS record did not match the desired state after write", "transient_failure", adapter.provider);
   }
   return verified;
-}
-
-export function recordMatches(record: ProviderRecord, expected: DnsRecordInput): boolean {
-  if (record.type !== expected.type
-    || normalizeName(record.name) !== normalizeName(expected.name)
-    || record.content !== expected.content
-    || record.ttl !== expected.ttl
-    || (record.priority ?? null) !== (expected.priority ?? null)) return false;
-  return Object.entries(expected.providerMetadata).every(([key, value]) => value === undefined || deepEqual(record.providerMetadata[key], value));
-}
-
-function normalizeName(value: string): string {
-  return value.toLowerCase().replace(/\.$/, "");
-}
-
-function deepEqual(left: unknown, right: unknown): boolean {
-  if (left === right) return true;
-  if (Array.isArray(left) && Array.isArray(right)) return left.length === right.length && left.every((item, index) => deepEqual(item, right[index]));
-  if (left && right && typeof left === "object" && typeof right === "object") {
-    const leftEntries = Object.entries(left as Record<string, unknown>);
-    const rightEntries = Object.entries(right as Record<string, unknown>);
-    return leftEntries.length === rightEntries.length && leftEntries.every(([key, value]) => deepEqual(value, (right as Record<string, unknown>)[key]));
-  }
-  return false;
 }
 
 function toDnsRecordValues(zoneId: string, record: ProviderRecord, management: "unmanaged" | "managed", poolId?: string): typeof dnsRecords.$inferInsert {

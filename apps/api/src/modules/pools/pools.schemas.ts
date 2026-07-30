@@ -51,6 +51,11 @@ export const createBindingSchema = z.object({
   ttl: z.number().int().min(1).max(2_147_483_647).default(60),
   providerMetadata: z.record(z.string(), z.unknown()).default({}),
   originalEndpointId: z.string().uuid().optional(),
+  takeoverExisting: z.boolean().default(false),
+}).superRefine((value, context) => {
+  if (value.takeoverExisting && !value.originalEndpointId) {
+    context.addIssue({ code: "custom", message: "接管现有记录时必须指定原始节点", path: ["originalEndpointId"] });
+  }
 });
 
 export const updateBindingSchema = z.object({

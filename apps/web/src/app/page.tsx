@@ -4,8 +4,9 @@ import { Activity, ArrowRight, Boxes, Cloud, FileClock, Network, ShieldAlert } f
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { ConsoleLayout } from "../components/console-layout";
+import { RelativeTime } from "../components/relative-time";
 import { ErrorState, LoadingState, MetricStrip, PageHeader, StatusBadge } from "../components/ui";
-import { api, formatDate, relativeTime, UI_PREVIEW } from "../lib/api";
+import { api, formatDate, UI_PREVIEW } from "../lib/api";
 import { demoAccounts, demoOperations, demoPools, demoZones } from "../lib/demo";
 import type { Operation, Pool, ProviderAccount, ZoneListRow } from "../lib/types";
 
@@ -46,7 +47,7 @@ function Dashboard({ data }: { data: DashboardData }) {
         <section className="surface">
           <header className="surface-header"><div><h2>IP Pool 状态</h2><p>当前自动化与分配概况</p></div><Link className="button button-ghost" href="/pools">查看全部 <ArrowRight size={14} /></Link></header>
           <div className="table-wrap"><table><thead><tr><th>Pool</th><th>策略</th><th>节点</th><th>域名</th><th>状态</th><th>最近协调</th></tr></thead><tbody>
-            {data.pools.map((pool) => <tr key={pool.id}><td><Link className="table-primary" href={`/pools/${pool.id}`}><strong>{pool.name}</strong><small>Revision {pool.policyRevision}</small></Link></td><td>{strategyLabel(pool.strategy)}</td><td>{pool.healthyEndpointCount ?? 0} / {pool.endpointCount ?? 0}</td><td>{pool.bindingCount ?? 0}</td><td><StatusBadge value={pool.enabled ? pool.state : "disabled"} /></td><td className="muted">{relativeTime(pool.lastReconciledAt)}</td></tr>)}
+            {data.pools.map((pool) => <tr key={pool.id}><td><Link className="table-primary" href={`/pools/${pool.id}`}><strong>{pool.name}</strong><small>Revision {pool.policyRevision}</small></Link></td><td>{strategyLabel(pool.strategy)}</td><td>{pool.healthyEndpointCount ?? 0} / {pool.endpointCount ?? 0}</td><td>{pool.bindingCount ?? 0}</td><td><StatusBadge value={pool.enabled ? pool.state : "disabled"} /></td><td className="muted"><RelativeTime value={pool.lastReconciledAt} /></td></tr>)}
           </tbody></table></div>
         </section>
         <section className="surface">

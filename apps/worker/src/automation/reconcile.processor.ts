@@ -17,10 +17,12 @@ import {
   providerAccounts,
   zones,
 } from "@masterdns/db";
+import { dnsRecordMatches } from "@masterdns/providers";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { Job, Worker } from "bullmq";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
+import { reconcileOperationSource } from "./reconcile-source.js";
 
 type PendingStep = {
   providerAccountId: string;
@@ -204,7 +206,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
 
       const [operation] = await tx.insert(operations).values({
         ownerUserId: pool.ownerUserId,
-        source: operationSource(job.data.trigger),
+        source: reconcileOperationSource(job.data),
         idempotencyKey,
         resourceType: "endpoint_pool",
         resourceId: pool.id,
@@ -277,7 +279,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
     const record = recordInput(binding, address.address);
     const metadata = managedMetadata(poolId, binding.id, endpointId, decision.previousEndpointIds, "single");
     if (currentRecord && !currentRecord.deletedAt) {
-      if (currentRecord.content !== address.address || current?.endpointId !== endpointId) {
+      if (!dnsRecordMatches(currentRecord, record) || current?.endpointId !== endpointId) {
         pending.push({
           providerAccountId: zone.providerAccountId,
           zoneId: zone.zone.id,
@@ -325,8 +327,9 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
       const address = requiredAddress(addresses, endpointId, binding.recordType);
       const assignment = assignments.find((item) => item.endpointId === endpointId);
       const currentRecord = assignment?.dnsRecordId ? records.get(assignment.dnsRecordId) : undefined;
+      const desiredRecord = recordInput(binding, address.address);
       const action = currentRecord && !currentRecord.deletedAt ? "update" : "create";
-      if (action === "update" && currentRecord?.content === address.address && assignment?.applied) continue;
+      if (action === "update" && currentRecord && dnsRecordMatches(currentRecord, desiredRecord) && assignment?.applied) continue;
       pending.push({
         providerAccountId: zone.providerAccountId,
         zoneId: zone.zone.id,
@@ -335,7 +338,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         input: {
           zoneExternalId: zone.zone.externalId,
           ...(currentRecord ? { recordExternalId: currentRecord.externalId } : {}),
-          record: recordInput(binding, address.address),
+          record: desiredRecord,
           ...managedMetadata(poolId, binding.id, endpointId, decision.previousEndpointIds, "set"),
         },
       });
@@ -380,11 +383,7 @@ function managedMetadata(poolId: string, bindingId: string, endpointId: string, 
 }
 
 function eventEvidence(job: PoolReconcileJob, policyRevision: number) {
-  return { eventId: job.eventId, trigger: job.trigger, policyRevision, force: job.force ?? false };
-}
-
-function operationSource(trigger: PoolReconcileJob["trigger"]): "failover" | "recovery" {
-  return trigger === "recovery" ? "recovery" : "failover";
+  return { eventId: job.eventId, trigger: job.trigger, source: reconcileOperationSource(job), policyRevision, force: job.force ?? false };
 }
 
 function reconcileEventType(trigger: PoolReconcileJob["trigger"]): string {

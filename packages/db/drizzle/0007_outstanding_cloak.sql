@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "domain_bindings_zone_fqdn_type_unique" ON "domain_bindings" USING btree ("zone_id","fqdn","record_type");

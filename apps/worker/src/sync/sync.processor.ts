@@ -60,7 +60,7 @@ export class SyncProcessor implements OnModuleInit, OnModuleDestroy {
       }
       for (const poolId of driftPools) {
         const eventId = randomUUID();
-        await this.queues.reconcile.add("reconcile-pool", { poolId, eventId, trigger: "configuration" }, {
+        await this.queues.reconcile.add("reconcile-pool", { poolId, eventId, trigger: "repair", source: "drift" }, {
           jobId: `reconcile-${eventId}`,
           attempts: 3,
           backoff: { type: "exponential", delay: 1_000 },

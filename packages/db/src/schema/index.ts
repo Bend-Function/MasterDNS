@@ -181,6 +181,7 @@ export const domainBindings = pgTable("domain_bindings", {
   ...timestamps,
 }, (table) => [
   uniqueIndex("domain_bindings_pool_fqdn_type_unique").on(table.poolId, table.fqdn, table.recordType),
+  uniqueIndex("domain_bindings_zone_fqdn_type_unique").on(table.zoneId, table.fqdn, table.recordType),
   index("domain_bindings_zone_idx").on(table.zoneId),
   check("domain_bindings_address_type", sql`${table.recordType} in ('A', 'AAAA')`),
 ]);

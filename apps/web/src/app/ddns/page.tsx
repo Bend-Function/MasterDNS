@@ -4,8 +4,9 @@ import { Ban, Copy, ExternalLink, RadioTower, RefreshCw } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
+import { RelativeTime } from "../../components/relative-time";
 import { Button, Dialog, EmptyState, IconButton, LoadingState, PageHeader, StatusBadge } from "../../components/ui";
-import { api, jsonBody, relativeTime, UI_PREVIEW } from "../../lib/api";
+import { api, jsonBody, UI_PREVIEW } from "../../lib/api";
 import { demoPoolDetail } from "../../lib/demo";
 import type { DdnsAgent, Endpoint, Pool, PoolDetail } from "../../lib/types";
 
@@ -110,7 +111,7 @@ export default function DdnsPage() {
           <td><Link href={`/pools/${row.pool.id}`}>{row.pool.name}</Link></td>
           <td><div className="address-stack">{current.map((address) => <span className="mono" key={address.id}>{address.address}</span>)}{candidate.length > 0 && <span className="status status-warning">候选待验证</span>}</div></td>
           <td><div className="table-primary"><StatusBadge value={row.agent.status} /><small>{row.agent.agentVersion ? `v${row.agent.agentVersion}` : row.agent.hasRuntimeToken ? "已兑换 Token" : "待安装"}</small></div></td>
-          <td className="muted">{relativeTime(row.agent.lastSeenAt)}</td>
+          <td className="muted"><RelativeTime value={row.agent.lastSeenAt} /></td>
           <td><StatusBadge value={row.endpoint.healthState} /></td>
           <td><div className="row-actions">
             <Button variant="ghost" icon={<RadioTower size={14} />} disabled={busyEndpointId === row.endpoint.id} onClick={() => void install(row)}>{row.agent.hasRuntimeToken ? "重装" : "安装"}</Button>

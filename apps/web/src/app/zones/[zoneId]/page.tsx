@@ -5,9 +5,10 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useMemo, useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../../components/console-layout";
+import { RelativeTime } from "../../../components/relative-time";
 import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState } from "../../../components/ui";
 import { useResource } from "../../../hooks/use-resource";
-import { api, jsonBody, relativeTime, UI_PREVIEW } from "../../../lib/api";
+import { api, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { demoNow, demoZones } from "../../../lib/demo";
 import type { DnsRecord, ZoneListRow } from "../../../lib/types";
 
@@ -166,7 +167,7 @@ export default function ZoneRecordsPage() {
         <td>{record.ttl === 1 ? "自动" : `${record.ttl}s`}</td>
         <td className="muted">{providerMetadataLabel(provider, record.providerMetadata)}</td>
         <td>{record.management === "managed" ? <span className="status status-warning"><LockKeyhole size={11} />Pool 受管</span> : <span className="status status-neutral"><i />手动</span>}</td>
-        <td className="muted">{relativeTime(record.lastSyncedAt)}</td>
+        <td className="muted"><RelativeTime value={record.lastSyncedAt} /></td>
         <td><div className="row-actions"><IconButton label="编辑记录" disabled={record.management === "managed"} onClick={() => openEditor(record)}><Edit3 size={15} /></IconButton><IconButton label="删除记录" disabled={record.management === "managed"} onClick={() => setDeleting(record)}><Trash2 size={15} /></IconButton></div></td>
       </tr>)}</tbody>
     </table></div>}

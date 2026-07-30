@@ -395,11 +395,17 @@ export class PoolsService {
     const pool = await this.findOwnedPool(actor, poolId);
     const endpoint = await this.findEndpoint(poolId, endpointId);
     const [assignment, binding] = await Promise.all([
-      this.database.db.select({ id: bindingAssignments.endpointId }).from(bindingAssignments).where(eq(bindingAssignments.endpointId, endpointId)).limit(1),
+      this.database.db.select({ id: bindingAssignments.endpointId }).from(bindingAssignments).where(and(
+        eq(bindingAssignments.endpointId, endpointId),
+        or(eq(bindingAssignments.desired, true), eq(bindingAssignments.applied, true)),
+      )).limit(1),
       this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.originalEndpointId, endpointId)).limit(1),
     ]);
     if (assignment.length > 0 || binding.length > 0) throw new ConflictException("节点仍被域名绑定引用，请先调整绑定或重新平衡");
-    await this.database.db.delete(endpoints).where(eq(endpoints.id, endpointId));
+    await this.database.db.transaction(async (tx) => {
+      await tx.delete(bindingAssignments).where(eq(bindingAssignments.endpointId, endpointId));
+      await tx.delete(endpoints).where(eq(endpoints.id, endpointId));
+    });
     await this.recordPolicyChange(actor, poolId, "endpoint.delete", endpoint, undefined, pool.ownerUserId);
     return { deleted: true };
   }
@@ -428,16 +434,56 @@ export class PoolsService {
     if (pool.strategy !== "healthy_set" && !input.originalEndpointId) throw new BadRequestException("该策略需要为域名指定原始节点");
     if (input.originalEndpointId) await this.findEndpoint(poolId, input.originalEndpointId);
     const fqdn = normalizeFqdn(input.fqdn, zone.nameAscii);
+    const [existingBindings, zoneRecords] = await Promise.all([
+      this.database.db.select({ id: domainBindings.id, poolId: domainBindings.poolId }).from(domainBindings).where(and(
+        eq(domainBindings.zoneId, input.zoneId),
+        eq(domainBindings.fqdn, fqdn),
+        eq(domainBindings.recordType, input.recordType),
+      )).limit(1),
+      this.database.db.select().from(dnsRecords).where(and(
+        eq(dnsRecords.zoneId, input.zoneId),
+        sql`lower(rtrim(${dnsRecords.name}, '.')) = ${fqdn}`,
+        eq(dnsRecords.type, input.recordType),
+        isNull(dnsRecords.deletedAt),
+      )),
+    ]);
+    const existingBinding = existingBindings[0];
+    const existingRecords = zoneRecords;
+    if (existingBinding) throw new ConflictException("该 DNS 记录已由另一个 IP Pool 管理");
+    if (!input.takeoverExisting && existingRecords.length > 0) {
+      throw new ConflictException("同名 DNS 记录已存在；如需纳入自动化，请启用接管现有记录");
+    }
+    if (input.takeoverExisting) {
+      if (!input.originalEndpointId) throw new BadRequestException("接管现有记录时必须指定原始节点");
+      if (existingRecords.length === 0) throw new BadRequestException("未找到可接管的同名记录，请先同步 Zone");
+      if (existingRecords.length > 1) throw new ConflictException("存在多条同名记录，无法安全接管；请先整理该 RRSet");
+      if (existingRecords[0]?.management !== "unmanaged") throw new ConflictException("该 DNS 记录已由其他自动化策略管理");
+    }
+    const { takeoverExisting, ...bindingInput } = input;
+    const takeoverRecord = takeoverExisting ? existingRecords[0] : undefined;
     const binding = await this.database.db.transaction(async (tx) => {
-      const [created] = await tx.insert(domainBindings).values({ ...input, fqdn, poolId }).returning();
+      const [created] = await tx.insert(domainBindings).values({ ...bindingInput, fqdn, poolId }).returning();
       if (!created) throw new Error("Binding insert returned no row");
       if (input.originalEndpointId) await tx.insert(bindingAssignments).values({
         domainBindingId: created.id,
         endpointId: input.originalEndpointId,
+        ...(takeoverRecord ? { dnsRecordId: takeoverRecord.id } : {}),
         desired: true,
-        applied: false,
+        applied: Boolean(takeoverRecord),
         reason: "configuration",
       });
+      if (takeoverRecord) {
+        const [claimed] = await tx.update(dnsRecords).set({
+          management: "managed",
+          managedByPoolId: poolId,
+          updatedAt: new Date(),
+        }).where(and(
+          eq(dnsRecords.id, takeoverRecord.id),
+          eq(dnsRecords.management, "unmanaged"),
+          isNull(dnsRecords.deletedAt),
+        )).returning({ id: dnsRecords.id });
+        if (!claimed) throw new ConflictException("现有 DNS 记录已被其他操作接管，请刷新后重试");
+      }
       return created;
     });
     await this.recordPolicyChange(actor, poolId, "binding.create", undefined, binding);
@@ -584,7 +630,7 @@ export class PoolsService {
 
   private async enqueueReconcile(poolId: string, trigger: PoolReconcileJob["trigger"], force = false) {
     const eventId = randomUUID();
-    await this.queues.reconcile.add("reconcile-pool", { poolId, eventId, trigger, force }, {
+    await this.queues.reconcile.add("reconcile-pool", { poolId, eventId, trigger, source: "user", force }, {
       jobId: `reconcile-${eventId}`,
       attempts: 3,
       backoff: { type: "exponential", delay: 1_000 },

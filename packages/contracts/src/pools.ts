@@ -22,7 +22,7 @@ export type StrategyBinding = {
 
 export type StrategyContext = {
   eventId: string;
-  trigger: "failure" | "recovery" | "rebalance" | "configuration";
+  trigger: "failure" | "recovery" | "rebalance" | "configuration" | "repair";
   strategy: PoolStrategy;
   selectionMode: SelectionMode;
   recoveryMode: RecoveryMode;

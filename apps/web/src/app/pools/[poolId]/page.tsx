@@ -22,6 +22,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../../components/console-layout";
+import { RelativeTime } from "../../../components/relative-time";
 import {
   Button,
   Dialog,
@@ -34,7 +35,7 @@ import {
   StatusBadge,
 } from "../../../components/ui";
 import { useResource } from "../../../hooks/use-resource";
-import { api, formatDate, jsonBody, relativeTime, UI_PREVIEW } from "../../../lib/api";
+import { api, formatDate, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { demoPoolDetail, demoZones } from "../../../lib/demo";
 import type { Binding, Endpoint, HealthCheck, Pool, PoolDetail, ZoneListRow } from "../../../lib/types";
 
@@ -54,6 +55,7 @@ type BindingDraft = {
   recordType: Binding["recordType"];
   ttl: number;
   originalEndpointId: string;
+  takeoverExisting: boolean;
   proxied: boolean;
   aliLine: string;
   aliWeight: string;
@@ -108,6 +110,7 @@ const bindingInitial: BindingDraft = {
   recordType: "A",
   ttl: 60,
   originalEndpointId: "",
+  takeoverExisting: false,
   proxied: false,
   aliLine: "default",
   aliWeight: "",
@@ -225,6 +228,7 @@ export default function PoolDetailPage() {
       recordType: binding.recordType,
       ttl: binding.ttl,
       originalEndpointId: binding.originalEndpointId ?? "",
+      takeoverExisting: false,
       proxied: binding.providerMetadata.proxied === true,
       aliLine: typeof binding.providerMetadata.line === "string" ? binding.providerMetadata.line : "default",
       aliWeight: typeof binding.providerMetadata.weight === "number" ? String(binding.providerMetadata.weight) : "",
@@ -245,6 +249,7 @@ export default function PoolDetailPage() {
         ttl: bindingDraft.ttl,
         providerMetadata,
         originalEndpointId: bindingDraft.originalEndpointId || undefined,
+        takeoverExisting: bindingDraft.takeoverExisting,
       })
       : bindingEditor
         ? await mutate(`/v1/pools/${poolId}/bindings/${bindingEditor.id}`, "PATCH", {
@@ -381,7 +386,7 @@ export default function PoolDetailPage() {
       { label: "节点", value: data.endpoints.length, detail: `${data.endpoints.filter((endpoint) => endpoint.healthState === "healthy").length} 个健康` },
       { label: "域名绑定", value: data.bindings.length, detail: `${new Set(data.bindings.map((binding) => binding.provider)).size} 个云厂商` },
       { label: "活动故障", value: unhealthy, detail: unhealthy ? "自动化正在接管" : "当前正常" },
-      { label: "最近协调", value: relativeTime(pool.lastReconciledAt), detail: `策略版本 ${pool.policyRevision}` },
+      { label: "最近协调", value: <RelativeTime value={pool.lastReconciledAt} />, detail: `策略版本 ${pool.policyRevision}` },
     ]} />
 
     <nav className="tabs" aria-label="Pool 详情">
@@ -401,7 +406,7 @@ export default function PoolDetailPage() {
           <td>{endpoint.addressMode === "ddns" ? <span><RadioTower size={13} /> DDNS</span> : "静态"}</td>
           <td><StatusBadge value={endpoint.healthState} /></td>
           <td><span className="muted">+{endpoint.consecutiveSuccesses} / -{endpoint.consecutiveFailures}</span></td>
-          <td className="muted">{relativeTime(endpoint.lastCheckedAt)}</td>
+          <td className="muted"><RelativeTime value={endpoint.lastCheckedAt} /></td>
           <td><div className="row-actions">
             <IconButton label="立即检查" disabled={busy} onClick={() => void mutate(`/v1/pools/${poolId}/endpoints/${endpoint.id}/check`)}><Activity size={15} /></IconButton>
             {endpoint.addressMode === "ddns" && <IconButton label="安装 DDNS Agent" disabled={busy} onClick={() => void installAgent(endpoint)}><RadioTower size={15} /></IconButton>}
@@ -467,8 +472,9 @@ export default function PoolDetailPage() {
         <Field label="Zone"><select value={bindingDraft.zoneId} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, zoneId: event.target.value })} required><option value="">选择 Zone</option>{zones.data?.map((row) => <option key={row.zone.id} value={row.zone.id}>{row.zone.nameAscii} · {row.provider}</option>)}</select></Field>
         <Field label="记录类型"><select value={bindingDraft.recordType} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, recordType: event.target.value as Binding["recordType"] })}><option>A</option><option>AAAA</option></select></Field>
         <Field label="完整域名"><input placeholder="api.example.com" value={bindingDraft.fqdn} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, fqdn: event.target.value })} required /></Field>
-        <Field label="原始节点"><select value={bindingDraft.originalEndpointId} onChange={(event) => setBindingDraft({ ...bindingDraft, originalEndpointId: event.target.value })} required={pool.strategy !== "healthy_set"}><option value="">{pool.strategy === "healthy_set" ? "由健康集合决定" : "选择节点"}</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
+        <Field label="原始节点"><select value={bindingDraft.originalEndpointId} onChange={(event) => setBindingDraft({ ...bindingDraft, originalEndpointId: event.target.value })} required={pool.strategy !== "healthy_set" || bindingDraft.takeoverExisting}><option value="">{pool.strategy === "healthy_set" ? "由健康集合决定" : "选择节点"}</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
         <Field label="TTL"><input type="number" min={1} value={bindingDraft.ttl} onChange={(event) => setBindingDraft({ ...bindingDraft, ttl: Number(event.target.value) })} /></Field>
+        {bindingEditor === "new" && <label className="switch-row"><span>接管现有同名记录</span><button type="button" className={`switch ${bindingDraft.takeoverExisting ? "on" : ""}`} aria-label="切换接管现有同名记录" onClick={() => setBindingDraft({ ...bindingDraft, takeoverExisting: !bindingDraft.takeoverExisting })} /></label>}
         {selectedProvider === "cloudflare" && <label className="switch-row"><span>Cloudflare Proxy</span><button type="button" className={`switch ${bindingDraft.proxied ? "on" : ""}`} aria-label="切换 Cloudflare Proxy" onClick={() => setBindingDraft({ ...bindingDraft, proxied: !bindingDraft.proxied })} /></label>}
         {selectedProvider === "aliyun" && <><Field label="解析线路"><input value={bindingDraft.aliLine} onChange={(event) => setBindingDraft({ ...bindingDraft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={bindingDraft.aliWeight} onChange={(event) => setBindingDraft({ ...bindingDraft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={bindingDraft.aliStatus} onChange={(event) => setBindingDraft({ ...bindingDraft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
         {bindingEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" checked={bindingDraft.forceApply} onChange={(event) => setBindingDraft({ ...bindingDraft, forceApply: event.target.checked })} /></label>}

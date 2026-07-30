@@ -1,7 +1,7 @@
 "use client";
 
 import { Eye, RefreshCw, RotateCcw, Search } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
 import { Button, Dialog, ErrorState, IconButton, LoadingState, PageHeader, StatusBadge } from "../../components/ui";
 import { useResource } from "../../hooks/use-resource";
@@ -17,9 +17,22 @@ export default function OperationsPage() {
   const [actionPending, setActionPending] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [confirmRollback, setConfirmRollback] = useState(false);
+  const deepLinkHandled = useRef(false);
   const rows = useMemo(() => (data ?? []).filter((operation) => `${operation.id} ${operation.source} ${operation.status} ${operation.resourceType}`.toLowerCase().includes(search.toLowerCase())), [data, search]);
-  const close = () => { setSelected(null); setConfirmRollback(false); setActionError(null); };
-  const open = async (operation: Operation) => {
+  const close = () => {
+    setSelected(null);
+    setConfirmRollback(false);
+    setActionError(null);
+    const url = new URL(window.location.href);
+    url.searchParams.delete("id");
+    window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+  };
+  const open = useCallback(async (operation: Operation, updateLocation = true) => {
+    if (updateLocation) {
+      const url = new URL(window.location.href);
+      url.searchParams.set("id", operation.id);
+      window.history.replaceState(null, "", `${url.pathname}${url.search}${url.hash}`);
+    }
     setSelected(operation);
     setActionError(null);
     if (UI_PREVIEW) {
@@ -34,7 +47,19 @@ export default function OperationsPage() {
     } finally {
       setDetailLoading(false);
     }
-  };
+  }, []);
+  useEffect(() => {
+    if (loading || deepLinkHandled.current) return;
+    deepLinkHandled.current = true;
+    const operationId = new URLSearchParams(window.location.search).get("id");
+    if (!operationId) return;
+    const operation = data?.find((item) => item.id === operationId);
+    if (operation) {
+      Promise.resolve().then(() => void open(operation, false));
+      return;
+    }
+    Promise.resolve().then(() => setActionError("找不到指定的 Operation，可能已超出当前查询范围"));
+  }, [data, loading, open]);
   const action = async (kind: "retry" | "rollback") => {
     if (!selected) return;
     if (UI_PREVIEW) { close(); return; }
@@ -50,7 +75,7 @@ export default function OperationsPage() {
       setActionPending(false);
     }
   };
-  return <ConsoleLayout><PageHeader title="变更历史" description="每次人工与自动 DNS 写入均有独立状态和远端验证" actions={<Button variant="secondary" icon={<RefreshCw size={14} />} onClick={() => void reload()}>刷新</Button>} /><div className="toolbar"><div className="toolbar-left"><label className="search-box"><Search size={15} /><input aria-label="搜索变更" placeholder="Operation ID、来源或状态" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div><div className="toolbar-right"><span className="muted">永久保留审计历史</span></div></div>{loading ? <div className="surface"><LoadingState /></div> : error ? <div className="surface"><ErrorState message={error} /></div> : <div className="table-wrap"><table><thead><tr><th>Operation</th><th>来源</th><th>资源</th><th>状态</th><th>开始</th><th>完成</th><th aria-label="操作" /></tr></thead><tbody>{rows.map((operation) => <tr key={operation.id}><td><div className="table-primary"><strong className="mono">{operation.id.slice(0, 18)}</strong><small>{operation.id}</small></div></td><td>{sourceLabel(operation.source)}</td><td>{operation.resourceType}</td><td><StatusBadge value={operation.status} />{operation.errorCode && <div className="muted">{operation.errorCode}</div>}</td><td className="muted">{formatDate(operation.startedAt ?? operation.createdAt)}</td><td className="muted">{formatDate(operation.finishedAt)}</td><td><IconButton label="查看操作详情" onClick={() => void open(operation)}><Eye size={15} /></IconButton></td></tr>)}</tbody></table></div>}
+  return <ConsoleLayout><PageHeader title="变更历史" description="每次人工与自动 DNS 写入均有独立状态和远端验证" actions={<Button variant="secondary" icon={<RefreshCw size={14} />} onClick={() => void reload()}>刷新</Button>} />{actionError && selected === null && <div className="inline-error" role="alert">{actionError}</div>}<div className="toolbar"><div className="toolbar-left"><label className="search-box"><Search size={15} /><input aria-label="搜索变更" placeholder="Operation ID、来源或状态" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div><div className="toolbar-right"><span className="muted">永久保留审计历史</span></div></div>{loading ? <div className="surface"><LoadingState /></div> : error ? <div className="surface"><ErrorState message={error} /></div> : <div className="table-wrap"><table><thead><tr><th>Operation</th><th>来源</th><th>资源</th><th>状态</th><th>开始</th><th>完成</th><th aria-label="操作" /></tr></thead><tbody>{rows.map((operation) => <tr key={operation.id}><td><div className="table-primary"><strong className="mono">{operation.id.slice(0, 18)}</strong><small>{operation.id}</small></div></td><td>{sourceLabel(operation.source)}</td><td>{operation.resourceType}</td><td><StatusBadge value={operation.status} />{operation.errorCode && <div className="muted">{operation.errorCode}</div>}</td><td className="muted">{formatDate(operation.startedAt ?? operation.createdAt)}</td><td className="muted">{formatDate(operation.finishedAt)}</td><td><IconButton label="查看操作详情" onClick={() => void open(operation)}><Eye size={15} /></IconButton></td></tr>)}</tbody></table></div>}
     <Dialog open={selected !== null} title={confirmRollback ? "确认创建回滚" : "Operation 详情"} size="large" onClose={close} footer={confirmRollback
       ? <><Button variant="danger" icon={<RotateCcw size={14} />} disabled={actionPending} onClick={() => void action("rollback")}>{actionPending ? "提交中" : "确认回滚"}</Button><Button variant="secondary" disabled={actionPending} onClick={() => setConfirmRollback(false)}>取消</Button></>
       : <>{selected && ["failed", "partial"].includes(selected.status) && <Button variant="secondary" icon={<RefreshCw size={14} />} disabled={actionPending} onClick={() => void action("retry")}>{actionPending ? "提交中" : "重试失败项"}</Button>}{selected?.status === "succeeded" && selected.resourceType === "dns_record" && <Button icon={<RotateCcw size={14} />} onClick={() => setConfirmRollback(true)}>创建回滚操作</Button>}<Button variant="secondary" onClick={close}>关闭</Button></>}>

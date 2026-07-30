@@ -2,6 +2,7 @@ import { Controller, Get, Headers, Param, Post, Query } from "@nestjs/common";
 import { z } from "zod";
 import { CurrentUser } from "../../auth/auth.decorators.js";
 import type { AuthUser } from "../../auth/auth.types.js";
+import { parseIdempotencyKey } from "../../common/idempotency.js";
 import { OperationsService } from "./operations.service.js";
 
 @Controller("v1/operations")
@@ -19,7 +20,7 @@ export class OperationsController {
 
   @Post(":id/rollback")
   rollback(@CurrentUser() actor: AuthUser, @Param("id") id: string, @Headers("idempotency-key") key?: string) {
-    return this.operations.rollback(actor, id, key);
+    return this.operations.rollback(actor, id, parseIdempotencyKey(key));
   }
 
   @Post(":id/retry")
