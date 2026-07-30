@@ -11,7 +11,7 @@
 ## 2. 准备配置
 
 ```bash
-cp .env.example .env
+install -m 0600 .env.example .env
 openssl rand -base64 32   # MASTER_ENCRYPTION_KEY
 openssl rand -hex 24      # 可用作 POSTGRES_PASSWORD
 ```
@@ -28,9 +28,11 @@ PUBLIC_API_URL=https://dns-api.example.internal
 NEXT_PUBLIC_API_URL=https://dns-api.example.internal
 ```
 
-Compose 会用 `POSTGRES_PASSWORD` 生成容器内的 `DATABASE_URL`；本地直接运行 API 时才需要单独设置 `DATABASE_URL`，密码中的 URL 保留字符必须进行百分号编码。`.env` 权限建议设为 `0600`。`MASTER_ENCRYPTION_KEY` 丢失后无法解密已保存的云凭证，必须与数据库备份分开保管。
+Compose 会将 `POSTGRES_PASSWORD` 作为独立的 `PGPASSWORD` 参数传给应用，因此可安全使用 URL 保留字符。本地直接运行 API 时可设置 `DATABASE_URL`，其中密码的 URL 保留字符必须进行百分号编码；也可以设置完整的 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER` 和 `PGPASSWORD`。上述命令会以 `0600` 权限创建 `.env`。`MASTER_ENCRYPTION_KEY` 丢失后无法解密已保存的云凭证，必须与数据库备份分开保管。
 
 `TRUSTED_PROXY_CIDRS` 只能填写实际反向代理网段。未使用反向代理时保留 loopback 默认值；不要设置为 `0.0.0.0/0` 或 `::/0`。
+
+健康检查和 Webhook 默认拒绝 private、loopback、link-local 与保留地址。确需探测内网节点时只设置 `ALLOW_PRIVATE_HEALTH_TARGETS=true`；只有确认所有普通用户都可信且内部接收端可安全接受签名 POST 时，才设置 `ALLOW_PRIVATE_WEBHOOK_TARGETS=true`。两个开关都不会放行 loopback、link-local 或保留地址。
 
 ## 3. 启动与检查
 
@@ -45,7 +47,7 @@ curl -fsS http://127.0.0.1:${API_PORT:-4000}/api/health
 
 `migrate` 必须以成功状态退出，`postgres`、`redis`、`api`、`worker` 和 `web` 应保持运行或健康。首次登录后立即确认管理员密码，并从“用户管理”创建日常使用账号。
 
-默认端口仅便于本机验收。正式环境应由反向代理终止 TLS，不应将 PostgreSQL 或 Redis 暴露到宿主机或公网。
+默认端口仅绑定 `127.0.0.1`，便于本机验收和同机反向代理接入。反向代理位于其他主机时，可将 `BIND_ADDRESS` 改为指定内网地址，并通过防火墙限制来源。正式环境应由反向代理终止 TLS，不应将 PostgreSQL 或 Redis 暴露到宿主机或公网。
 
 ## 4. 反向代理要求
 
@@ -79,7 +81,14 @@ sudo journalctl -u masterdns-ddns.service -n 100 --no-pager
 
 ```bash
 docker compose exec -T postgres pg_dump -U masterdns -d masterdns -Fc > masterdns.dump
-docker compose exec -T postgres pg_restore --clean --if-exists -U masterdns -d masterdns < masterdns.dump
+
+# 恢复窗口：先停止所有可能触发数据库写入的服务和 Web 入口
+docker compose stop web api worker migrate
+docker compose exec -T postgres pg_restore --clean --if-exists --exit-on-error -U masterdns -d masterdns < masterdns.dump
+docker compose run --rm migrate node packages/db/dist/preflight-cli.js
+docker compose run --rm migrate
+docker compose start api worker web
+docker compose ps
 ```
 
 恢复操作会覆盖目标数据库，应只在明确的恢复窗口执行。完整恢复需要同时具备数据库备份和对应的 `MASTER_ENCRYPTION_KEY`；Redis 卷可以重建，Worker 会扫描未完成的 Operation 与通知投递并重新入队。
@@ -91,16 +100,19 @@ docker compose exec -T postgres pg_restore --clean --if-exists -U masterdns -d m
 ```bash
 git pull --ff-only
 docker compose build
+docker compose run --rm --no-deps migrate node packages/db/dist/preflight-cli.js
 docker compose up -d
 docker compose ps
 docker compose logs --since=10m migrate api worker
 ```
 
+升级预检是只读操作。若它报告同一 Zone、FQDN 和记录类型被多个 Pool 绑定，应在旧版本仍运行时根据报告中的 Binding/Pool ID 保留一个业务上正确的绑定，并删除或改名其他绑定；预检不会替操作员选择或删除数据。重复运行预检直至通过后再执行 `docker compose up -d`。健康检查唯一约束升级会按 `updated_at`、`created_at`、`id` 顺序保留每个 scope 最新的启用配置，并自动禁用其余旧配置。
+
 migration 只向前执行。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。不要只回退代码而忽略数据库兼容性。
 
 ## 9. 常见检查
 
-- API 不健康：检查 `postgres`、`redis` 与 `migrate` 日志以及 `DATABASE_URL`。
+- API 不健康：检查 `postgres`、`redis` 与 `migrate` 日志以及 `DATABASE_URL` 或 `PG*` 数据库配置。
 - 无法登录：确认访问协议为 HTTPS、`WEB_URL` 与浏览器 Origin 完全一致，Cookie 未被代理删除。
 - Zone 不同步：检查云账号最小权限、账号状态和 Worker 日志。
 - DDNS heartbeat 401：重新生成安装 Token 并安装，或检查 Agent 是否已被吊销。

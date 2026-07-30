@@ -142,19 +142,52 @@ export class AliyunDnsAdapter implements DnsProviderAdapter {
 
   async createRecord(zoneExternalId: string, input: DnsRecordInput): Promise<ProviderRecord> {
     return this.wrap(async () => {
+      const metadata = validateAliyunMetadata(input.providerMetadata);
       const response = await this.client.addDomainRecord(new AddDomainRecordRequest(toAliyunInput(zoneExternalId, input)));
       const recordId = response.body?.recordId;
       if (!recordId) throw new ProviderError("Aliyun did not return the created record ID", "unknown_provider_error", this.provider);
-      await this.applyMetadata(recordId, input);
+      try {
+        await this.applyMetadata(recordId, metadata);
+      } catch (error) {
+        try {
+          await this.client.deleteDomainRecord(new DeleteDomainRecordRequest({ recordId }));
+        } catch (cleanupError) {
+          throw new ProviderError(`Aliyun DNS record ${recordId} was partially created and cleanup failed`, "unknown_provider_error", this.provider, {
+            retryable: false,
+            cause: new AggregateError([error, cleanupError]),
+          });
+        }
+        throw error;
+      }
       return (await this.getRecord(zoneExternalId, recordId)) ?? recordFromInput(recordId, zoneExternalId, input);
     });
   }
 
   async updateRecord(zoneExternalId: string, recordExternalId: string, input: DnsRecordInput): Promise<ProviderRecord> {
     return this.wrap(async () => {
+      const metadata = validateAliyunMetadata(input.providerMetadata);
       const before = await this.getRecord(zoneExternalId, recordExternalId);
       await this.client.updateDomainRecord(new UpdateDomainRecordRequest({ recordId: recordExternalId, ...toAliyunInput(zoneExternalId, input) }));
-      await this.applyMetadata(recordExternalId, input, before ?? undefined);
+      const appliedMetadata = new Set<keyof AliyunWriteMetadata>();
+      try {
+        await this.applyMetadata(recordExternalId, metadata, before ?? undefined, appliedMetadata);
+      } catch (error) {
+        if (before) {
+          try {
+            await this.client.updateDomainRecord(new UpdateDomainRecordRequest({
+              recordId: recordExternalId,
+              ...toAliyunInput(zoneExternalId, before),
+            }));
+            await this.restoreAppliedMetadata(recordExternalId, before, appliedMetadata);
+          } catch (rollbackError) {
+            throw new ProviderError(`Aliyun DNS record ${recordExternalId} was partially updated and rollback failed`, "unknown_provider_error", this.provider, {
+              retryable: false,
+              cause: new AggregateError([error, rollbackError]),
+            });
+          }
+        }
+        throw error;
+      }
       return (await this.getRecord(zoneExternalId, recordExternalId)) ?? recordFromInput(recordExternalId, zoneExternalId, input);
     });
   }
@@ -172,18 +205,38 @@ export class AliyunDnsAdapter implements DnsProviderAdapter {
     }
   }
 
-  private async applyMetadata(recordId: string, input: DnsRecordInput, before?: ProviderRecord) {
-    const requestedWeight = input.providerMetadata.weight;
-    if (typeof requestedWeight === "number" && requestedWeight !== before?.providerMetadata.weight) {
-      if (!Number.isInteger(requestedWeight) || requestedWeight < 1 || requestedWeight > 100) {
-        throw new ProviderError("Aliyun DNS weight must be an integer from 1 to 100", "validation_failed", this.provider);
-      }
-      await this.client.updateDNSSLBWeight(new UpdateDNSSLBWeightRequest({ recordId, weight: requestedWeight }));
-    }
-    const requestedStatus = normalizeAliyunStatus(input.providerMetadata.status);
+  private async applyMetadata(
+    recordId: string,
+    metadata: AliyunWriteMetadata,
+    before?: ProviderRecord,
+    applied?: Set<keyof AliyunWriteMetadata>,
+  ) {
+    const requestedStatus = metadata.status;
     const previousStatus = normalizeAliyunStatus(before?.providerMetadata.status);
     if (requestedStatus && requestedStatus !== previousStatus) {
       await this.client.setDomainRecordStatus(new SetDomainRecordStatusRequest({ recordId, status: requestedStatus }));
+      applied?.add("status");
+    }
+    const requestedWeight = metadata.weight;
+    if (requestedWeight !== undefined && requestedWeight !== before?.providerMetadata.weight) {
+      await this.client.updateDNSSLBWeight(new UpdateDNSSLBWeightRequest({ recordId, weight: requestedWeight }));
+      applied?.add("weight");
+    }
+  }
+
+  private async restoreAppliedMetadata(
+    recordId: string,
+    before: ProviderRecord,
+    applied: ReadonlySet<keyof AliyunWriteMetadata>,
+  ) {
+    const previous = validateAliyunMetadata(before.providerMetadata);
+    if (applied.has("weight")) {
+      if (previous.weight === undefined) throw new Error("Previous Aliyun DNS weight is unavailable for rollback");
+      await this.client.updateDNSSLBWeight(new UpdateDNSSLBWeightRequest({ recordId, weight: previous.weight }));
+    }
+    if (applied.has("status")) {
+      if (previous.status === undefined) throw new Error("Previous Aliyun DNS status is unavailable for rollback");
+      await this.client.setDomainRecordStatus(new SetDomainRecordStatusRequest({ recordId, status: previous.status }));
     }
   }
 }
@@ -195,7 +248,7 @@ export function normalizeAliyunRecord(record: AliyunRecordShape, zoneExternalId:
   const providerMetadata: Record<string, unknown> = {};
   if (record.line !== undefined) providerMetadata.line = record.line;
   if (record.weight !== undefined) providerMetadata.weight = record.weight;
-  if (record.status !== undefined) providerMetadata.status = record.status;
+  if (record.status !== undefined) providerMetadata.status = normalizeAliyunStatus(record.status);
   if (record.locked !== undefined) providerMetadata.locked = record.locked;
   if (record.remark !== undefined) providerMetadata.remark = record.remark;
   return {
@@ -211,7 +264,16 @@ export function normalizeAliyunRecord(record: AliyunRecordShape, zoneExternalId:
   };
 }
 
-function toAliyunInput(zoneExternalId: string, input: DnsRecordInput): Record<string, unknown> {
+type AliyunRecordInput = {
+  type: string;
+  name: string;
+  content: string;
+  ttl: number;
+  priority?: number | null | undefined;
+  providerMetadata: Record<string, unknown>;
+};
+
+function toAliyunInput(zoneExternalId: string, input: AliyunRecordInput): Record<string, unknown> {
   return {
     domainName: zoneExternalId,
     RR: rrFromFqdn(input.name, zoneExternalId),
@@ -224,7 +286,9 @@ function toAliyunInput(zoneExternalId: string, input: DnsRecordInput): Record<st
 }
 
 function recordFromInput(recordId: string, zoneExternalId: string, input: DnsRecordInput): ProviderRecord {
-  return { externalId: recordId, zoneExternalId, ...input };
+  const providerMetadata = { ...input.providerMetadata };
+  if (providerMetadata.status !== undefined) providerMetadata.status = normalizeAliyunStatus(providerMetadata.status);
+  return { externalId: recordId, zoneExternalId, ...input, providerMetadata };
 }
 
 function normalizeAliyunStatus(value: unknown): "Enable" | "Disable" | undefined {
@@ -233,6 +297,32 @@ function normalizeAliyunStatus(value: unknown): "Enable" | "Disable" | undefined
   if (normalized === "enable" || normalized === "enabled") return "Enable";
   if (normalized === "disable" || normalized === "disabled") return "Disable";
   throw new ProviderError("Aliyun DNS status must be Enable or Disable", "validation_failed", "aliyun");
+}
+
+type AliyunWriteMetadata = {
+  weight?: number;
+  status?: "Enable" | "Disable";
+};
+
+function validateAliyunMetadata(metadata: Record<string, unknown>): AliyunWriteMetadata {
+  if (metadata.line !== undefined && typeof metadata.line !== "string") {
+    throw new ProviderError("Aliyun DNS line must be a string", "validation_failed", "aliyun");
+  }
+  const result: AliyunWriteMetadata = {};
+  if (metadata.weight !== undefined) {
+    if (typeof metadata.weight !== "number" || !Number.isInteger(metadata.weight) || metadata.weight < 1 || metadata.weight > 100) {
+      throw new ProviderError("Aliyun DNS weight must be an integer from 1 to 100", "validation_failed", "aliyun");
+    }
+    result.weight = metadata.weight;
+  }
+  if (metadata.status !== undefined) {
+    if (typeof metadata.status !== "string") {
+      throw new ProviderError("Aliyun DNS status must be Enable or Disable", "validation_failed", "aliyun");
+    }
+    const status = normalizeAliyunStatus(metadata.status);
+    if (status !== undefined) result.status = status;
+  }
+  return result;
 }
 
 function fqdnFromRr(rr: string, zone: string): string {

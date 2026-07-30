@@ -33,9 +33,11 @@ import {
   LoadingState,
   MetricStrip,
   StatusBadge,
+  Switch,
 } from "../../../components/ui";
 import { useResource } from "../../../hooks/use-resource";
 import { api, formatDate, jsonBody, UI_PREVIEW } from "../../../lib/api";
+import { createPreviewDdnsInstall, type DdnsInstallPayload } from "../../../lib/ddns-install";
 import { demoPoolDetail, demoZones } from "../../../lib/demo";
 import type { Binding, Endpoint, HealthCheck, Pool, PoolDetail, ZoneListRow } from "../../../lib/types";
 
@@ -146,7 +148,7 @@ export default function PoolDetailPage() {
   const [bindingEditor, setBindingEditor] = useState<Binding | "new" | null>(null);
   const [checkOpen, setCheckOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [agentCommand, setAgentCommand] = useState<string | null>(null);
+  const [agentInstall, setAgentInstall] = useState<DdnsInstallPayload | null>(null);
   const [endpointDraft, setEndpointDraft] = useState<EndpointDraft>(endpointInitial);
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(bindingInitial);
   const [checkDraft, setCheckDraft] = useState<CheckDraft>(checkInitial);
@@ -192,6 +194,10 @@ export default function PoolDetailPage() {
 
   const saveEndpoint = async (event: FormEvent) => {
     event.preventDefault();
+    if (endpointDraft.addressMode === "static" && !endpointDraft.ipv4.trim() && !endpointDraft.ipv6.trim()) {
+      setActionError("静态节点至少需要一个 IP 地址");
+      return;
+    }
     const common = {
       name: endpointDraft.name,
       priority: endpointDraft.priority,
@@ -213,6 +219,7 @@ export default function PoolDetailPage() {
         ? await mutate(`/v1/pools/${poolId}/endpoints/${endpointEditor.id}`, "PATCH", {
           ...common,
           ...staticAddresses,
+          ...(endpointEditor.addressMode === "ddns" && endpointDraft.addressMode === "static" ? { addressMode: "static" } : {}),
           forceApply: endpointDraft.forceApply,
         })
         : false;
@@ -320,16 +327,16 @@ export default function PoolDetailPage() {
   const installAgent = async (endpoint: Endpoint) => {
     setActionError(null);
     if (UI_PREVIEW) {
-      setAgentCommand("curl -fsSL 'https://dns.internal/api/v1/ddns/install.sh' | sudo sh -s -- install --url 'https://dns.internal' --token 'one-time-token'");
+      setAgentInstall(createPreviewDdnsInstall());
       return;
     }
     setBusy(true);
     try {
-      const result = await api<{ command: string }>(`/v1/pools/${poolId}/endpoints/${endpoint.id}/ddns/install-token`, {
+      const result = await api<DdnsInstallPayload>(`/v1/pools/${poolId}/endpoints/${endpoint.id}/ddns/install-token`, {
         method: "POST",
         ...jsonBody({ expiresInSeconds: 900 }),
       });
-      setAgentCommand(result.command);
+      setAgentInstall(result);
     } catch (installError) {
       setActionError(installError instanceof Error ? installError.message : "生成安装命令失败");
     } finally {
@@ -354,7 +361,6 @@ export default function PoolDetailPage() {
       router.push("/pools");
     } catch (deleteError) {
       setActionError(deleteError instanceof Error ? deleteError.message : "删除 Pool 失败");
-      setDeletePoolOpen(false);
     } finally {
       setBusy(false);
     }
@@ -411,7 +417,7 @@ export default function PoolDetailPage() {
             <IconButton label="立即检查" disabled={busy} onClick={() => void mutate(`/v1/pools/${poolId}/endpoints/${endpoint.id}/check`)}><Activity size={15} /></IconButton>
             {endpoint.addressMode === "ddns" && <IconButton label="安装 DDNS Agent" disabled={busy} onClick={() => void installAgent(endpoint)}><RadioTower size={15} /></IconButton>}
             <IconButton label="编辑节点" onClick={() => openEndpointEditor(endpoint)}><Edit3 size={15} /></IconButton>
-            <IconButton label="删除节点" onClick={() => setDeletingEndpoint(endpoint)}><Trash2 size={15} /></IconButton>
+            <IconButton label="删除节点" onClick={() => { setActionError(null); setDeletingEndpoint(endpoint); }}><Trash2 size={15} /></IconButton>
           </div></td>
         </tr>)}</tbody>
       </table></div>}
@@ -428,14 +434,14 @@ export default function PoolDetailPage() {
           <td>{binding.assignments.filter((assignment) => assignment.applied).map((assignment) => endpointName(data.endpoints, assignment.endpointId)).join(", ") || "未发布"}</td>
           <td><StatusBadge value={binding.state} /></td>
           <td>{binding.ttl}s</td>
-          <td><div className="row-actions"><IconButton label="编辑绑定" onClick={() => openBindingEditor(binding)}><Edit3 size={15} /></IconButton><IconButton label="删除绑定" onClick={() => setDeletingBinding(binding)}><Trash2 size={15} /></IconButton></div></td>
+          <td><div className="row-actions"><IconButton label="编辑绑定" onClick={() => openBindingEditor(binding)}><Edit3 size={15} /></IconButton><IconButton label="删除绑定" onClick={() => { setActionError(null); setDeletingBinding(binding); }}><Trash2 size={15} /></IconButton></div></td>
         </tr>)}</tbody>
       </table></div>}
     </section>}
 
     {tab === "checks" && <div className="content-grid">
       <section className="surface">
-        <header className="surface-header"><div><h2>检查配置</h2><p>Pool 默认，可由节点或域名覆盖</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => { setCheckDraft(checkInitial); setCheckOpen(true); }}>添加</Button></header>
+        <header className="surface-header"><div><h2>检查配置</h2><p>Pool 默认，可由节点或域名覆盖</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => { setActionError(null); setCheckDraft(checkInitial); setCheckOpen(true); }}>添加</Button></header>
         {data.healthChecks.length === 0 ? <EmptyState title="未配置健康检查" /> : <div className="table-wrap"><table>
           <thead><tr><th>范围</th><th>Checker</th><th>目标</th><th>超时</th><th>状态</th><th aria-label="操作" /></tr></thead>
           <tbody>{data.healthChecks.map((check) => <tr key={check.id}>
@@ -444,7 +450,7 @@ export default function PoolDetailPage() {
             <td className="mono">{checkTargetLabel(check)}</td>
             <td>{String(check.config.timeoutMs ?? pool.checkTimeoutMs)}ms</td>
             <td><StatusBadge value={check.enabled ? "active" : "disabled"} /></td>
-            <td><IconButton label="删除健康检查" onClick={() => setDeletingCheck(check)}><Trash2 size={15} /></IconButton></td>
+            <td><IconButton label="删除健康检查" onClick={() => { setActionError(null); setDeletingCheck(check); }}><Trash2 size={15} /></IconButton></td>
           </tr>)}</tbody>
         </table></div>}
       </section>
@@ -453,36 +459,39 @@ export default function PoolDetailPage() {
 
     {tab === "history" && <div className="content-grid">
       <section className="surface"><header className="surface-header"><div><h2>故障与调度事件</h2><p>健康证据与策略决定</p></div><ShieldAlert size={16} /></header><ul className="event-list">{data.events.map((event) => <li key={event.id}><strong>{event.eventType}</strong><span>{formatDate(event.createdAt)} · {JSON.stringify(event.evidence).slice(0, 160)}</span></li>)}</ul></section>
-      <aside className="surface"><header className="surface-header"><div><h2>策略版本</h2><p>不可变配置历史</p></div></header><ul className="compact-list">{data.policyVersions.map((version) => <li key={version.id}><div><strong>Revision {version.version}</strong><small>{version.reason} · {formatDate(version.createdAt)}</small></div>{version.version === pool.policyRevision ? <StatusBadge value="active" /> : <IconButton label={`恢复 Revision ${version.version}`} onClick={() => setRestoreVersion(version.version)}><RotateCcw size={14} /></IconButton>}</li>)}</ul></aside>
+      <aside className="surface"><header className="surface-header"><div><h2>策略版本</h2><p>不可变配置历史</p></div></header><ul className="compact-list">{data.policyVersions.map((version) => <li key={version.id}><div><strong>Revision {version.version}</strong><small>{version.reason} · {formatDate(version.createdAt)}</small></div>{version.version === pool.policyRevision ? <StatusBadge value="active" /> : <IconButton label={`恢复 Revision ${version.version}`} onClick={() => { setActionError(null); setRestoreVersion(version.version); }}><RotateCcw size={14} /></IconButton>}</li>)}</ul></aside>
     </div>}
 
     <Dialog open={endpointEditor !== null} title={endpointEditor === "new" ? "添加节点" : "编辑节点"} onClose={() => setEndpointEditor(null)} footer={<><Button variant="secondary" onClick={() => setEndpointEditor(null)}>取消</Button><Button type="submit" form="endpoint-form" disabled={busy}>{endpointEditor === "new" ? "添加节点" : "保存节点"}</Button></>}>
       <form id="endpoint-form" className="field-grid" onSubmit={saveEndpoint}>
+        <DialogActionError message={actionError} />
         <Field label="节点名称"><input value={endpointDraft.name} onChange={(event) => setEndpointDraft({ ...endpointDraft, name: event.target.value })} required /></Field>
-        <Field label="地址模式"><select value={endpointDraft.addressMode} disabled={endpointEditor !== "new"} onChange={(event) => setEndpointDraft({ ...endpointDraft, addressMode: event.target.value as Endpoint["addressMode"] })}><option value="static">静态地址</option><option value="ddns">DDNS Agent</option></select></Field>
+        <Field label="地址模式"><select value={endpointDraft.addressMode} disabled={endpointEditor !== "new" && endpointEditor?.addressMode !== "ddns"} onChange={(event) => setEndpointDraft({ ...endpointDraft, addressMode: event.target.value as Endpoint["addressMode"] })}><option value="static">静态地址</option><option value="ddns">DDNS Agent</option></select></Field>
         <Field label="优先级"><input type="number" min={0} value={endpointDraft.priority} onChange={(event) => setEndpointDraft({ ...endpointDraft, priority: Number(event.target.value) })} /></Field>
         <Field label="运行状态"><select value={endpointDraft.lifecycle} onChange={(event) => setEndpointDraft({ ...endpointDraft, lifecycle: event.target.value })}><option value="enabled">启用</option><option value="maintenance">维护</option><option value="draining">排空</option><option value="disabled">停用</option></select></Field>
-        {endpointDraft.addressMode === "static" && <><Field label="IPv4"><input className="mono" placeholder="203.0.113.10" value={endpointDraft.ipv4} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv4: event.target.value })} /></Field><Field label="IPv6"><input className="mono" placeholder="2001:db8::10" value={endpointDraft.ipv6} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv6: event.target.value })} /></Field></>}
-        {endpointEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" checked={endpointDraft.forceApply} onChange={(event) => setEndpointDraft({ ...endpointDraft, forceApply: event.target.checked })} /></label>}
+        {endpointDraft.addressMode === "static" && <><Field label="IPv4"><input className="mono" placeholder="203.0.113.10" value={endpointDraft.ipv4} required={!endpointDraft.ipv6} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv4: event.target.value })} /></Field><Field label="IPv6"><input className="mono" placeholder="2001:db8::10" value={endpointDraft.ipv6} required={!endpointDraft.ipv4} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv6: event.target.value })} /></Field></>}
+        {endpointEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" role="switch" aria-checked={endpointDraft.forceApply} checked={endpointDraft.forceApply} onChange={(event) => setEndpointDraft({ ...endpointDraft, forceApply: event.target.checked })} /></label>}
       </form>
     </Dialog>
 
     <Dialog open={bindingEditor !== null} title={bindingEditor === "new" ? "添加域名绑定" : "编辑域名绑定"} onClose={() => setBindingEditor(null)} footer={<><Button variant="secondary" onClick={() => setBindingEditor(null)}>取消</Button><Button type="submit" form="binding-form" disabled={busy}>{bindingEditor === "new" ? "添加绑定" : "保存绑定"}</Button></>}>
       <form id="binding-form" className="field-grid" onSubmit={saveBinding}>
+        <DialogActionError message={actionError} />
         <Field label="Zone"><select value={bindingDraft.zoneId} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, zoneId: event.target.value })} required><option value="">选择 Zone</option>{zones.data?.map((row) => <option key={row.zone.id} value={row.zone.id}>{row.zone.nameAscii} · {row.provider}</option>)}</select></Field>
         <Field label="记录类型"><select value={bindingDraft.recordType} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, recordType: event.target.value as Binding["recordType"] })}><option>A</option><option>AAAA</option></select></Field>
         <Field label="完整域名"><input placeholder="api.example.com" value={bindingDraft.fqdn} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, fqdn: event.target.value })} required /></Field>
         <Field label="原始节点"><select value={bindingDraft.originalEndpointId} onChange={(event) => setBindingDraft({ ...bindingDraft, originalEndpointId: event.target.value })} required={pool.strategy !== "healthy_set" || bindingDraft.takeoverExisting}><option value="">{pool.strategy === "healthy_set" ? "由健康集合决定" : "选择节点"}</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
         <Field label="TTL"><input type="number" min={1} value={bindingDraft.ttl} onChange={(event) => setBindingDraft({ ...bindingDraft, ttl: Number(event.target.value) })} /></Field>
-        {bindingEditor === "new" && <label className="switch-row"><span>接管现有同名记录</span><button type="button" className={`switch ${bindingDraft.takeoverExisting ? "on" : ""}`} aria-label="切换接管现有同名记录" onClick={() => setBindingDraft({ ...bindingDraft, takeoverExisting: !bindingDraft.takeoverExisting })} /></label>}
-        {selectedProvider === "cloudflare" && <label className="switch-row"><span>Cloudflare Proxy</span><button type="button" className={`switch ${bindingDraft.proxied ? "on" : ""}`} aria-label="切换 Cloudflare Proxy" onClick={() => setBindingDraft({ ...bindingDraft, proxied: !bindingDraft.proxied })} /></label>}
+        {bindingEditor === "new" && <div className="switch-row"><span>接管现有同名记录</span><Switch checked={bindingDraft.takeoverExisting} label="切换接管现有同名记录" onCheckedChange={(takeoverExisting) => setBindingDraft({ ...bindingDraft, takeoverExisting })} /></div>}
+        {selectedProvider === "cloudflare" && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={bindingDraft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setBindingDraft({ ...bindingDraft, proxied })} /></div>}
         {selectedProvider === "aliyun" && <><Field label="解析线路"><input value={bindingDraft.aliLine} onChange={(event) => setBindingDraft({ ...bindingDraft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={bindingDraft.aliWeight} onChange={(event) => setBindingDraft({ ...bindingDraft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={bindingDraft.aliStatus} onChange={(event) => setBindingDraft({ ...bindingDraft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
-        {bindingEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" checked={bindingDraft.forceApply} onChange={(event) => setBindingDraft({ ...bindingDraft, forceApply: event.target.checked })} /></label>}
+        {bindingEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" role="switch" aria-checked={bindingDraft.forceApply} checked={bindingDraft.forceApply} onChange={(event) => setBindingDraft({ ...bindingDraft, forceApply: event.target.checked })} /></label>}
       </form>
     </Dialog>
 
     <Dialog open={checkOpen} title="添加健康检查" size="large" onClose={() => setCheckOpen(false)} footer={<><Button variant="secondary" onClick={() => setCheckOpen(false)}>取消</Button><Button type="submit" form="check-form" disabled={busy}>保存检查</Button></>}>
       <form id="check-form" className="field-grid" onSubmit={createCheck}>
+        <DialogActionError message={actionError} />
         <Field label="作用范围"><select value={checkDraft.scope} onChange={(event) => setCheckDraft({ ...checkDraft, scope: event.target.value as CheckDraft["scope"], scopeId: "" })}><option value="pool">Pool 默认</option><option value="endpoint">节点覆盖</option><option value="binding">域名绑定覆盖</option></select></Field>
         {checkDraft.scope === "endpoint" && <Field label="节点"><select value={checkDraft.scopeId} onChange={(event) => setCheckDraft({ ...checkDraft, scopeId: event.target.value })} required><option value="">选择节点</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>}
         {checkDraft.scope === "binding" && <Field label="域名绑定"><select value={checkDraft.scopeId} onChange={(event) => setCheckDraft({ ...checkDraft, scopeId: event.target.value })} required><option value="">选择域名</option>{data.bindings.map((binding) => <option key={binding.id} value={binding.id}>{binding.fqdn}</option>)}</select></Field>}
@@ -504,8 +513,9 @@ export default function PoolDetailPage() {
       </form>
     </Dialog>
 
-    <Dialog open={settingsOpen && poolDraft !== null} title="Pool 设置" size="large" onClose={() => setSettingsOpen(false)} footer={<><Button variant="danger" icon={<Trash2 size={14} />} onClick={() => { setSettingsOpen(false); setDeletePoolOpen(true); }}>删除 Pool</Button><Button variant="secondary" onClick={() => setSettingsOpen(false)}>取消</Button><Button type="submit" form="pool-settings-form" disabled={busy}>保存设置</Button></>}>
+    <Dialog open={settingsOpen && poolDraft !== null} title="Pool 设置" size="large" onClose={() => setSettingsOpen(false)} footer={<><Button variant="danger" icon={<Trash2 size={14} />} onClick={() => { setActionError(null); setDeletePoolName(""); setSettingsOpen(false); setDeletePoolOpen(true); }}>删除 Pool</Button><Button variant="secondary" onClick={() => setSettingsOpen(false)}>取消</Button><Button type="submit" form="pool-settings-form" disabled={busy}>保存设置</Button></>}>
       {poolDraft && <form id="pool-settings-form" className="field-grid" onSubmit={saveSettings}>
+        <DialogActionError message={actionError} />
         <Field label="名称"><input value={poolDraft.name} onChange={(event) => setPoolDraft({ ...poolDraft, name: event.target.value })} required /></Field>
         <Field label="策略类型"><select value={poolDraft.strategy} onChange={(event) => setPoolDraft({ ...poolDraft, strategy: event.target.value as Pool["strategy"] })}><option value="primary_backup">主备模式</option><option value="healthy_set">健康集合</option><option value="assignment_pool">跨域名分配池</option></select></Field>
         <Field label="说明"><textarea value={poolDraft.description} onChange={(event) => setPoolDraft({ ...poolDraft, description: event.target.value })} /></Field>
@@ -521,18 +531,22 @@ export default function PoolDetailPage() {
       </form>}
     </Dialog>
 
-    <Dialog open={agentCommand !== null} title="安装 DDNS Agent" size="large" onClose={() => setAgentCommand(null)} footer={<><Button variant="secondary" icon={<Copy size={14} />} onClick={() => agentCommand && navigator.clipboard.writeText(agentCommand)}>复制命令</Button><Button onClick={() => setAgentCommand(null)}>完成</Button></>}><div className="code-box">{agentCommand}</div></Dialog>
+    <Dialog open={agentInstall !== null} title="安装 DDNS Agent" size="large" onClose={() => setAgentInstall(null)} footer={<><Button variant="secondary" icon={<Copy size={14} />} onClick={() => agentInstall && navigator.clipboard.writeText(agentInstall.command)}>复制命令</Button><Button variant="secondary" icon={<Copy size={14} />} onClick={() => agentInstall && navigator.clipboard.writeText(agentInstall.installToken)}>复制 Token</Button><Button onClick={() => setAgentInstall(null)}>完成</Button></>}><DialogActionError message={actionError} />{agentInstall && <div className="agent-install"><section><strong>安装命令</strong><div className="code-box">{agentInstall.command}</div></section><section><strong>一次性安装 Token</strong><div className="code-box">{agentInstall.installToken}</div><small>有效期至 {formatDate(agentInstall.expiresAt)}</small></section></div>}</Dialog>
 
-    <Dialog open={restoreVersion !== null} title={`恢复 Revision ${restoreVersion ?? ""}`} size="small" onClose={() => setRestoreVersion(null)} footer={<><Button variant="secondary" onClick={() => setRestoreVersion(null)}>取消</Button><Button icon={<RotateCcw size={14} />} disabled={busy} onClick={() => void restorePolicy()}>{busy ? "正在恢复" : "恢复策略"}</Button></>}><p className="confirm-copy">旧配置会恢复为一个新的策略版本，并重新计算受管 DNS。节点或域名绑定集合不一致时，系统会拒绝本次操作。</p><label className="switch-row"><span>忽略当前健康状态并强制发布</span><input type="checkbox" checked={restoreForce} onChange={(event) => setRestoreForce(event.target.checked)} /></label></Dialog>
+    <Dialog open={restoreVersion !== null} title={`恢复 Revision ${restoreVersion ?? ""}`} size="small" onClose={() => setRestoreVersion(null)} footer={<><Button variant="secondary" onClick={() => setRestoreVersion(null)}>取消</Button><Button icon={<RotateCcw size={14} />} disabled={busy} onClick={() => void restorePolicy()}>{busy ? "正在恢复" : "恢复策略"}</Button></>}><DialogActionError message={actionError} /><p className="confirm-copy">旧配置会恢复为一个新的策略版本，并重新计算受管 DNS。节点或域名绑定集合不一致时，系统会拒绝本次操作。</p><label className="switch-row"><span>忽略当前健康状态并强制发布</span><input type="checkbox" role="switch" aria-checked={restoreForce} checked={restoreForce} onChange={(event) => setRestoreForce(event.target.checked)} /></label></Dialog>
 
-    <Dialog open={deletingEndpoint !== null} title="删除节点" size="small" onClose={() => setDeletingEndpoint(null)} footer={<><Button variant="secondary" onClick={() => setDeletingEndpoint(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingEndpoint && await mutate(`/v1/pools/${poolId}/endpoints/${deletingEndpoint.id}`, "DELETE")) setDeletingEndpoint(null); }}>删除节点</Button></>}><p className="confirm-copy">删除 <strong>{deletingEndpoint?.name}</strong>。节点仍被域名分配引用时，系统会拒绝操作。</p></Dialog>
+    <Dialog open={deletingEndpoint !== null} title="删除节点" size="small" onClose={() => setDeletingEndpoint(null)} footer={<><Button variant="secondary" onClick={() => setDeletingEndpoint(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingEndpoint && await mutate(`/v1/pools/${poolId}/endpoints/${deletingEndpoint.id}`, "DELETE")) setDeletingEndpoint(null); }}>删除节点</Button></>}><DialogActionError message={actionError} /><p className="confirm-copy">删除 <strong>{deletingEndpoint?.name}</strong>。节点仍被域名分配引用时，系统会拒绝操作。</p></Dialog>
 
-    <Dialog open={deletingBinding !== null} title="删除域名绑定" size="small" onClose={() => setDeletingBinding(null)} footer={<><Button variant="secondary" onClick={() => setDeletingBinding(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingBinding && await mutate(`/v1/pools/${poolId}/bindings/${deletingBinding.id}`, "DELETE")) setDeletingBinding(null); }}>删除绑定</Button></>}><p className="confirm-copy">系统会先删除该绑定创建的云端 DNS 记录，再保留完整操作历史。确认删除 <strong>{deletingBinding?.fqdn}</strong>？</p></Dialog>
+    <Dialog open={deletingBinding !== null} title="删除域名绑定" size="small" onClose={() => setDeletingBinding(null)} footer={<><Button variant="secondary" onClick={() => setDeletingBinding(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingBinding && await mutate(`/v1/pools/${poolId}/bindings/${deletingBinding.id}`, "DELETE")) setDeletingBinding(null); }}>删除绑定</Button></>}><DialogActionError message={actionError} /><p className="confirm-copy">系统会先删除该绑定创建的云端 DNS 记录，再保留完整操作历史。确认删除 <strong>{deletingBinding?.fqdn}</strong>？</p></Dialog>
 
-    <Dialog open={deletingCheck !== null} title="删除健康检查" size="small" onClose={() => setDeletingCheck(null)} footer={<><Button variant="secondary" onClick={() => setDeletingCheck(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingCheck && await mutate(`/v1/pools/${poolId}/checks/${deletingCheck.id}`, "DELETE")) setDeletingCheck(null); }}>删除检查</Button></>}><p className="confirm-copy">删除后，该范围会重新继承上级健康检查配置。</p></Dialog>
+    <Dialog open={deletingCheck !== null} title="删除健康检查" size="small" onClose={() => setDeletingCheck(null)} footer={<><Button variant="secondary" onClick={() => setDeletingCheck(null)}>取消</Button><Button variant="danger" disabled={busy} onClick={async () => { if (deletingCheck && await mutate(`/v1/pools/${poolId}/checks/${deletingCheck.id}`, "DELETE")) setDeletingCheck(null); }}>删除检查</Button></>}><DialogActionError message={actionError} /><p className="confirm-copy">删除后，该范围会重新继承上级健康检查配置。</p></Dialog>
 
-    <Dialog open={deletePoolOpen} title="删除 Pool" size="small" onClose={() => setDeletePoolOpen(false)} footer={<><Button variant="secondary" onClick={() => setDeletePoolOpen(false)}>取消</Button><Button variant="danger" disabled={busy || deletePoolName !== pool.name} onClick={() => void deletePool()}>永久删除</Button></>}><div className="field-grid"><p className="confirm-copy span-2">只有清空域名绑定后才能删除 Pool。输入 <strong>{pool.name}</strong> 确认。</p><Field label="Pool 名称"><input value={deletePoolName} onChange={(event) => setDeletePoolName(event.target.value)} /></Field></div></Dialog>
+    <Dialog open={deletePoolOpen} title="删除 Pool" size="small" onClose={() => setDeletePoolOpen(false)} footer={<><Button variant="secondary" onClick={() => setDeletePoolOpen(false)}>取消</Button><Button variant="danger" disabled={busy || deletePoolName !== pool.name} onClick={() => void deletePool()}>永久删除</Button></>}><div className="field-grid"><DialogActionError message={actionError} /><p className="confirm-copy span-2">只有清空域名绑定后才能删除 Pool。输入 <strong>{pool.name}</strong> 确认。</p><Field label="Pool 名称"><input value={deletePoolName} onChange={(event) => setDeletePoolName(event.target.value)} /></Field></div></Dialog>
   </ConsoleLayout>;
+}
+
+function DialogActionError({ message }: { message: string | null }) {
+  return message ? <div className="login-error span-2" role="alert">{message}</div> : null;
 }
 
 function currentAddress(endpoint: Endpoint, family: "4" | "6") {

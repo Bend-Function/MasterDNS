@@ -11,6 +11,7 @@ export type StrategyEndpoint = {
   lifecycle: EndpointLifecycle;
   healthState: HealthState;
   activeBindingCount: number;
+  addressFamilies?: ("4" | "6")[];
 };
 
 export type StrategyBinding = {
@@ -18,6 +19,7 @@ export type StrategyBinding = {
   originalEndpointId?: string;
   currentEndpointIds: string[];
   endpointHealthStates?: Record<string, HealthState>;
+  requiredAddressFamily?: "4" | "6";
 };
 
 export type StrategyContext = {
@@ -29,6 +31,7 @@ export type StrategyContext = {
   endpoints: StrategyEndpoint[];
   bindings: StrategyBinding[];
   roundRobinCursor?: string;
+  roundRobinCursors?: Record<string, string>;
 };
 
 export type BindingDecision = {
@@ -42,5 +45,6 @@ export type StrategyDecision = {
   eventId: string;
   decisions: BindingDecision[];
   nextRoundRobinCursor?: string;
+  nextRoundRobinCursors?: Record<string, string>;
   noHealthyEndpoints: boolean;
 };

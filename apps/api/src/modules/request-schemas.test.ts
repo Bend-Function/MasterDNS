@@ -32,6 +32,16 @@ describe("Pool request schemas", () => {
     expect(() => updateBindingSchema.parse({ forceApply: true })).toThrow(/至少提供/);
   });
 
+  it("requires an address when explicitly converting an endpoint to static mode", () => {
+    expect(() => updateEndpointSchema.parse({ addressMode: "static" })).toThrow(/至少提供一个 IP/);
+    expect(() => updateEndpointSchema.parse({ addressMode: "static", ipv4: null, ipv6: null })).toThrow(/至少提供一个 IP/);
+    expect(updateEndpointSchema.parse({ addressMode: "static", ipv4: "192.0.2.20" })).toMatchObject({
+      addressMode: "static",
+      ipv4: "192.0.2.20",
+    });
+    expect(() => updateEndpointSchema.parse({ addressMode: "ddns", ipv4: "192.0.2.20" })).toThrow();
+  });
+
   it("requires an original endpoint for explicit record takeover", () => {
     const binding = {
       zoneId: "11111111-1111-4111-8111-111111111111",

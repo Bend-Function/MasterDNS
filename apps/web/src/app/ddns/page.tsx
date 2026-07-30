@@ -6,7 +6,8 @@ import { useCallback, useEffect, useState } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
 import { RelativeTime } from "../../components/relative-time";
 import { Button, Dialog, EmptyState, IconButton, LoadingState, PageHeader, StatusBadge } from "../../components/ui";
-import { api, jsonBody, UI_PREVIEW } from "../../lib/api";
+import { api, formatDate, jsonBody, UI_PREVIEW } from "../../lib/api";
+import { createPreviewDdnsInstall, type DdnsInstallPayload } from "../../lib/ddns-install";
 import { demoPoolDetail } from "../../lib/demo";
 import type { DdnsAgent, Endpoint, Pool, PoolDetail } from "../../lib/types";
 
@@ -33,7 +34,7 @@ export default function DdnsPage() {
     .map((endpoint) => ({ pool: demoPoolDetail.pool, endpoint, agent: { ...previewAgent, endpointId: endpoint.id } }));
   const [rows, setRows] = useState<DdnsRow[] | null>(UI_PREVIEW ? previewRows : null);
   const [error, setError] = useState<string | null>(null);
-  const [command, setCommand] = useState<string | null>(null);
+  const [installPayload, setInstallPayload] = useState<DdnsInstallPayload | null>(null);
   const [revokeTarget, setRevokeTarget] = useState<DdnsRow | null>(null);
   const [busyEndpointId, setBusyEndpointId] = useState<string | null>(null);
 
@@ -63,13 +64,13 @@ export default function DdnsPage() {
     setError(null);
     try {
       if (UI_PREVIEW) {
-        setCommand("curl -fsSL 'https://dns.internal/api/v1/ddns/install.sh' | sudo sh -s -- install --url 'https://dns.internal' --token 'one-time-token'");
+        setInstallPayload(createPreviewDdnsInstall());
       } else {
-        const result = await api<{ command: string }>(`/v1/pools/${row.pool.id}/endpoints/${row.endpoint.id}/ddns/install-token`, {
+        const result = await api<DdnsInstallPayload>(`/v1/pools/${row.pool.id}/endpoints/${row.endpoint.id}/ddns/install-token`, {
           method: "POST",
           ...jsonBody({ expiresInSeconds: 900 }),
         });
-        setCommand(result.command);
+        setInstallPayload(result);
         await load();
       }
     } catch (installError) {
@@ -115,15 +116,15 @@ export default function DdnsPage() {
           <td><StatusBadge value={row.endpoint.healthState} /></td>
           <td><div className="row-actions">
             <Button variant="ghost" icon={<RadioTower size={14} />} disabled={busyEndpointId === row.endpoint.id} onClick={() => void install(row)}>{row.agent.hasRuntimeToken ? "重装" : "安装"}</Button>
-            {row.agent.status === "active" && <IconButton label="吊销 DDNS Agent" disabled={busyEndpointId === row.endpoint.id} onClick={() => setRevokeTarget(row)}><Ban size={15} /></IconButton>}
+            {row.agent.status === "active" && <IconButton label="吊销 DDNS Agent" disabled={busyEndpointId === row.endpoint.id} onClick={() => { setError(null); setRevokeTarget(row); }}><Ban size={15} /></IconButton>}
             <Link className="icon-button" href={`/pools/${row.pool.id}`} aria-label="打开节点所属 Pool"><ExternalLink size={15} /></Link>
           </div></td>
         </tr>;
       })}</tbody>
     </table></div>}
 
-    <Dialog open={command !== null} title="Linux 一键安装" size="large" onClose={() => setCommand(null)} footer={<><Button variant="secondary" icon={<Copy size={14} />} onClick={() => command && navigator.clipboard.writeText(command)}>复制命令</Button><Button onClick={() => setCommand(null)}>完成</Button></>}><div className="code-box">{command}</div></Dialog>
-    <Dialog open={revokeTarget !== null} title="吊销 DDNS Agent" size="small" onClose={() => setRevokeTarget(null)} footer={<><Button variant="secondary" onClick={() => setRevokeTarget(null)}>取消</Button><Button variant="danger" disabled={busyEndpointId !== null} onClick={() => void revoke()}>吊销 Token</Button></>}><p className="confirm-copy">吊销 <strong>{revokeTarget?.endpoint.name}</strong> 的运行 Token。当前 DNS 与节点地址保持不变，服务器下次心跳将被拒绝。</p></Dialog>
+    <Dialog open={installPayload !== null} title="Linux 一键安装" size="large" onClose={() => setInstallPayload(null)} footer={<><Button variant="secondary" icon={<Copy size={14} />} onClick={() => installPayload && navigator.clipboard.writeText(installPayload.command)}>复制命令</Button><Button variant="secondary" icon={<Copy size={14} />} onClick={() => installPayload && navigator.clipboard.writeText(installPayload.installToken)}>复制 Token</Button><Button onClick={() => setInstallPayload(null)}>完成</Button></>}>{installPayload && <div className="agent-install"><section><strong>安装命令</strong><div className="code-box">{installPayload.command}</div></section><section><strong>一次性安装 Token</strong><div className="code-box">{installPayload.installToken}</div><small>有效期至 {formatDate(installPayload.expiresAt)}</small></section></div>}</Dialog>
+    <Dialog open={revokeTarget !== null} title="吊销 DDNS Agent" size="small" onClose={() => setRevokeTarget(null)} footer={<><Button variant="secondary" onClick={() => setRevokeTarget(null)}>取消</Button><Button variant="danger" disabled={busyEndpointId !== null} onClick={() => void revoke()}>吊销 Token</Button></>}>{error && <div className="login-error" role="alert">{error}</div>}<p className="confirm-copy">吊销 <strong>{revokeTarget?.endpoint.name}</strong> 的运行 Token。当前 DNS 与节点地址保持不变，服务器下次心跳将被拒绝。</p></Dialog>
   </ConsoleLayout>;
 }
 

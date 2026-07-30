@@ -1,5 +1,19 @@
 name: masterdns
 
+x-database-environment: &database-environment
+  PGHOST: postgres
+  PGPORT: 5432
+  PGDATABASE: masterdns
+  PGUSER: masterdns
+  PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+
+x-runtime-environment: &runtime-environment
+  <<: *database-environment
+  NODE_ENV: production
+  REDIS_URL: redis://redis:6379
+  MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:?MASTER_ENCRYPTION_KEY is required}
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
 services:
   postgres:
     image: postgres:17-alpine
@@ -33,24 +47,13 @@ services:
       context: .
       dockerfile: Dockerfile
       target: api
-    command: ["pnpm", "db:migrate"]
-    environment: &backend-environment
+    command: ["node", "packages/db/dist/migrate.js"]
+    environment:
+      <<: *database-environment
       NODE_ENV: production
-      DATABASE_URL: postgres://masterdns:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/masterdns
-      REDIS_URL: redis://redis:6379
-      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY:?MASTER_ENCRYPTION_KEY is required}
       BOOTSTRAP_ADMIN_USERNAME: ${BOOTSTRAP_ADMIN_USERNAME:-admin}
       BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:?BOOTSTRAP_ADMIN_PASSWORD is required}
       BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
-      WEB_URL: ${WEB_URL:-http://localhost:3000}
-      API_URL: ${API_URL:-http://localhost:4000}
-      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:4000}
-      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
-      LOG_LEVEL: ${LOG_LEVEL:-info}
-      HEALTH_RAW_RETENTION_DAYS: ${HEALTH_RAW_RETENTION_DAYS:-30}
-      HEALTH_STATS_RETENTION_DAYS: ${HEALTH_STATS_RETENTION_DAYS:-365}
-      PROVIDER_SYNC_INTERVAL_SECONDS: ${PROVIDER_SYNC_INTERVAL_SECONDS:-300}
-      PROVIDER_SYNC_SCAN_SECONDS: ${PROVIDER_SYNC_SCAN_SECONDS:-30}
     depends_on:
       postgres:
         condition: service_healthy
@@ -63,10 +66,13 @@ services:
       target: api
     restart: unless-stopped
     environment:
-      <<: *backend-environment
+      <<: *runtime-environment
       PORT: 4000
+      WEB_URL: ${WEB_URL:-http://localhost:3000}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:4000}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-127.0.0.1/32,::1/128}
     ports:
-      - "${API_PORT:-4000}:4000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${API_PORT:-4000}:4000"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -84,7 +90,14 @@ services:
       dockerfile: Dockerfile
       target: worker
     restart: unless-stopped
-    environment: *backend-environment
+    environment:
+      <<: *runtime-environment
+      HEALTH_RAW_RETENTION_DAYS: ${HEALTH_RAW_RETENTION_DAYS:-30}
+      HEALTH_STATS_RETENTION_DAYS: ${HEALTH_STATS_RETENTION_DAYS:-365}
+      PROVIDER_SYNC_INTERVAL_SECONDS: ${PROVIDER_SYNC_INTERVAL_SECONDS:-300}
+      PROVIDER_SYNC_SCAN_SECONDS: ${PROVIDER_SYNC_SCAN_SECONDS:-30}
+      ALLOW_PRIVATE_HEALTH_TARGETS: ${ALLOW_PRIVATE_HEALTH_TARGETS:-false}
+      ALLOW_PRIVATE_WEBHOOK_TARGETS: ${ALLOW_PRIVATE_WEBHOOK_TARGETS:-false}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -104,7 +117,7 @@ services:
       NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:4000}
       API_URL: http://api:4000
     ports:
-      - "${WEB_PORT:-3000}:3000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${WEB_PORT:-3000}:3000"
     depends_on:
       api:
         condition: service_healthy

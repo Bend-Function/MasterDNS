@@ -8,7 +8,7 @@
     "start": "next start",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run src --passWithNoTests"
+    "test": "vitest run src"
   },
   "dependencies": {
     "@masterdns/contracts": "workspace:*",

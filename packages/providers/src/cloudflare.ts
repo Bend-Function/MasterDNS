@@ -81,7 +81,9 @@ export class CloudflareDnsAdapter implements DnsProviderAdapter {
 
   async createRecord(zoneExternalId: string, input: DnsRecordInput): Promise<ProviderRecord> {
     return this.wrap(async () => {
-      const record = await this.client.dns.records.create(toCloudflareCreateInput(zoneExternalId, input));
+      // A timed-out POST may already have created the record. Let the durable
+      // operation retry reconcile the remote state before issuing another POST.
+      const record = await this.client.dns.records.create(toCloudflareCreateInput(zoneExternalId, input), { maxRetries: 0 });
       return normalizeCloudflareRecord(record as CloudflareRecordShape, zoneExternalId);
     });
   }
@@ -136,12 +138,13 @@ function toCloudflareUpdateInput(zoneId: string, input: DnsRecordInput): Paramet
 
 function toCloudflareInput(zoneId: string, input: DnsRecordInput): Record<string, unknown> {
   const metadata = input.providerMetadata;
+  const proxied = metadata.proxied === true;
   return {
     zone_id: zoneId,
     type: input.type,
     name: input.name,
     content: input.content,
-    ttl: input.ttl,
+    ttl: proxied ? 1 : input.ttl,
     ...(input.priority !== undefined ? { priority: input.priority } : {}),
     ...(typeof metadata.proxied === "boolean" ? { proxied: metadata.proxied } : {}),
     ...(typeof metadata.comment === "string" ? { comment: metadata.comment } : {}),

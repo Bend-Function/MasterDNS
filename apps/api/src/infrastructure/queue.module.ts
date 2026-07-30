@@ -23,6 +23,39 @@ export class QueueService implements OnModuleDestroy {
     return Number(result);
   }
 
+  async acquireConcurrencyLease(key: string, member: string, limit: number, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const result = await this.redis.eval(
+      "redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1]); if redis.call('zcard', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end; redis.call('zadd', KEYS[1], ARGV[2], ARGV[4]); redis.call('pexpire', KEYS[1], ARGV[5]); return 1",
+      1,
+      key,
+      now,
+      now + ttlMs,
+      limit,
+      member,
+      ttlMs,
+    );
+    return Number(result) === 1;
+  }
+
+  async renewConcurrencyLease(key: string, member: string, ttlMs: number): Promise<boolean> {
+    const now = Date.now();
+    const result = await this.redis.eval(
+      "local expiry = redis.call('zscore', KEYS[1], ARGV[1]); if expiry == false or tonumber(expiry) <= tonumber(ARGV[2]) then redis.call('zrem', KEYS[1], ARGV[1]); return 0 end; redis.call('zadd', KEYS[1], ARGV[3], ARGV[1]); redis.call('pexpire', KEYS[1], ARGV[4]); return 1",
+      1,
+      key,
+      member,
+      now,
+      now + ttlMs,
+      ttlMs,
+    );
+    return Number(result) === 1;
+  }
+
+  async releaseConcurrencyLease(key: string, member: string): Promise<void> {
+    await this.redis.zrem(key, member);
+  }
+
   async ping(): Promise<string> {
     return this.redis.ping();
   }

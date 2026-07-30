@@ -3,13 +3,14 @@
 import { ArrowLeft, Edit3, LockKeyhole, Plus, RefreshCw, Search, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useMemo, useState, type FormEvent } from "react";
+import { useMemo, useRef, useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../../components/console-layout";
 import { RelativeTime } from "../../../components/relative-time";
-import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState } from "../../../components/ui";
+import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState, Switch } from "../../../components/ui";
 import { useResource } from "../../../hooks/use-resource";
 import { api, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { demoNow, demoZones } from "../../../lib/demo";
+import { createIntentKey } from "../../../lib/intent-key";
 import type { DnsRecord, ZoneListRow } from "../../../lib/types";
 
 const previewRecords: DnsRecord[] = [
@@ -53,10 +54,13 @@ export default function ZoneRecordsPage() {
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const saveIntentKey = useRef(createIntentKey());
+  const deleteIntentKey = useRef(createIntentKey());
   const records = useMemo(() => (data ?? []).filter((record) => `${record.name} ${record.type} ${record.content}`.toLowerCase().includes(search.toLowerCase())), [data, search]);
   const zone = zones.data?.find((row) => row.zone.id === zoneId);
 
   const openEditor = (record?: DnsRecord) => {
+    saveIntentKey.current.reset();
     setActionError(null);
     setEditing(record ?? "new");
     setDraft(record ? {
@@ -99,7 +103,7 @@ export default function ZoneRecordsPage() {
       if (!UI_PREVIEW) {
         await api(`/v1/zones/${zoneId}/records${editing !== "new" ? `/${editing?.id}` : ""}`, {
           method: editing === "new" ? "POST" : "PATCH",
-          headers: { "idempotency-key": crypto.randomUUID() },
+          headers: { "idempotency-key": saveIntentKey.current.current() },
           ...jsonBody(body),
         });
         await reload();
@@ -108,6 +112,7 @@ export default function ZoneRecordsPage() {
       } else if (editing) {
         setData((data ?? []).map((record) => record.id === editing.id ? { ...record, ...body, priority: "priority" in body ? body.priority : null } : record));
       }
+      saveIntentKey.current.reset();
       setEditing(null);
     } catch (saveError) {
       setActionError(saveError instanceof Error ? saveError.message : "提交 DNS 变更失败");
@@ -122,17 +127,24 @@ export default function ZoneRecordsPage() {
     setActionError(null);
     try {
       if (!UI_PREVIEW) {
-        await api(`/v1/zones/${zoneId}/records/${deleting.id}`, { method: "DELETE", headers: { "idempotency-key": crypto.randomUUID() } });
+        await api(`/v1/zones/${zoneId}/records/${deleting.id}`, { method: "DELETE", headers: { "idempotency-key": deleteIntentKey.current.current() } });
         await reload();
       } else {
         setData((data ?? []).filter((record) => record.id !== deleting.id));
       }
+      deleteIntentKey.current.reset();
       setDeleting(null);
     } catch (deleteError) {
       setActionError(deleteError instanceof Error ? deleteError.message : "删除 DNS 记录失败");
     } finally {
       setSaving(false);
     }
+  };
+
+  const openDelete = (record: DnsRecord) => {
+    deleteIntentKey.current.reset();
+    setActionError(null);
+    setDeleting(record);
   };
 
   const sync = async () => {
@@ -168,7 +180,7 @@ export default function ZoneRecordsPage() {
         <td className="muted">{providerMetadataLabel(provider, record.providerMetadata)}</td>
         <td>{record.management === "managed" ? <span className="status status-warning"><LockKeyhole size={11} />Pool 受管</span> : <span className="status status-neutral"><i />手动</span>}</td>
         <td className="muted"><RelativeTime value={record.lastSyncedAt} /></td>
-        <td><div className="row-actions"><IconButton label="编辑记录" disabled={record.management === "managed"} onClick={() => openEditor(record)}><Edit3 size={15} /></IconButton><IconButton label="删除记录" disabled={record.management === "managed"} onClick={() => setDeleting(record)}><Trash2 size={15} /></IconButton></div></td>
+        <td><div className="row-actions"><IconButton label="编辑记录" disabled={record.management === "managed"} onClick={() => openEditor(record)}><Edit3 size={15} /></IconButton><IconButton label="删除记录" disabled={record.management === "managed"} onClick={() => openDelete(record)}><Trash2 size={15} /></IconButton></div></td>
       </tr>)}</tbody>
     </table></div>}
 
@@ -179,12 +191,12 @@ export default function ZoneRecordsPage() {
         <Field label="名称"><input placeholder="api 或完整域名" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></Field>
         <Field label="内容"><input className="mono" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required /></Field>
         {["MX", "SRV"].includes(draft.type) && <Field label="优先级"><input type="number" min={0} max={65535} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} /></Field>}
-        {provider === "cloudflare" && ["A", "AAAA", "CNAME"].includes(draft.type) && <label className="switch-row"><span>Cloudflare Proxy</span><button type="button" className={`switch ${draft.proxied ? "on" : ""}`} aria-label="切换 Cloudflare Proxy" onClick={() => setDraft({ ...draft, proxied: !draft.proxied })} /></label>}
+        {provider === "cloudflare" && ["A", "AAAA", "CNAME"].includes(draft.type) && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={draft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setDraft({ ...draft, proxied })} /></div>}
         {provider === "aliyun" && <><Field label="解析线路"><input value={draft.aliLine} onChange={(event) => setDraft({ ...draft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={draft.aliWeight} onChange={(event) => setDraft({ ...draft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={draft.aliStatus} onChange={(event) => setDraft({ ...draft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
-        {actionError && <div className="login-error span-2">{actionError}</div>}
+        {actionError && <div className="login-error span-2" role="alert">{actionError}</div>}
       </form>
     </Dialog>
-    <Dialog open={deleting !== null} title="删除 DNS 记录" size="small" onClose={() => setDeleting(null)} footer={<><Button variant="secondary" onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" disabled={saving} onClick={() => void remove()}>删除</Button></>}><p className="confirm-copy">将从云厂商删除 <strong>{deleting?.name}</strong>，操作会保留历史并可通过回滚重新创建。</p></Dialog>
+    <Dialog open={deleting !== null} title="删除 DNS 记录" size="small" onClose={() => setDeleting(null)} footer={<><Button variant="secondary" onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" disabled={saving} onClick={() => void remove()}>删除</Button></>}>{actionError && <div className="login-error" role="alert">{actionError}</div>}<p className="confirm-copy">将从云厂商删除 <strong>{deleting?.name}</strong>，操作会保留历史并可通过回滚重新创建。</p></Dialog>
   </ConsoleLayout>;
 }
 

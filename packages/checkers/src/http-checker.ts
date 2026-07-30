@@ -3,12 +3,16 @@ import { httpCheckConfigSchema } from "@masterdns/contracts";
 import { Agent, request } from "undici";
 import type { HealthChecker } from "./checker.js";
 import { elapsedMs, errorResult } from "./checker.js";
+import { assertAllowedNetworkTarget, type NetworkTargetPolicy } from "./network-policy.js";
+import { matchesPatternSafely } from "./pattern-match.js";
 
 const MAX_REDIRECTS = 5;
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 
 export class HttpHealthChecker implements HealthChecker<HttpCheckConfig> {
   readonly type = "http";
+
+  constructor(private readonly networkPolicy: NetworkTargetPolicy = {}) {}
 
   validate(config: unknown): HttpCheckConfig {
     return httpCheckConfigSchema.parse(config);
@@ -25,6 +29,7 @@ export class HttpHealthChecker implements HealthChecker<HttpCheckConfig> {
       : new Agent();
 
     try {
+      assertAllowedNetworkTarget(target.address, this.networkPolicy);
       let path = config.path;
       let response: Awaited<ReturnType<typeof request>> | undefined;
       for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
@@ -56,7 +61,7 @@ export class HttpHealthChecker implements HealthChecker<HttpCheckConfig> {
       if (config.bodyContains !== undefined && !body.includes(config.bodyContains)) {
         return failedHttpResult(startedAt, response.statusCode, "body_mismatch", "Response body does not contain expected text");
       }
-      if (config.bodyPattern !== undefined && !new RegExp(config.bodyPattern).test(body)) {
+      if (config.bodyPattern !== undefined && !await matchesPatternSafely(config.bodyPattern, body)) {
         return failedHttpResult(startedAt, response.statusCode, "body_mismatch", "Response body does not match expected pattern");
       }
       return { success: true, latencyMs: elapsedMs(startedAt), checkedAt: new Date(), statusCode: response.statusCode };

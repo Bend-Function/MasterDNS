@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run src --passWithNoTests",
     "generate": "drizzle-kit generate",
+    "preflight": "tsx src/preflight-cli.ts",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts"
   },

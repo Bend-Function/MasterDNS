@@ -11,10 +11,13 @@ export class RateLimitGuard implements CanActivate {
   async canActivate(context: ExecutionContext): Promise<boolean> {
     const request = context.switchToHttp().getRequest<FastifyRequest & { currentUser?: AuthUser }>();
     const route = request.routeOptions.url ?? request.url;
-    const category = rateLimitPolicyFor(request, route);
-    if (!category) return true;
-    const count = await this.queues.incrementRateLimit(`masterdns:rate:${category.key}`, category.windowMs);
-    if (count > category.limit) throw new HttpException("请求过于频繁，请稍后再试", HttpStatus.TOO_MANY_REQUESTS);
+    const policy = rateLimitPolicyFor(request, route);
+    if (!policy) return true;
+    const categories = Array.isArray(policy) ? policy : [policy];
+    for (const category of categories) {
+      const count = await this.queues.incrementRateLimit(`masterdns:rate:${category.key}`, category.windowMs);
+      if (count > category.limit) throw new HttpException("请求过于频繁，请稍后再试", HttpStatus.TOO_MANY_REQUESTS);
+    }
     return true;
   }
 }

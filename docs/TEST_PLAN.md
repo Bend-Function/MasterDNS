@@ -111,10 +111,16 @@
 
 ## 6. 发布门槛
 
-- 所有 migration 可从空库执行并可在测试中回滚。
-- 核心策略和状态机分支覆盖率不低于 90%。
-- Provider Adapter Contract 全部通过。
-- Cloudflare 隔离真实 API 测试通过且无残留记录。
+### 6.1 自动化门槛
+
+- `pnpm build`、`pnpm typecheck`、`pnpm lint` 和 `pnpm test` 全部通过。
+- `pnpm test:coverage` 对 `@masterdns/automation` 的核心策略与健康状态机执行 V8 覆盖率检查，branches、functions、lines 和 statements 均不得低于 90%。
+- 数据库连接参数、升级预检报告和 migration SQL 的 PostgreSQL 验证通过。
+
+### 6.2 环境验收门槛
+
+- 在隔离 PostgreSQL 中完成空库 migration，并验证从上一发布版本升级；破坏性回退通过恢复升级前备份演练，不宣称 migration 自动向后回滚。
+- Provider Adapter Contract 全部通过；Cloudflare 隔离真实 API 测试通过且无残留记录。
 - 安全日志测试确认不含 Token、Secret、Cookie 和凭证明文。
 - Worker 被强制终止后，未完成 Operation 能够恢复且不产生重复记录。
 - Playwright 验证桌面和移动端无阻塞操作问题。

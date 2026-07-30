@@ -3,9 +3,12 @@ import type { CheckResult, CheckTarget, TcpCheckConfig } from "@masterdns/contra
 import { tcpCheckConfigSchema } from "@masterdns/contracts";
 import type { HealthChecker } from "./checker.js";
 import { elapsedMs, errorResult } from "./checker.js";
+import { assertAllowedNetworkTarget, type NetworkTargetPolicy } from "./network-policy.js";
 
 export class TcpHealthChecker implements HealthChecker<TcpCheckConfig> {
   readonly type = "tcp";
+
+  constructor(private readonly networkPolicy: NetworkTargetPolicy = {}) {}
 
   validate(config: unknown): TcpCheckConfig {
     return tcpCheckConfigSchema.parse(config);
@@ -15,6 +18,7 @@ export class TcpHealthChecker implements HealthChecker<TcpCheckConfig> {
     const config = this.validate(configInput);
     const startedAt = performance.now();
     try {
+      assertAllowedNetworkTarget(target.address, this.networkPolicy);
       await new Promise<void>((resolve, reject) => {
         const socket = createConnection({ host: target.address, port: target.port, family: target.family });
         const timer = setTimeout(() => socket.destroy(Object.assign(new Error("TCP health check timed out"), { code: "ETIMEDOUT" })), config.timeoutMs);

@@ -21,6 +21,9 @@ export type HealthCheckJob = {
 export type PoolReconcileJob = {
   poolId: string;
   eventId: string;
+  /** Monotonic pool decision sequence assigned by the transactional outbox. */
+  decisionRevision?: number;
+  policyRevision?: number;
   trigger: "failure" | "recovery" | "rebalance" | "configuration" | "repair";
   source?: OperationSource;
   endpointId?: string;

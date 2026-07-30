@@ -5,11 +5,19 @@ const schema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(4000),
   WEB_URL: z.string().url().default("http://localhost:3000"),
   PUBLIC_API_URL: z.string().url().default("http://localhost:4000"),
-  DATABASE_URL: z.string().min(1),
+  DATABASE_URL: z.string().min(1).optional(),
+  PGHOST: z.string().min(1).optional(),
+  PGPORT: z.coerce.number().int().min(1).max(65535).optional(),
+  PGDATABASE: z.string().min(1).optional(),
+  PGUSER: z.string().min(1).optional(),
+  PGPASSWORD: z.string().min(1).optional(),
   REDIS_URL: z.string().min(1),
   MASTER_ENCRYPTION_KEY: z.string().min(1),
   LOG_LEVEL: z.enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"]).default("info"),
   TRUSTED_PROXY_CIDRS: z.string().default("127.0.0.1/32,::1/128"),
+}).superRefine((value, context) => {
+  if (value.DATABASE_URL || (value.PGHOST && value.PGDATABASE && value.PGUSER && value.PGPASSWORD)) return;
+  context.addIssue({ code: "custom", message: "DATABASE_URL or complete PGHOST/PGDATABASE/PGUSER/PGPASSWORD settings are required" });
 });
 
 const parsed = schema.parse(process.env);

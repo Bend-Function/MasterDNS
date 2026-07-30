@@ -1,7 +1,7 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import type { HealthCheckJob } from "@masterdns/contracts";
-import { domainBindings, endpointPools, endpoints, healthCheckConfigs } from "@masterdns/db";
-import { eq } from "drizzle-orm";
+import { domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs } from "@masterdns/db";
+import { and, eq } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
 
@@ -34,30 +34,19 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
           endpointId: endpoints.id,
           poolId: endpoints.poolId,
           intervalSeconds: endpointPools.checkIntervalSeconds,
-        }).from(endpoints)
+          addressId: endpointAddresses.id,
+          family: endpointAddresses.family,
+        }).from(endpointAddresses)
+          .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id))
           .innerJoin(endpointPools, eq(endpoints.poolId, endpointPools.id))
-          .where(eq(endpoints.lifecycle, "enabled")),
+          .where(and(eq(endpoints.lifecycle, "enabled"), eq(endpointAddresses.state, "current"))),
         this.database.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.enabled, true)),
-        this.database.db.select({ id: domainBindings.id, poolId: domainBindings.poolId }).from(domainBindings),
+        this.database.db.select({ id: domainBindings.id, poolId: domainBindings.poolId, recordType: domainBindings.recordType }).from(domainBindings),
       ]);
 
-      const bindingsByPool = groupBy(bindings, (binding) => binding.poolId);
-      const poolConfigs = groupBy(configs.filter((config) => config.poolId), (config) => config.poolId!);
-      const endpointConfigs = groupBy(configs.filter((config) => config.endpointId), (config) => config.endpointId!);
-      const bindingConfigs = groupBy(configs.filter((config) => config.domainBindingId), (config) => config.domainBindingId!);
       const now = Date.now();
-      const enqueue: Promise<unknown>[] = [];
-
-      for (const target of targets) {
-        const base = endpointConfigs.get(target.endpointId) ?? poolConfigs.get(target.poolId) ?? [];
-        for (const config of base) enqueue.push(this.enqueue(target.endpointId, config.id, target.intervalSeconds, now));
-        for (const binding of bindingsByPool.get(target.poolId) ?? []) {
-          for (const config of bindingConfigs.get(binding.id) ?? []) {
-            enqueue.push(this.enqueue(target.endpointId, config.id, target.intervalSeconds, now, binding.id));
-          }
-        }
-      }
-      await Promise.all(enqueue);
+      await Promise.all(buildScheduledHealthJobs(targets, configs, bindings)
+        .map((scheduled) => this.enqueue(scheduled.data, scheduled.intervalSeconds, now)));
     } catch (error) {
       this.logger.error(`Health schedule scan failed: ${safeError(error)}`);
     } finally {
@@ -65,18 +54,66 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private async enqueue(endpointId: string, configId: string, intervalSeconds: number, now: number, bindingId?: string) {
+  private async enqueue(data: HealthCheckJob, intervalSeconds: number, now: number) {
     const intervalMs = Math.max(5, intervalSeconds) * 1000;
     const slot = Math.floor(now / intervalMs);
-    const data: HealthCheckJob = { endpointId, configId, ...(bindingId ? { bindingId } : {}) };
-    const scope = bindingId ?? "base";
+    const scope = `${data.bindingId ?? "base"}-${data.addressId ?? "address"}`;
     await this.queues.health.add("check-endpoint", data, {
-      jobId: `health-${endpointId}-${configId}-${scope}-${slot}`,
+      jobId: `health-${data.endpointId}-${data.configId}-${scope}-${slot}`,
       attempts: 1,
       removeOnComplete: 5_000,
       removeOnFail: 5_000,
     });
   }
+}
+
+type ScheduledTarget = {
+  endpointId: string;
+  poolId: string;
+  intervalSeconds: number;
+  addressId: string;
+  family: "4" | "6";
+};
+
+type ScheduledConfig = {
+  id: string;
+  poolId: string | null;
+  endpointId: string | null;
+  domainBindingId: string | null;
+};
+
+type ScheduledBinding = {
+  id: string;
+  poolId: string;
+  recordType: string;
+};
+
+export function buildScheduledHealthJobs(
+  targets: ScheduledTarget[],
+  configs: ScheduledConfig[],
+  bindings: ScheduledBinding[],
+): Array<{ data: HealthCheckJob; intervalSeconds: number }> {
+  const bindingsByPool = groupBy(bindings, (binding) => binding.poolId);
+  const poolConfigs = groupBy(configs.filter((config) => config.poolId), (config) => config.poolId!);
+  const endpointConfigs = groupBy(configs.filter((config) => config.endpointId), (config) => config.endpointId!);
+  const bindingConfigs = groupBy(configs.filter((config) => config.domainBindingId), (config) => config.domainBindingId!);
+  const scheduled: Array<{ data: HealthCheckJob; intervalSeconds: number }> = [];
+
+  for (const target of targets) {
+    const base = endpointConfigs.get(target.endpointId) ?? poolConfigs.get(target.poolId) ?? [];
+    for (const config of base) scheduled.push({
+      data: { endpointId: target.endpointId, configId: config.id, addressId: target.addressId },
+      intervalSeconds: target.intervalSeconds,
+    });
+    for (const binding of bindingsByPool.get(target.poolId) ?? []) {
+      if ((binding.recordType === "AAAA" ? "6" : "4") !== target.family) continue;
+      for (const config of bindingConfigs.get(binding.id) ?? []) scheduled.push({
+        data: { endpointId: target.endpointId, configId: config.id, bindingId: binding.id, addressId: target.addressId },
+        intervalSeconds: target.intervalSeconds,
+      });
+    }
+  }
+  return scheduled;
 }
 
 function groupBy<T>(items: T[], key: (item: T) => string): Map<string, T[]> {

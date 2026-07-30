@@ -20,6 +20,35 @@ describe("health state machine", () => {
     state = applyHealthResult(state, true, { failureThreshold: 3, successThreshold: 2 });
     expect(state.state).toBe("healthy");
   });
+
+  it.each([
+    ["healthy", true, 3, "healthy"],
+    ["degraded", true, 3, "degraded"],
+    ["unknown", true, 1, "healthy"],
+    ["unhealthy", false, 3, "unhealthy"],
+    ["recovering", false, 3, "unhealthy"],
+    ["unknown", false, 3, "unknown"],
+    ["unknown", false, 1, "unhealthy"],
+  ] as const)("moves %s on success=%s with threshold=%s to %s", (state, success, threshold, expected) => {
+    expect(applyHealthResult(
+      { state, consecutiveSuccesses: 0, consecutiveFailures: 0 },
+      success,
+      { failureThreshold: threshold, successThreshold: threshold },
+    ).state).toBe(expected);
+  });
+
+  it.each([
+    [{ failureThreshold: 0, successThreshold: 1 }, "failureThreshold"],
+    [{ failureThreshold: 1.5, successThreshold: 1 }, "failureThreshold"],
+    [{ failureThreshold: 1, successThreshold: 0 }, "successThreshold"],
+    [{ failureThreshold: 1, successThreshold: 1.5 }, "successThreshold"],
+  ])("rejects invalid thresholds %#", (thresholds, expectedMessage) => {
+    expect(() => applyHealthResult(
+      { state: "unknown", consecutiveSuccesses: 0, consecutiveFailures: 0 },
+      true,
+      thresholds,
+    )).toThrow(expectedMessage);
+  });
 });
 
 describe("pool strategy", () => {
@@ -72,7 +101,40 @@ describe("pool strategy", () => {
       bindings: ["site-1", "site-2", "site-3"].map((id) => ({ id, originalEndpointId: "a", currentEndpointIds: ["a"] })),
     }));
     expect(result.decisions.map((decision) => decision.desiredEndpointIds[0])).toEqual(["b", "c", "b"]);
-    expect(result.nextRoundRobinCursor).toBe("b");
+    expect(Object.values(result.nextRoundRobinCursors ?? {})).toEqual(["b"]);
+  });
+
+  it("keeps independent round-robin cursors for different address candidate sets", () => {
+    const first = evaluateStrategy(context({
+      selectionMode: "round_robin",
+      endpoints: [
+        { id: "a4", priority: 1, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "b4", priority: 2, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "a6", priority: 1, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["6"] },
+        { id: "b6", priority: 2, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["6"] },
+      ],
+      bindings: [
+        { id: "site-a", currentEndpointIds: [], requiredAddressFamily: "4" },
+        { id: "site-aaaa", currentEndpointIds: [], requiredAddressFamily: "6" },
+      ],
+    }));
+    const second = evaluateStrategy(context({
+      eventId: "event-2",
+      selectionMode: "round_robin",
+      endpoints: [
+        { id: "a4", priority: 1, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "b4", priority: 2, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "a6", priority: 1, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["6"] },
+        { id: "b6", priority: 2, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["6"] },
+      ],
+      bindings: [
+        { id: "site-a", currentEndpointIds: [], requiredAddressFamily: "4" },
+        { id: "site-aaaa", currentEndpointIds: [], requiredAddressFamily: "6" },
+      ],
+      roundRobinCursors: first.nextRoundRobinCursors!,
+    }));
+    expect(first.decisions.map((decision) => decision.desiredEndpointIds[0])).toEqual(["a4", "a6"]);
+    expect(second.decisions.map((decision) => decision.desiredEndpointIds[0])).toEqual(["b4", "b6"]);
   });
 
   it("makes random selection reproducible for the same event", () => {
@@ -105,6 +167,59 @@ describe("pool strategy", () => {
     const recovered = endpoints.map((endpoint) => ({ ...endpoint, healthState: "healthy" as const }));
     const result = evaluateStrategy(context({ trigger: "recovery", recoveryMode: "keep_current", endpoints: recovered, bindings: [{ id: "site", originalEndpointId: "a", currentEndpointIds: ["b"] }] }));
     expect(result.decisions).toEqual([]);
+  });
+
+  it.each(["keep_current", "manual"] as const)("does not republish recovered healthy-set members in %s mode", (recoveryMode) => {
+    const result = evaluateStrategy(context({
+      trigger: "recovery",
+      strategy: "healthy_set",
+      recoveryMode,
+      endpoints: endpoints.map((endpoint) => ({ ...endpoint, healthState: "healthy" })),
+      bindings: [{ id: "site", currentEndpointIds: ["b", "c"] }],
+    }));
+    expect(result.decisions).toEqual([]);
+  });
+
+  it.each(["automatic", "delayed"] as const)("republishes recovered healthy-set members in %s mode", (recoveryMode) => {
+    const result = evaluateStrategy(context({
+      trigger: "recovery",
+      strategy: "healthy_set",
+      recoveryMode,
+      endpoints: endpoints.map((endpoint) => ({ ...endpoint, healthState: "healthy" })),
+      bindings: [{ id: "site", currentEndpointIds: ["b", "c"] }],
+    }));
+    expect(result.decisions[0]?.desiredEndpointIds).toEqual(["a", "b", "c"]);
+  });
+
+  it("uses a recovered healthy-set member when keep-current has no available current member", () => {
+    const result = evaluateStrategy(context({
+      trigger: "recovery",
+      strategy: "healthy_set",
+      recoveryMode: "keep_current",
+      endpoints: endpoints.map((endpoint) => endpoint.id === "a"
+        ? { ...endpoint, healthState: "healthy" }
+        : { ...endpoint, healthState: "unhealthy" }),
+      bindings: [{ id: "site", currentEndpointIds: ["b", "c"] }],
+    }));
+    expect(result.decisions[0]?.desiredEndpointIds).toEqual(["a"]);
+  });
+
+  it("keeps degraded endpoints eligible until the failure threshold is reached", () => {
+    const result = evaluateStrategy(context({
+      endpoints: endpoints.map((endpoint) => endpoint.id === "a" ? { ...endpoint, healthState: "degraded" } : endpoint),
+    }));
+    expect(result.decisions).toEqual([]);
+  });
+
+  it("only selects endpoints with an address for the binding family", () => {
+    const result = evaluateStrategy(context({
+      endpoints: endpoints.map((endpoint) => ({
+        ...endpoint,
+        addressFamilies: endpoint.id === "b" ? ["4"] : ["6"],
+      })),
+      bindings: [{ id: "site", currentEndpointIds: ["a"], requiredAddressFamily: "6" }],
+    }));
+    expect(result.decisions[0]?.desiredEndpointIds).toEqual(["c"]);
   });
 
   it("repairs records without reassigning a healthy current endpoint", () => {
@@ -142,6 +257,23 @@ describe("pool strategy", () => {
       }],
     }));
     expect(result.decisions[0]?.desiredEndpointIds).toEqual(["c"]);
+  });
+
+  it("keeps least-assigned counts across binding-scoped health overrides", () => {
+    const result = evaluateStrategy(context({
+      selectionMode: "least_assigned",
+      endpoints: [
+        { id: "a", priority: 1, lifecycle: "enabled", healthState: "unhealthy", activeBindingCount: 2 },
+        { id: "b", priority: 2, lifecycle: "enabled", healthState: "unhealthy", activeBindingCount: 0 },
+        { id: "c", priority: 3, lifecycle: "enabled", healthState: "unhealthy", activeBindingCount: 0 },
+      ],
+      bindings: ["site-1", "site-2"].map((id) => ({
+        id,
+        currentEndpointIds: ["a"],
+        endpointHealthStates: { a: "unhealthy", b: "healthy", c: "healthy" },
+      })),
+    }));
+    expect(result.decisions.map((decision) => decision.desiredEndpointIds[0])).toEqual(["b", "c"]);
   });
 
   it("allows different healthy sets for different domain bindings", () => {

@@ -1,5 +1,6 @@
 import { Module } from "@nestjs/common";
 import { ReconcileProcessor } from "./automation/reconcile.processor.js";
+import { ReconcileOutboxService } from "./automation/reconcile-outbox.service.js";
 import { DatabaseService } from "./database.service.js";
 import { HealthProcessor } from "./health/health.processor.js";
 import { HealthRetentionService } from "./health/health-retention.service.js";
@@ -24,6 +25,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
     HealthSchedulerService,
     HealthRetentionService,
     ReconcileProcessor,
+    ReconcileOutboxService,
     NotificationProcessor,
     AllDownReminderService,
   ],

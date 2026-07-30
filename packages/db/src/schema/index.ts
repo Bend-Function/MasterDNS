@@ -120,7 +120,9 @@ export const endpointPools = pgTable("endpoint_pools", {
   allDownReminderSeconds: integer("all_down_reminder_seconds").notNull().default(1800),
   state: healthStateEnum("state").notNull().default("unknown"),
   policyRevision: integer("policy_revision").notNull().default(1),
+  decisionRevision: integer("decision_revision").notNull().default(0),
   roundRobinCursor: uuid("round_robin_cursor"),
+  roundRobinCursors: jsonb("round_robin_cursors").$type<Record<string, string>>().notNull().default({}),
   enabled: boolean("enabled").notNull().default(true),
   enabledAt: timestamp("enabled_at", { withTimezone: true }).notNull().defaultNow(),
   pausedAt: timestamp("paused_at", { withTimezone: true }),
@@ -242,6 +244,7 @@ export const healthCheckResults = pgTable("health_check_results", {
   id: uuid("id").primaryKey().defaultRandom(),
   configId: uuid("config_id").notNull().references(() => healthCheckConfigs.id, { onDelete: "cascade" }),
   endpointId: uuid("endpoint_id").notNull().references(() => endpoints.id, { onDelete: "cascade" }),
+  endpointAddressId: uuid("endpoint_address_id").references(() => endpointAddresses.id, { onDelete: "set null" }),
   domainBindingId: uuid("domain_binding_id").references(() => domainBindings.id, { onDelete: "cascade" }),
   probeId: varchar("probe_id", { length: 120 }),
   success: boolean("success").notNull(),
@@ -252,6 +255,7 @@ export const healthCheckResults = pgTable("health_check_results", {
   checkedAt: timestamp("checked_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [
   index("health_results_endpoint_time_idx").on(table.endpointId, table.checkedAt),
+  index("health_results_address_time_idx").on(table.endpointAddressId, table.checkedAt),
   index("health_results_binding_time_idx").on(table.domainBindingId, table.checkedAt),
 ]);
 
@@ -277,6 +281,7 @@ export const healthCheckStats = pgTable("health_check_stats", {
 export const bindingEndpointHealth = pgTable("binding_endpoint_health", {
   domainBindingId: uuid("domain_binding_id").notNull().references(() => domainBindings.id, { onDelete: "cascade" }),
   endpointId: uuid("endpoint_id").notNull().references(() => endpoints.id, { onDelete: "cascade" }),
+  endpointAddressId: uuid("endpoint_address_id").references(() => endpointAddresses.id, { onDelete: "set null" }),
   healthState: healthStateEnum("health_state").notNull().default("unknown"),
   consecutiveSuccesses: integer("consecutive_successes").notNull().default(0),
   consecutiveFailures: integer("consecutive_failures").notNull().default(0),
@@ -295,6 +300,8 @@ export const ddnsAgents = pgTable("ddns_agents", {
   installTokenExpiresAt: timestamp("install_token_expires_at", { withTimezone: true }),
   installTokenUsedAt: timestamp("install_token_used_at", { withTimezone: true }),
   runtimeTokenHash: varchar("runtime_token_hash", { length: 64 }),
+  previousRuntimeTokenHash: varchar("previous_runtime_token_hash", { length: 64 }),
+  previousRuntimeTokenExpiresAt: timestamp("previous_runtime_token_expires_at", { withTimezone: true }),
   agentVersion: varchar("agent_version", { length: 40 }),
   hostname: varchar("hostname", { length: 255 }),
   status: resourceStatusEnum("status").notNull().default("active"),
@@ -313,6 +320,7 @@ export const operations = pgTable("operations", {
   resourceType: varchar("resource_type", { length: 80 }).notNull(),
   resourceId: uuid("resource_id"),
   policyRevision: integer("policy_revision"),
+  decisionRevision: integer("decision_revision"),
   status: operationStatusEnum("status").notNull().default("pending"),
   beforeSnapshot: jsonb("before_snapshot").$type<unknown>(),
   desiredSnapshot: jsonb("desired_snapshot").$type<unknown>(),
@@ -364,6 +372,24 @@ export const failoverEvents = pgTable("failover_events", {
   decision: jsonb("decision").$type<Record<string, unknown>>().notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [index("failover_events_pool_time_idx").on(table.poolId, table.createdAt)]);
+
+export const reconcileIntents = pgTable("reconcile_intents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  eventId: uuid("event_id").notNull().unique(),
+  poolId: uuid("pool_id").notNull().references(() => endpointPools.id, { onDelete: "cascade" }),
+  endpointId: uuid("endpoint_id").references(() => endpoints.id, { onDelete: "set null" }),
+  decisionRevision: integer("decision_revision").notNull(),
+  policyRevision: integer("policy_revision").notNull(),
+  trigger: varchar("trigger", { length: 32 }).$type<"failure" | "recovery" | "rebalance" | "configuration" | "repair">().notNull(),
+  source: operationSourceEnum("source").notNull(),
+  force: boolean("force").notNull().default(false),
+  availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+  ...timestamps,
+}, (table) => [
+  uniqueIndex("reconcile_intents_pool_revision_unique").on(table.poolId, table.decisionRevision),
+  index("reconcile_intents_pending_idx").on(table.completedAt, table.availableAt),
+]);
 
 export const auditLogs = pgTable("audit_logs", {
   id: uuid("id").primaryKey().defaultRandom(),

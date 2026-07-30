@@ -7,65 +7,146 @@ if [ ! -r "$CONFIG_FILE" ]; then
   exit 1
 fi
 
-# shellcheck disable=SC1090
-. "$CONFIG_FILE"
+read_config_value() {
+  config_key="$1"
+  sed -n "s/^${config_key}='\(.*\)'$/\1/p" "$CONFIG_FILE" | head -n 1
+}
+
+MASTERDNS_API_URL="$(read_config_value MASTERDNS_API_URL)"
+MASTERDNS_ALLOW_INSECURE_LOOPBACK="$(read_config_value MASTERDNS_ALLOW_INSECURE_LOOPBACK)"
+MASTERDNS_RUNTIME_TOKEN="$(read_config_value MASTERDNS_RUNTIME_TOKEN)"
+MASTERDNS_INTERFACE="$(read_config_value MASTERDNS_INTERFACE)"
+MASTERDNS_IPV4="$(read_config_value MASTERDNS_IPV4)"
+MASTERDNS_IPV6="$(read_config_value MASTERDNS_IPV6)"
+
 : "${MASTERDNS_API_URL:?MASTERDNS_API_URL is required}"
 : "${MASTERDNS_RUNTIME_TOKEN:?MASTERDNS_RUNTIME_TOKEN is required}"
+[ -n "$MASTERDNS_ALLOW_INSECURE_LOOPBACK" ] || MASTERDNS_ALLOW_INSECURE_LOOPBACK=false
+case "$MASTERDNS_ALLOW_INSECURE_LOOPBACK" in
+  true|false) ;;
+  *) echo "MASTERDNS_ALLOW_INSECURE_LOOPBACK must be true or false" >&2; exit 1 ;;
+esac
+
+CURL_PROTO="=https"
+CURL_NO_PROXY="${NO_PROXY:-${no_proxy:-}}"
+python3 - "$MASTERDNS_API_URL" "$MASTERDNS_ALLOW_INSECURE_LOOPBACK" <<'PY'
+import ipaddress
+import sys
+from urllib.parse import urlsplit
+
+raw_url, allow_insecure = sys.argv[1:]
+if not raw_url or any(char.isspace() or ord(char) < 32 for char in raw_url):
+    raise SystemExit("API URL contains whitespace or control characters")
+try:
+    parsed = urlsplit(raw_url)
+    port = parsed.port
+except ValueError as error:
+    raise SystemExit(f"Invalid API URL: {error}") from None
+if parsed.scheme not in {"https", "http"} or not parsed.hostname:
+    raise SystemExit("MASTERDNS_API_URL must be an absolute HTTPS URL")
+if (parsed.username is not None or parsed.password is not None or parsed.query or parsed.fragment
+        or "?" in raw_url or "#" in raw_url):
+    raise SystemExit("MASTERDNS_API_URL must not contain credentials, a query, or a fragment")
+if port is not None and not (1 <= port <= 65535):
+    raise SystemExit("MASTERDNS_API_URL port is invalid")
+if parsed.scheme == "http":
+    hostname = parsed.hostname.rstrip(".").lower()
+    try:
+        is_loopback = ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        is_loopback = hostname == "localhost"
+    if not is_loopback or allow_insecure != "true":
+        raise SystemExit("HTTP is allowed only for an explicitly enabled loopback URL")
+PY
+
+while [ "${MASTERDNS_API_URL%/}" != "$MASTERDNS_API_URL" ]; do
+  MASTERDNS_API_URL="${MASTERDNS_API_URL%/}"
+done
+case "$MASTERDNS_API_URL" in
+  https://*) CURL_PROTO="=https" ;;
+  http://*) CURL_PROTO="=http"; CURL_NO_PROXY="*" ;;
+esac
+
+if ! printf '%s' "$MASTERDNS_RUNTIME_TOKEN" | python3 -c '
+import re
+import sys
+
+if re.fullmatch(r"[A-Za-z0-9_-]{32,256}", sys.stdin.read()) is None:
+    raise SystemExit("MASTERDNS_RUNTIME_TOKEN has an invalid format")
+'; then
+  exit 1
+fi
 
 discover_ipv4() {
-  if [ -n "${MASTERDNS_IPV4:-}" ]; then
+  if [ -n "$MASTERDNS_IPV4" ]; then
     printf '%s' "$MASTERDNS_IPV4"
-  elif [ -n "${MASTERDNS_INTERFACE:-}" ]; then
+  elif [ -n "$MASTERDNS_INTERFACE" ]; then
     ip -4 -o addr show dev "$MASTERDNS_INTERFACE" scope global 2>/dev/null | awk 'NR == 1 { split($4, a, "/"); print a[1] }'
   else
-    curl -4 -fsS --max-time 10 https://api.ipify.org
+    curl -q -4 -fsS --proto '=https' --proto-redir '=https' --noproxy "$CURL_NO_PROXY" --max-time 10 https://api.ipify.org
   fi
 }
 
 discover_ipv6() {
-  if [ -n "${MASTERDNS_IPV6:-}" ]; then
+  if [ -n "$MASTERDNS_IPV6" ]; then
     printf '%s' "$MASTERDNS_IPV6"
-  elif [ -n "${MASTERDNS_INTERFACE:-}" ]; then
+  elif [ -n "$MASTERDNS_INTERFACE" ]; then
     ip -6 -o addr show dev "$MASTERDNS_INTERFACE" scope global 2>/dev/null | awk 'NR == 1 { split($4, a, "/"); print a[1] }'
   else
-    curl -6 -fsS --max-time 10 https://api6.ipify.org
+    curl -q -6 -fsS --proto '=https' --proto-redir '=https' --noproxy "$CURL_NO_PROXY" --max-time 10 https://api6.ipify.org
   fi
 }
 
-IPV4="$(discover_ipv4 2>/dev/null || true)"
-IPV6="$(discover_ipv6 2>/dev/null || true)"
+IPV4_KNOWN=true
+IPV6_KNOWN=true
+if [ -n "$MASTERDNS_IPV4" ] || [ -n "$MASTERDNS_INTERFACE" ]; then
+  IPV4="$(discover_ipv4 2>/dev/null || true)"
+elif ! IPV4="$(discover_ipv4 2>/dev/null)"; then
+  IPV4=""
+  IPV4_KNOWN=false
+fi
+if [ -n "$MASTERDNS_IPV6" ] || [ -n "$MASTERDNS_INTERFACE" ]; then
+  IPV6="$(discover_ipv6 2>/dev/null || true)"
+elif ! IPV6="$(discover_ipv6 2>/dev/null)"; then
+  IPV6=""
+  IPV6_KNOWN=false
+fi
 HOSTNAME_VALUE="$(hostname -f 2>/dev/null || hostname)"
 
-if [ -z "$IPV4" ] && [ -z "$IPV6" ]; then
-  echo "No public IPv4 or IPv6 address could be discovered" >&2
-  exit 1
-fi
-
-PAYLOAD="$(python3 - "$IPV4" "$IPV6" "$HOSTNAME_VALUE" <<'PY'
+PAYLOAD="$(python3 - "$IPV4" "$IPV6" "$IPV4_KNOWN" "$IPV6_KNOWN" "$HOSTNAME_VALUE" <<'PY'
 import json
 import sys
 
-payload = {"hostname": sys.argv[3], "agentVersion": "1.0.0"}
-if sys.argv[1]:
-    payload["ipv4"] = sys.argv[1]
-if sys.argv[2]:
-    payload["ipv6"] = sys.argv[2]
+payload = {
+    "hostname": sys.argv[5],
+    "agentVersion": "1.1.0",
+}
+if sys.argv[3] == "true":
+    payload["ipv4"] = sys.argv[1] or None
+if sys.argv[4] == "true":
+    payload["ipv6"] = sys.argv[2] or None
 print(json.dumps(payload, separators=(",", ":")))
 PY
 )"
 
-AUTH_CONFIG="$(mktemp)"
-trap 'rm -f "$AUTH_CONFIG"' EXIT HUP INT TERM
+AUTH_CONFIG="$(mktemp /tmp/masterdns-ddns-curl.XXXXXX)"
+cleanup() {
+  rm -f "$AUTH_CONFIG"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 chmod 0600 "$AUTH_CONFIG"
 printf 'header = "Authorization: Bearer %s"\n' "$MASTERDNS_RUNTIME_TOKEN" > "$AUTH_CONFIG"
 
-printf '%s' "$PAYLOAD" | curl -fsS \
+printf '%s' "$PAYLOAD" | curl -q -fsS \
   --config "$AUTH_CONFIG" \
+  --proto "$CURL_PROTO" \
+  --proto-redir "$CURL_PROTO" \
+  --noproxy "$CURL_NO_PROXY" \
   --retry 3 \
-  --retry-all-errors \
   --connect-timeout 10 \
   --max-time 30 \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   --data-binary @- \
-  "${MASTERDNS_API_URL%/}/api/v1/ddns/heartbeat"
+  "${MASTERDNS_API_URL}/api/v1/ddns/heartbeat"
 printf '\n'

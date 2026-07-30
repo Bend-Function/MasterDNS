@@ -15,6 +15,7 @@ import {
   operationSteps,
   operations,
   providerAccounts,
+  reconcileIntents,
   zones,
 } from "@masterdns/db";
 import { dnsRecordMatches } from "@masterdns/providers";
@@ -56,6 +57,18 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
       const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, job.data.poolId)).limit(1);
       if (!pool) return null;
 
+      if (job.data.decisionRevision !== undefined) {
+        const [intent] = await tx.select().from(reconcileIntents).where(and(
+          eq(reconcileIntents.eventId, job.data.eventId),
+          eq(reconcileIntents.poolId, pool.id),
+          eq(reconcileIntents.decisionRevision, job.data.decisionRevision),
+        )).limit(1);
+        if (!intent || intent.completedAt) return null;
+        await tx.update(reconcileIntents).set({ completedAt: new Date(), updatedAt: new Date() })
+          .where(eq(reconcileIntents.id, intent.id));
+        if (!isReconcileDecisionCurrent(pool, job.data)) return null;
+      }
+
       const idempotencyKey = `pool:${pool.id}:revision:${pool.policyRevision}:event:${job.data.eventId}`;
       const [existingOperation] = await tx.select({ id: operations.id }).from(operations)
         .where(eq(operations.idempotencyKey, idempotencyKey)).limit(1);
@@ -93,6 +106,9 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           lifecycle: endpoint.lifecycle,
           healthState: job.data.force && endpoint.lifecycle === "enabled" ? "healthy" : endpoint.healthState,
           activeBindingCount: assignmentRows.filter((assignment) => assignment.endpointId === endpoint.id && assignment.applied).length,
+          addressFamilies: addresses
+            .filter((row) => row.endpoint_addresses.endpointId === endpoint.id)
+            .map((row) => row.endpoint_addresses.family),
         })),
         bindings: bindings.map((binding) => {
           const applied = assignmentRows.filter((assignment) => assignment.domainBindingId === binding.id && assignment.applied).map((assignment) => assignment.endpointId);
@@ -100,17 +116,19 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
             id: binding.id,
             ...(binding.originalEndpointId ? { originalEndpointId: binding.originalEndpointId } : {}),
             currentEndpointIds: applied,
-            ...(bindingsWithHealthOverrides.has(binding.id) ? {
-              endpointHealthStates: Object.fromEntries(poolEndpoints.map((endpoint) => [
-                endpoint.id,
-                job.data.force && endpoint.lifecycle === "enabled"
-                  ? "healthy"
-                  : bindingHealthRows.find((row) => row.health.domainBindingId === binding.id && row.health.endpointId === endpoint.id)?.health.healthState ?? "unknown",
-              ])),
-            } : {}),
+            requiredAddressFamily: binding.recordType === "AAAA" ? "6" : "4",
+            endpointHealthStates: Object.fromEntries(poolEndpoints.map((endpoint) => [
+              endpoint.id,
+              job.data.force && endpoint.lifecycle === "enabled"
+                ? "healthy"
+                : bindingsWithHealthOverrides.has(binding.id)
+                  ? healthForCurrentBindingAddress(binding.id, endpoint.id, binding.recordType, bindingHealthRows, addresses)
+                  : currentAddressForBinding(endpoint.id, binding.recordType, addresses)?.healthState ?? "unknown",
+            ])),
           };
         }),
         ...(pool.roundRobinCursor ? { roundRobinCursor: pool.roundRobinCursor } : {}),
+        roundRobinCursors: pool.roundRobinCursors,
       });
       const queuedNotifications: NotificationEvent[] = [];
 
@@ -140,13 +158,16 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         queuedNotifications.push(notificationEvent(pool, job.data, decision, eventType));
       }
 
-      const bindingIds = decision.decisions.map((item) => item.bindingId);
+      const bindingIds = decision.decisions.filter((item) => shouldPlanProviderSteps(item.reason)).map((item) => item.bindingId);
       const bindingMap = new Map(bindings.map((binding) => [binding.id, binding]));
       const zoneRows = bindingIds.length === 0
         ? []
-        : await tx.select({ zone: zones, providerAccountId: providerAccounts.id })
+        : await tx.select({ zone: zones, providerAccountId: providerAccounts.id, providerStatus: providerAccounts.status })
           .from(zones).innerJoin(providerAccounts, eq(zones.providerAccountId, providerAccounts.id))
           .where(inArray(zones.id, bindings.filter((binding) => bindingIds.includes(binding.id)).map((binding) => binding.zoneId)));
+      if (!providersReadyForReconcile(zoneRows.map((row) => row.providerStatus))) {
+        throw new Error("A DNS provider account is unavailable; reconcile intent remains pending");
+      }
       const zoneMap = new Map(zoneRows.map((row) => [row.zone.id, row]));
       const recordIds = assignmentRows.flatMap((assignment) => assignment.dnsRecordId ? [assignment.dnsRecordId] : []);
       const records = recordIds.length === 0 ? [] : await tx.select().from(dnsRecords).where(inArray(dnsRecords.id, recordIds));
@@ -157,9 +178,6 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
       for (const item of decision.decisions) {
         const binding = bindingMap.get(item.bindingId);
         if (!binding) continue;
-        const zone = zoneMap.get(binding.zoneId);
-        if (!zone) throw new Error(`Zone ${binding.zoneId} is unavailable for Pool reconcile`);
-        const family = binding.recordType === "AAAA" ? "6" : "4";
         const existing = assignmentRows.filter((assignment) => assignment.domainBindingId === binding.id);
 
         await tx.update(bindingAssignments).set({ desired: false, updatedAt: new Date() })
@@ -177,17 +195,21 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           });
         }
 
-        if (pool.strategy === "healthy_set") {
-          this.planHealthySet(pending, item, binding, zone, existing, recordMap, addressMap, pool.id);
-        } else {
-          this.planSingleAssignment(pending, item, binding, zone, existing, recordMap, addressMap, pool.id);
+        if (shouldPlanProviderSteps(item.reason)) {
+          const zone = zoneMap.get(binding.zoneId);
+          if (!zone) throw new Error(`Zone ${binding.zoneId} is unavailable for Pool reconcile`);
+          if (pool.strategy === "healthy_set") {
+            this.planHealthySet(pending, item, binding, zone, existing, recordMap, addressMap, pool.id);
+          } else {
+            this.planSingleAssignment(pending, item, binding, zone, existing, recordMap, addressMap, pool.id);
+          }
         }
         await tx.update(domainBindings).set({ state: item.reason === "no_healthy_endpoint" ? "failed" : pending.some((step) => step.input.bindingId === binding.id) ? "switching" : "healthy", desiredRevision: pool.policyRevision, updatedAt: new Date() })
           .where(eq(domainBindings.id, binding.id));
       }
 
-      if (decision.nextRoundRobinCursor) {
-        await tx.update(endpointPools).set({ roundRobinCursor: decision.nextRoundRobinCursor, updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
+      if (decision.nextRoundRobinCursors) {
+        await tx.update(endpointPools).set({ roundRobinCursors: decision.nextRoundRobinCursors, updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
       }
       if (pending.length === 0) {
         await tx.update(endpointPools).set({ lastReconciledAt: new Date(), updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
@@ -211,6 +233,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         resourceType: "endpoint_pool",
         resourceId: pool.id,
         policyRevision: pool.policyRevision,
+        ...(job.data.decisionRevision !== undefined ? { decisionRevision: job.data.decisionRevision } : {}),
         desiredSnapshot: decision,
       }).returning({ id: operations.id });
       if (!operation) throw new Error("Pool operation insert returned no row");
@@ -361,6 +384,35 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
   }
 }
 
+export function shouldPlanProviderSteps(reason: StrategyDecision["decisions"][number]["reason"]): boolean {
+  return reason !== "no_healthy_endpoint";
+}
+
+function currentAddressForBinding(
+  endpointId: string,
+  recordType: string,
+  addresses: Array<{ endpoint_addresses: typeof endpointAddresses.$inferSelect }>,
+) {
+  const family = recordType === "AAAA" ? "6" : "4";
+  return addresses.find((row) => row.endpoint_addresses.endpointId === endpointId
+    && row.endpoint_addresses.family === family)?.endpoint_addresses;
+}
+
+function healthForCurrentBindingAddress(
+  bindingId: string,
+  endpointId: string,
+  recordType: string,
+  healthRows: Array<{ health: typeof bindingEndpointHealth.$inferSelect }>,
+  addresses: Array<{ endpoint_addresses: typeof endpointAddresses.$inferSelect }>,
+) {
+  const currentAddress = currentAddressForBinding(endpointId, recordType, addresses);
+  if (!currentAddress) return "unknown" as const;
+  const health = healthRows.find((row) => row.health.domainBindingId === bindingId
+    && row.health.endpointId === endpointId
+    && row.health.endpointAddressId === currentAddress.id)?.health;
+  return health?.healthState ?? "unknown";
+}
+
 function requiredAddress(addresses: Map<string, typeof endpointAddresses.$inferSelect>, endpointId: string, recordType: string) {
   const family = recordType === "AAAA" ? "6" : "4";
   const address = addresses.get(`${endpointId}:${family}`);
@@ -383,7 +435,29 @@ function managedMetadata(poolId: string, bindingId: string, endpointId: string, 
 }
 
 function eventEvidence(job: PoolReconcileJob, policyRevision: number) {
-  return { eventId: job.eventId, trigger: job.trigger, source: reconcileOperationSource(job), policyRevision, force: job.force ?? false };
+  return {
+    eventId: job.eventId,
+    trigger: job.trigger,
+    source: reconcileOperationSource(job),
+    policyRevision,
+    decisionRevision: job.decisionRevision ?? null,
+    force: job.force ?? false,
+  };
+}
+
+export function isReconcileDecisionCurrent(
+  pool: Pick<typeof endpointPools.$inferSelect, "policyRevision" | "decisionRevision">,
+  job: Pick<PoolReconcileJob, "policyRevision" | "decisionRevision">,
+): boolean {
+  return job.decisionRevision === undefined
+    || (pool.decisionRevision === job.decisionRevision
+      && (job.policyRevision === undefined || pool.policyRevision === job.policyRevision));
+}
+
+export function providersReadyForReconcile(
+  statuses: (typeof providerAccounts.$inferSelect["status"])[],
+): boolean {
+  return statuses.every((status) => status === "active");
 }
 
 function reconcileEventType(trigger: PoolReconcileJob["trigger"]): string {

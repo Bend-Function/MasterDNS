@@ -37,11 +37,16 @@ export const createEndpointSchema = z.object({
 
 export const updateEndpointSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
+  addressMode: z.literal("static").optional(),
   priority: z.number().int().min(0).max(1_000_000).optional(),
   lifecycle: z.enum(["enabled", "disabled", "maintenance", "draining"]).optional(),
   ipv4: nullableIp(4).optional(),
   ipv6: nullableIp(6).optional(),
   forceApply: z.boolean().default(false),
+}).superRefine((value, context) => {
+  if (value.addressMode === "static" && !value.ipv4 && !value.ipv6) {
+    context.addIssue({ code: "custom", message: "切换为静态节点时至少提供一个 IP 地址", path: ["addressMode"] });
+  }
 }).refine((value) => Object.keys(value).some((key) => key !== "forceApply"), "至少提供一个要修改的字段");
 
 export const createBindingSchema = z.object({

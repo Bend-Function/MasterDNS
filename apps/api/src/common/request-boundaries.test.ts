@@ -26,4 +26,9 @@ describe("database error redaction", () => {
     expect(publicDatabaseError({ code: "23514" })?.code).toBe("validation_failed");
     expect(publicDatabaseError(new Error("unknown"))).toBeNull();
   });
+
+  it("maps serialization and deadlock retries to public conflicts", () => {
+    expect(publicDatabaseError({ code: "40001" })).toEqual({ status: 409, code: "conflict", message: "配置正在被其他操作修改，请刷新后重试" });
+    expect(publicDatabaseError({ code: "40P01" })?.status).toBe(409);
+  });
 });

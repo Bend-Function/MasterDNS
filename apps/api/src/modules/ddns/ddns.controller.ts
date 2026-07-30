@@ -37,6 +37,13 @@ export class DdnsController {
   }
 
   @Public()
+  @AllowNonBrowser()
+  @Post("v1/ddns/revoke")
+  revokeRuntime(@Headers("authorization") authorization: string | undefined, @Req() request: FastifyRequest) {
+    return this.ddns.revokeRuntime(authorization, request.ip);
+  }
+
+  @Public()
   @Header("Content-Type", "text/plain; charset=utf-8")
   @Header("Cache-Control", "no-store")
   @Get("v1/ddns/install.sh")

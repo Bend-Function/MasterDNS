@@ -23,7 +23,7 @@ export const httpCheckConfigSchema = z.object({
   expectedStatusMin: z.number().int().min(100).max(599).default(200),
   expectedStatusMax: z.number().int().min(100).max(599).default(399),
   bodyContains: z.string().max(2048).optional(),
-  bodyPattern: z.string().max(2048).optional(),
+  bodyPattern: z.string().max(2048).refine(isValidRegularExpression, "响应正文正则表达式不合法").optional(),
   followRedirects: z.boolean().default(true),
   verifyTls: z.boolean().default(true),
   timeoutMs: z.number().int().min(100).max(60_000).default(3000),
@@ -54,3 +54,12 @@ export type HealthObservation = {
   consecutiveSuccesses: number;
   consecutiveFailures: number;
 };
+
+function isValidRegularExpression(value: string): boolean {
+  try {
+    new RegExp(value);
+    return true;
+  } catch {
+    return false;
+  }
+}

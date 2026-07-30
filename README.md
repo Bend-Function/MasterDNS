@@ -11,14 +11,14 @@ PRD v1.0、架构和数据模型已经确认。当前实现包含本地多用户
 ## Docker Compose
 
 ```bash
-cp .env.example .env
+install -m 0600 .env.example .env
 openssl rand -base64 32
 # 将生成值写入 MASTER_ENCRYPTION_KEY，并修改 POSTGRES_PASSWORD
 # 和 BOOTSTRAP_ADMIN_PASSWORD
 docker compose up --build
 ```
 
-默认入口：Web `http://localhost:3000`，API `http://localhost:4000/api/health`。
+默认入口：Web `http://localhost:3000`，API `http://localhost:4000/api/health`。Compose 默认只监听 `127.0.0.1`；需要由其他主机访问时，应明确修改 `BIND_ADDRESS` 并同时配置防火墙。
 
 生产部署应在 Web/API 前配置 HTTPS 反向代理，并将 `WEB_URL`、`PUBLIC_API_URL`、`NEXT_PUBLIC_API_URL` 和 `TRUSTED_PROXY_CIDRS` 设置为实际地址。数据库卷包含加密后的云凭证；`MASTER_ENCRYPTION_KEY` 必须独立备份，不能提交到 Git。
 

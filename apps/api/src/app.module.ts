@@ -3,7 +3,9 @@ import { APP_GUARD } from "@nestjs/core";
 import { AuthGuard } from "./auth/auth.guard.js";
 import { AuthModule } from "./auth/auth.module.js";
 import { OriginGuard } from "./auth/origin.guard.js";
+import { PreAuthRateLimitGuard } from "./auth/pre-auth-rate-limit.guard.js";
 import { RateLimitGuard } from "./auth/rate-limit.guard.js";
+import { SseConcurrencyGuard } from "./auth/sse-concurrency.guard.js";
 import { DatabaseModule } from "./infrastructure/database.module.js";
 import { QueueModule } from "./infrastructure/queue.module.js";
 import { DdnsModule } from "./modules/ddns/ddns.module.js";
@@ -21,8 +23,10 @@ import { UsersModule } from "./modules/users/users.module.js";
   controllers: [HealthController, EventsController],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },
+    { provide: APP_GUARD, useClass: PreAuthRateLimitGuard },
     { provide: APP_GUARD, useClass: AuthGuard },
     { provide: APP_GUARD, useClass: RateLimitGuard },
+    SseConcurrencyGuard,
   ],
 })
 export class AppModule {}

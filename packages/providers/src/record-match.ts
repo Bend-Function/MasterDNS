@@ -1,4 +1,5 @@
 import type { DnsRecordInput } from "@masterdns/contracts";
+import { normalizeAliyunStatusForComparison } from "./record-hash.js";
 
 export type ComparableDnsRecord = {
   type: string;
@@ -10,13 +11,23 @@ export type ComparableDnsRecord = {
 };
 
 export function dnsRecordMatches(actual: ComparableDnsRecord, expected: DnsRecordInput): boolean {
+  const expectedTtl = expected.providerMetadata.proxied === true ? 1 : expected.ttl;
   if (actual.type !== expected.type
     || normalizeName(actual.name) !== normalizeName(expected.name)
     || actual.content !== expected.content
-    || actual.ttl !== expected.ttl
+    || actual.ttl !== expectedTtl
     || (actual.priority ?? null) !== (expected.priority ?? null)) return false;
   return Object.entries(expected.providerMetadata)
-    .every(([key, value]) => value === undefined || deepEqual(actual.providerMetadata[key], value));
+    .every(([key, value]) => value === undefined || providerMetadataEqual(key, actual.providerMetadata[key], value));
+}
+
+function providerMetadataEqual(key: string, actual: unknown, expected: unknown): boolean {
+  if (key === "status" && typeof actual === "string" && typeof expected === "string") {
+    const normalizedActual = normalizeAliyunStatusForComparison(actual);
+    const normalizedExpected = normalizeAliyunStatusForComparison(expected);
+    if (normalizedActual !== undefined || normalizedExpected !== undefined) return normalizedActual === normalizedExpected;
+  }
+  return deepEqual(actual, expected);
 }
 
 function normalizeName(value: string): string {

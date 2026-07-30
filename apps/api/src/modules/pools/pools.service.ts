@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
+import { isIP } from "node:net";
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
-import { healthCheckConfigSchema, type HealthCheckConfig, type PoolReconcileJob } from "@masterdns/contracts";
+import { healthCheckConfigSchema, type HealthCheckConfig, type HealthCheckJob, type PoolReconcileJob } from "@masterdns/contracts";
 import {
   auditLogs,
   bindingAssignments,
+  bindingEndpointHealth,
   ddnsAgents,
   dnsRecords,
   domainBindings,
@@ -17,6 +19,7 @@ import {
   operations,
   policyVersions,
   providerAccounts,
+  reconcileIntents,
   zones,
 } from "@masterdns/db";
 import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
@@ -83,6 +86,37 @@ const policySnapshotSchema = z.object({
     revision: z.number().int().positive(),
   }).refine((check) => [check.poolId, check.endpointId, check.domainBindingId].filter(Boolean).length === 1, "健康检查作用域无效")),
 });
+
+type PolicySnapshot = z.infer<typeof policySnapshotSchema>;
+type DatabaseTransaction = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
+
+export function validateRestorablePolicySnapshot(snapshot: PolicySnapshot, poolId: string) {
+  const endpointIds = new Set(snapshot.endpoints.map((endpoint) => endpoint.id));
+  const bindingIds = new Set(snapshot.bindings.map((binding) => binding.id));
+  for (const endpoint of snapshot.endpoints) {
+    if (endpoint.addressMode !== "static") continue;
+    const currentStaticAddresses = snapshot.addresses.filter((address) => (
+      address.endpointId === endpoint.id
+      && address.state === "current"
+      && address.source === "static"
+    ));
+    if (currentStaticAddresses.length === 0) throw new ConflictException(`历史节点 ${endpoint.name} 没有可恢复的静态地址`);
+    if (new Set(currentStaticAddresses.map((address) => address.family)).size !== currentStaticAddresses.length) {
+      throw new ConflictException(`历史节点 ${endpoint.name} 包含重复的静态地址族`);
+    }
+    for (const address of currentStaticAddresses) {
+      if (isIP(address.address) !== Number(address.family)) throw new ConflictException(`历史节点 ${endpoint.name} 包含无效的 IPv${address.family} 地址`);
+    }
+  }
+  for (const check of snapshot.healthChecks) {
+    const config = healthCheckConfigSchema.safeParse(check.config);
+    const validScope = check.poolId === poolId
+      || Boolean(check.endpointId && endpointIds.has(check.endpointId))
+      || Boolean(check.domainBindingId && bindingIds.has(check.domainBindingId));
+    if (!config.success || config.data.type !== check.checkerType || !validScope) throw new ConflictException("历史版本包含无效的健康检查配置");
+  }
+  return { endpointIds, bindingIds };
+}
 
 @Injectable()
 export class PoolsService {
@@ -169,7 +203,7 @@ export class PoolsService {
   }
 
   async restorePolicyVersion(actor: AuthUser, poolId: string, version: number, input: { force: boolean }) {
-    const currentPool = await this.findOwnedPool(actor, poolId);
+    await this.findOwnedPool(actor, poolId);
     const [targetVersion] = await this.database.db.select().from(policyVersions).where(and(
       eq(policyVersions.poolId, poolId),
       eq(policyVersions.version, version),
@@ -178,35 +212,30 @@ export class PoolsService {
     const parsed = policySnapshotSchema.safeParse(targetVersion.snapshot);
     if (!parsed.success) throw new ConflictException("该历史版本格式不完整，无法安全回滚");
     const snapshot = parsed.data;
-    const [currentEndpoints, currentBindings, currentChecks, currentAddresses] = await Promise.all([
-      this.database.db.select().from(endpoints).where(eq(endpoints.poolId, poolId)),
-      this.database.db.select().from(domainBindings).where(eq(domainBindings.poolId, poolId)),
-      this.database.db.select().from(healthCheckConfigs).where(or(
-        eq(healthCheckConfigs.poolId, poolId),
-        inArray(healthCheckConfigs.endpointId, this.database.db.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, poolId))),
-        inArray(healthCheckConfigs.domainBindingId, this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
-      )),
-      this.database.db.select({ address: endpointAddresses }).from(endpointAddresses)
-        .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, poolId)),
-    ]);
-    if (!sameIdSet(currentEndpoints, snapshot.endpoints) || !sameIdSet(currentBindings, snapshot.bindings)) {
-      throw new ConflictException("旧版本与当前版本的节点或域名绑定集合不同；请先通过节点/绑定流程恢复相同结构，再重试策略回滚");
-    }
-    const endpointIds = new Set(snapshot.endpoints.map((endpoint) => endpoint.id));
-    const bindingIds = new Set(snapshot.bindings.map((binding) => binding.id));
-    for (const endpoint of snapshot.endpoints) {
-      const currentAddresses = snapshot.addresses.filter((address) => address.endpointId === endpoint.id && address.state === "current");
-      if (endpoint.addressMode === "static" && currentAddresses.length === 0) throw new ConflictException(`历史节点 ${endpoint.name} 没有可恢复的静态地址`);
-    }
-    for (const check of snapshot.healthChecks) {
-      const config = healthCheckConfigSchema.safeParse(check.config);
-      const validScope = check.poolId === poolId
-        || Boolean(check.endpointId && endpointIds.has(check.endpointId))
-        || Boolean(check.domainBindingId && bindingIds.has(check.domainBindingId));
-      if (!config.success || config.data.type !== check.checkerType || !validScope) throw new ConflictException("历史版本包含无效的健康检查配置");
-    }
+    const { bindingIds } = validateRestorablePolicySnapshot(snapshot, poolId);
+    const eventId = randomUUID();
 
-    const restoredPool = await this.database.db.transaction(async (tx) => {
+    const restored = await this.database.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [lockedPool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, poolId)).limit(1).for("update");
+      if (!lockedPool || (actor.role !== "admin" && lockedPool.ownerUserId !== actor.id)) throw new NotFoundException("IP Pool 不存在");
+
+      const [currentEndpoints, currentBindings, currentChecks, currentAddresses] = await Promise.all([
+        tx.select().from(endpoints).where(eq(endpoints.poolId, poolId)).for("update"),
+        tx.select().from(domainBindings).where(eq(domainBindings.poolId, poolId)).for("update"),
+        tx.select().from(healthCheckConfigs).where(or(
+          eq(healthCheckConfigs.poolId, poolId),
+          inArray(healthCheckConfigs.endpointId, tx.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, poolId))),
+          inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
+        )).for("update"),
+        tx.select({ address: endpointAddresses }).from(endpointAddresses)
+          .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, poolId)),
+      ]);
+      if (!sameIdSet(currentEndpoints, snapshot.endpoints) || !sameIdSet(currentBindings, snapshot.bindings)) {
+        throw new ConflictException("旧版本与当前版本的节点或域名绑定集合不同；请先通过节点/绑定流程恢复相同结构，再重试策略回滚");
+      }
+
+      const restoredAt = new Date();
       const [pool] = await tx.update(endpointPools).set({
         name: snapshot.pool.name,
         description: snapshot.pool.description ?? null,
@@ -220,28 +249,20 @@ export class PoolsService {
         checkTimeoutMs: snapshot.pool.checkTimeoutMs,
         switchCooldownSeconds: snapshot.pool.switchCooldownSeconds,
         allDownReminderSeconds: snapshot.pool.allDownReminderSeconds,
+        state: "unknown",
+        roundRobinCursor: null,
+        roundRobinCursors: {},
         enabled: snapshot.pool.enabled,
-        pausedAt: snapshot.pool.enabled ? null : new Date(),
-        enabledAt: snapshot.pool.enabled ? new Date() : currentPool.enabledAt,
+        pausedAt: snapshot.pool.enabled ? null : restoredAt,
+        enabledAt: snapshot.pool.enabled ? restoredAt : lockedPool.enabledAt,
         policyRevision: sql`${endpointPools.policyRevision} + 1`,
-        updatedAt: new Date(),
+        decisionRevision: sql`${endpointPools.decisionRevision} + 1`,
+        updatedAt: restoredAt,
       }).where(eq(endpointPools.id, poolId)).returning();
       if (!pool) throw new NotFoundException("IP Pool 不存在");
 
       for (const endpoint of snapshot.endpoints) {
-        await tx.update(endpoints).set({
-          name: endpoint.name,
-          addressMode: endpoint.addressMode,
-          priority: endpoint.priority,
-          lifecycle: endpoint.lifecycle,
-          updatedAt: new Date(),
-        }).where(and(eq(endpoints.id, endpoint.id), eq(endpoints.poolId, poolId)));
-        if (endpoint.addressMode === "static") {
-          for (const family of ["4", "6"] as const) {
-            const desired = snapshot.addresses.find((address) => address.endpointId === endpoint.id && address.family === family && address.state === "current" && address.source === "static");
-            await replaceStaticAddress(tx, endpoint.id, family, desired?.address ?? null);
-          }
-        }
+        await restoreEndpointPolicy(tx, poolId, endpoint, snapshot.addresses, restoredAt);
       }
       for (const binding of snapshot.bindings) {
         await tx.update(domainBindings).set({
@@ -252,8 +273,11 @@ export class PoolsService {
           providerMetadata: binding.providerMetadata,
           originalEndpointId: binding.originalEndpointId ?? null,
           desiredRevision: pool.policyRevision,
-          updatedAt: new Date(),
+          updatedAt: restoredAt,
         }).where(and(eq(domainBindings.id, binding.id), eq(domainBindings.poolId, poolId)));
+      }
+      if (bindingIds.size > 0) {
+        await tx.delete(bindingEndpointHealth).where(inArray(bindingEndpointHealth.domainBindingId, [...bindingIds]));
       }
 
       const targetCheckIds = new Set(snapshot.healthChecks.map((check) => check.id));
@@ -279,7 +303,7 @@ export class PoolsService {
             config: check.config,
             enabled: check.enabled,
             revision: check.revision,
-            updatedAt: new Date(),
+            updatedAt: restoredAt,
           },
         });
       }
@@ -296,20 +320,38 @@ export class PoolsService {
       ]);
       const restoredSnapshot = { pool, endpoints: restoredEndpoints, addresses: restoredAddresses.map((row) => row.address), bindings: restoredBindings, healthChecks: restoredChecks };
       await tx.insert(policyVersions).values({ poolId, version: pool.policyRevision, snapshot: restoredSnapshot, reason: `policy.rollback:${version}`, actorUserId: actor.id });
+      await tx.insert(reconcileIntents).values({
+        eventId,
+        poolId,
+        decisionRevision: pool.decisionRevision,
+        policyRevision: pool.policyRevision,
+        trigger: "configuration",
+        source: "rollback",
+        force: input.force,
+        availableAt: restoredAt,
+      });
       await tx.insert(auditLogs).values({
-        ownerUserId: currentPool.ownerUserId,
+        ownerUserId: lockedPool.ownerUserId,
         actorUserId: actor.id,
         source: "rollback",
         action: "policy.rollback",
         resourceType: "endpoint_pool",
         resourceId: poolId,
-        beforeSnapshot: { pool: currentPool, endpoints: currentEndpoints, addresses: currentAddresses.map((row) => row.address), bindings: currentBindings, healthChecks: currentChecks },
+        beforeSnapshot: { pool: lockedPool, endpoints: currentEndpoints, addresses: currentAddresses.map((row) => row.address), bindings: currentBindings, healthChecks: currentChecks },
         afterSnapshot: { restoredFromVersion: version, newVersion: pool.policyRevision },
+        eventId,
       });
-      return pool;
-    });
-    const reconcile = await this.enqueueReconcile(poolId, "configuration", input.force);
-    return { pool: restoredPool, restoredFromVersion: version, reconcile };
+      return {
+        pool,
+        reconcile: {
+          queued: true,
+          eventId,
+          decisionRevision: pool.decisionRevision,
+          policyRevision: pool.policyRevision,
+        },
+      };
+    }, { isolationLevel: "serializable" });
+    return { pool: restored.pool, restoredFromVersion: version, reconcile: restored.reconcile };
   }
 
   async pause(actor: AuthUser, poolId: string) {
@@ -367,11 +409,46 @@ export class PoolsService {
   async updateEndpoint(actor: AuthUser, poolId: string, endpointId: string, input: UpdateEndpointInput) {
     await this.findOwnedPool(actor, poolId);
     const current = await this.findEndpoint(poolId, endpointId);
-    const { ipv4, ipv6, forceApply, ...fields } = input;
+    const { ipv4, ipv6, forceApply, addressMode, ...fields } = input;
     const updated = await this.database.db.transaction(async (tx) => {
+      const [lockedEndpoint] = await tx.select().from(endpoints).where(and(
+        eq(endpoints.id, endpointId),
+        eq(endpoints.poolId, poolId),
+      )).limit(1).for("update");
+      if (!lockedEndpoint) throw new NotFoundException("节点不存在");
+
+      const convertingToStatic = lockedEndpoint.addressMode === "ddns" && addressMode === "static";
       let addressChanged = false;
-      if (ipv4 !== undefined || ipv6 !== undefined) {
-        if (current.addressMode !== "static") throw new ConflictException("DDNS 节点地址只能由 Agent 上报");
+      if (convertingToStatic) {
+        if (!ipv4 && !ipv6) throw new BadRequestException("切换为静态节点时至少提供一个 IP 地址");
+
+        const now = new Date();
+        await tx.select({ id: ddnsAgents.id }).from(ddnsAgents)
+          .where(eq(ddnsAgents.endpointId, endpointId)).limit(1).for("update");
+        await tx.update(endpointAddresses).set({ state: "previous", replacedAt: now }).where(and(
+          eq(endpointAddresses.endpointId, endpointId),
+          or(eq(endpointAddresses.state, "candidate"), eq(endpointAddresses.state, "current")),
+        ));
+        if (ipv4) await tx.insert(endpointAddresses).values({
+          endpointId,
+          family: "4",
+          address: ipv4,
+          state: "current",
+          source: "static",
+          promotedAt: now,
+        });
+        if (ipv6) await tx.insert(endpointAddresses).values({
+          endpointId,
+          family: "6",
+          address: ipv6,
+          state: "current",
+          source: "static",
+          promotedAt: now,
+        });
+        await disableDdnsAgent(tx, endpointId, now);
+        addressChanged = true;
+      } else if (ipv4 !== undefined || ipv6 !== undefined) {
+        if (lockedEndpoint.addressMode !== "static") throw new ConflictException("DDNS 节点地址只能由 Agent 上报；请显式切换为静态节点");
         if (ipv4 !== undefined) addressChanged = await replaceStaticAddress(tx, endpointId, "4", ipv4) || addressChanged;
         if (ipv6 !== undefined) addressChanged = await replaceStaticAddress(tx, endpointId, "6", ipv6) || addressChanged;
         const remaining = await tx.select({ id: endpointAddresses.id }).from(endpointAddresses)
@@ -380,7 +457,14 @@ export class PoolsService {
       }
       const [row] = await tx.update(endpoints).set({
         ...fields,
-        ...(addressChanged ? { healthState: "unknown" as const, consecutiveSuccesses: 0, consecutiveFailures: 0, stateChangedAt: new Date() } : {}),
+        ...(addressMode ? { addressMode } : {}),
+        ...(addressChanged ? {
+          healthState: "unknown" as const,
+          consecutiveSuccesses: 0,
+          consecutiveFailures: 0,
+          lastCheckedAt: null,
+          stateChangedAt: new Date(),
+        } : {}),
         updatedAt: new Date(),
       }).where(eq(endpoints.id, endpointId)).returning();
       return row;
@@ -420,12 +504,18 @@ export class PoolsService {
     const endpointScoped = configs.filter((config) => config.endpointId === endpointId);
     const effective = endpointScoped.length > 0 ? endpointScoped : configs.filter((config) => config.poolId === poolId);
     if (effective.length === 0) throw new BadRequestException("该节点没有可用的健康检查配置");
-    await Promise.all(effective.map((config) => this.queues.health.add("check-endpoint", { endpointId, configId: config.id, manual: true }, {
-      jobId: `manual-health-${endpointId}-${config.id}-${randomUUID()}`,
+    const addresses = await this.database.db.select({ id: endpointAddresses.id }).from(endpointAddresses).where(and(
+      eq(endpointAddresses.endpointId, endpointId),
+      eq(endpointAddresses.state, "current"),
+    ));
+    if (addresses.length === 0) throw new BadRequestException("该节点没有当前 IP 地址");
+    const jobs = buildManualHealthJobs(endpointId, effective, addresses);
+    await Promise.all(jobs.map((data) => this.queues.health.add("check-endpoint", data, {
+      jobId: `manual-health-${endpointId}-${data.configId}-${data.addressId}-${randomUUID()}`,
       removeOnComplete: 1000,
       removeOnFail: 1000,
     })));
-    return { queued: effective.length };
+    return { queued: jobs.length };
   }
 
   async createBinding(actor: AuthUser, poolId: string, input: CreateBindingInput) {
@@ -630,14 +720,28 @@ export class PoolsService {
 
   private async enqueueReconcile(poolId: string, trigger: PoolReconcileJob["trigger"], force = false) {
     const eventId = randomUUID();
-    await this.queues.reconcile.add("reconcile-pool", { poolId, eventId, trigger, source: "user", force }, {
-      jobId: `reconcile-${eventId}`,
-      attempts: 3,
-      backoff: { type: "exponential", delay: 1_000 },
-      removeOnComplete: 5_000,
-      removeOnFail: 5_000,
+    const revision = await this.database.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.update(endpointPools).set({
+        decisionRevision: sql`${endpointPools.decisionRevision} + 1`,
+        updatedAt: new Date(),
+      }).where(eq(endpointPools.id, poolId)).returning({
+        decisionRevision: endpointPools.decisionRevision,
+        policyRevision: endpointPools.policyRevision,
+      });
+      if (!pool) throw new NotFoundException("IP Pool 不存在");
+      await tx.insert(reconcileIntents).values({
+        eventId,
+        poolId,
+        decisionRevision: pool.decisionRevision,
+        policyRevision: pool.policyRevision,
+        trigger,
+        source: "user",
+        force,
+      });
+      return pool;
     });
-    return { queued: true, eventId };
+    return { queued: true, eventId, ...revision };
   }
 
   private async recordPolicyChange(actor: AuthUser, poolId: string, reason: string, before: unknown, after: unknown, ownerOverride?: string) {
@@ -679,8 +783,21 @@ export class PoolsService {
   }
 }
 
+export function buildManualHealthJobs(
+  endpointId: string,
+  configs: Pick<typeof healthCheckConfigs.$inferSelect, "id">[],
+  addresses: Pick<typeof endpointAddresses.$inferSelect, "id">[],
+): HealthCheckJob[] {
+  return configs.flatMap((config) => addresses.map((address) => ({
+    endpointId,
+    configId: config.id,
+    addressId: address.id,
+    manual: true,
+  })));
+}
+
 async function replaceStaticAddress(
-  tx: Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0],
+  tx: DatabaseTransaction,
   endpointId: string,
   family: "4" | "6",
   address: string | null,
@@ -690,10 +807,120 @@ async function replaceStaticAddress(
     eq(endpointAddresses.family, family),
     eq(endpointAddresses.state, "current"),
   )).limit(1);
-  if (current?.address === address) return false;
+  if (current?.address === address && current.source === "static") return false;
+  if (!current && address === null) return false;
+  if (current?.address === address) {
+    await tx.update(endpointAddresses).set({
+      source: "static",
+      healthState: "unknown",
+      consecutiveSuccesses: 0,
+      consecutiveFailures: 0,
+      lastCheckedAt: null,
+      observedAt: new Date(),
+    }).where(eq(endpointAddresses.id, current.id));
+    return true;
+  }
   if (current) await tx.update(endpointAddresses).set({ state: "previous", replacedAt: new Date() }).where(eq(endpointAddresses.id, current.id));
   if (address) await tx.insert(endpointAddresses).values({ endpointId, family, address, state: "current", source: "static", promotedAt: new Date() });
   return true;
+}
+
+async function disableDdnsAgent(
+  tx: DatabaseTransaction,
+  endpointId: string,
+  now: Date,
+): Promise<void> {
+  await tx.update(ddnsAgents).set({
+    installTokenHash: null,
+    installTokenExpiresAt: null,
+    runtimeTokenHash: null,
+    previousRuntimeTokenHash: null,
+    previousRuntimeTokenExpiresAt: null,
+    status: "disabled",
+    revokedAt: now,
+    updatedAt: now,
+  }).where(eq(ddnsAgents.endpointId, endpointId));
+}
+
+export async function restoreEndpointPolicy(
+  tx: DatabaseTransaction,
+  poolId: string,
+  endpoint: PolicySnapshot["endpoints"][number],
+  addresses: PolicySnapshot["addresses"],
+  restoredAt: Date,
+): Promise<void> {
+  const [lockedEndpoint] = await tx.select({ id: endpoints.id, addressMode: endpoints.addressMode })
+    .from(endpoints).where(and(eq(endpoints.id, endpoint.id), eq(endpoints.poolId, poolId)))
+    .limit(1).for("update");
+  if (!lockedEndpoint) throw new ConflictException(`节点 ${endpoint.name} 已被删除，无法完成策略回滚`);
+
+  const modeChanged = lockedEndpoint.addressMode !== endpoint.addressMode;
+  if (endpoint.addressMode === "static" || modeChanged) {
+    await tx.select({ id: ddnsAgents.id }).from(ddnsAgents)
+      .where(eq(ddnsAgents.endpointId, endpoint.id)).limit(1).for("update");
+    await disableDdnsAgent(tx, endpoint.id, restoredAt);
+  }
+
+  const resetHealth = {
+    healthState: "unknown" as const,
+    consecutiveSuccesses: 0,
+    consecutiveFailures: 0,
+    lastCheckedAt: null,
+  };
+  if (endpoint.addressMode === "static") {
+    await tx.update(endpointAddresses).set({
+      state: "previous",
+      replacedAt: restoredAt,
+      ...resetHealth,
+    }).where(and(
+      eq(endpointAddresses.endpointId, endpoint.id),
+      inArray(endpointAddresses.state, ["candidate", "current"]),
+    ));
+    const desired = addresses.filter((address) => (
+      address.endpointId === endpoint.id
+      && address.state === "current"
+      && address.source === "static"
+    ));
+    if (desired.length > 0) {
+      await tx.insert(endpointAddresses).values(desired.map((address) => ({
+        endpointId: endpoint.id,
+        family: address.family,
+        address: address.address,
+        state: "current" as const,
+        source: "static" as const,
+        healthState: "unknown" as const,
+        consecutiveSuccesses: 0,
+        consecutiveFailures: 0,
+        lastCheckedAt: null,
+        observedAt: restoredAt,
+        promotedAt: restoredAt,
+      })));
+    }
+  } else if (modeChanged) {
+    await tx.update(endpointAddresses).set({
+      state: "previous",
+      replacedAt: restoredAt,
+      ...resetHealth,
+    }).where(and(
+      eq(endpointAddresses.endpointId, endpoint.id),
+      inArray(endpointAddresses.state, ["candidate", "current"]),
+    ));
+  } else {
+    await tx.update(endpointAddresses).set(resetHealth).where(and(
+      eq(endpointAddresses.endpointId, endpoint.id),
+      inArray(endpointAddresses.state, ["candidate", "current"]),
+    ));
+  }
+
+  await tx.update(endpoints).set({
+    name: endpoint.name,
+    addressMode: endpoint.addressMode,
+    priority: endpoint.priority,
+    lifecycle: endpoint.lifecycle,
+    ...resetHealth,
+    stateChangedAt: restoredAt,
+    updatedAt: restoredAt,
+  }).where(and(eq(endpoints.id, endpoint.id), eq(endpoints.poolId, poolId)));
 }
 
 function normalizeFqdn(value: string, zoneName: string): string {

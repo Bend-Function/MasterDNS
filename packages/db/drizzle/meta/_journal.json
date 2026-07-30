@@ -57,6 +57,27 @@
       "when": 1785395454954,
       "tag": "0007_outstanding_cloak",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785411629309,
+      "tag": "0008_pink_makkari",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1785412277967,
+      "tag": "0009_spotty_union_jack",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1785414005158,
+      "tag": "0010_glamorous_shape",
+      "breakpoints": true
     }
   ]
 }

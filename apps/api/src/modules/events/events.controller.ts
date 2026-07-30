@@ -1,9 +1,10 @@
-import { Controller, Sse, type MessageEvent } from "@nestjs/common";
+import { Controller, Sse, UseGuards, type MessageEvent } from "@nestjs/common";
 import { endpointPools, failoverEvents, operations } from "@masterdns/db";
 import { desc, eq } from "drizzle-orm";
 import { Observable } from "rxjs";
 import { CurrentUser } from "../../auth/auth.decorators.js";
 import type { AuthUser } from "../../auth/auth.types.js";
+import { SseConcurrencyGuard } from "../../auth/sse-concurrency.guard.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 
 const POLL_INTERVAL_MS = 3_000;
@@ -13,6 +14,7 @@ export class EventsController {
   constructor(private readonly database: DatabaseService) {}
 
   @Sse()
+  @UseGuards(SseConcurrencyGuard)
   stream(@CurrentUser() actor: AuthUser): Observable<MessageEvent> {
     return new Observable<MessageEvent>((subscriber) => {
       let active = true;

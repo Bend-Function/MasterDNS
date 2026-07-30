@@ -16,13 +16,15 @@
     "lint": "pnpm -r --if-present lint",
     "typecheck": "pnpm -r --if-present typecheck",
     "test": "pnpm -r --if-present test",
-    "test:coverage": "pnpm -r --if-present test:coverage",
+    "test:coverage": "pnpm --filter @masterdns/automation test:coverage",
     "db:generate": "pnpm --filter @masterdns/db generate",
+    "db:preflight": "pnpm --filter @masterdns/db preflight",
     "db:migrate": "pnpm --filter @masterdns/db migrate",
     "db:seed": "pnpm --filter @masterdns/db seed"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "@vitest/coverage-v8": "4.0.18",
     "typescript": "^5.9.3",
     "vitest": "4.0.18"
   }

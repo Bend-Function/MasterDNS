@@ -14,6 +14,7 @@ import { request } from "undici";
 import { DatabaseService } from "../database.service.js";
 import { env } from "../env.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
+import { postJsonToAllowedUrl } from "../security/outbound-request.js";
 
 class DeliveryError extends Error {
   constructor(readonly code: string, readonly status?: number, readonly excerpt?: string) {
@@ -196,8 +197,7 @@ async function deliverWebhook(endpoint: string | null, secret: string, eventId: 
   if (!endpoint) throw new DeliveryError("webhook_endpoint_missing");
   const body = JSON.stringify(payload);
   const timestamp = Math.floor(Date.now() / 1000);
-  const response = await request(endpoint, {
-    method: "POST",
+  const status = await postJsonToAllowedUrl(endpoint, {
     headers: {
       "content-type": "application/json",
       "user-agent": "MasterDNS-Webhook/1.0",
@@ -206,12 +206,11 @@ async function deliverWebhook(endpoint: string | null, secret: string, eventId: 
       "x-masterdns-signature": signWebhook(secret, timestamp, body),
     },
     body,
-    headersTimeout: 10_000,
-    bodyTimeout: 10_000,
+    timeoutMs: 10_000,
+    policy: { allowPrivate: env.ALLOW_PRIVATE_WEBHOOK_TARGETS },
   });
-  const excerpt = await readExcerpt(response.body);
-  if (response.statusCode < 200 || response.statusCode >= 300) throw new DeliveryError("webhook_http_error", response.statusCode, excerpt);
-  return { status: response.statusCode, excerpt };
+  if (status < 200 || status >= 300) throw new DeliveryError("webhook_http_error", status);
+  return { status, excerpt: undefined };
 }
 
 async function deliverTelegram(chatId: string | null, botToken: string, payload: Record<string, unknown>) {

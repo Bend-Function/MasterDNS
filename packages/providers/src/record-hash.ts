@@ -8,8 +8,20 @@ export function providerRecordHash(record: Pick<ProviderRecord, "type" | "name" 
     content: record.content,
     ttl: record.ttl,
     priority: record.priority ?? null,
-    providerMetadata: record.providerMetadata,
+    providerMetadata: normalizeProviderMetadata(record.providerMetadata),
   })).digest("hex");
+}
+
+export function normalizeProviderMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const status = typeof metadata.status === "string" ? normalizeAliyunStatusForComparison(metadata.status) : undefined;
+  return status === undefined ? metadata : { ...metadata, status };
+}
+
+export function normalizeAliyunStatusForComparison(value: string): "Enable" | "Disable" | undefined {
+  const normalized = value.toLowerCase();
+  if (normalized === "enable" || normalized === "enabled") return "Enable";
+  if (normalized === "disable" || normalized === "disabled") return "Disable";
+  return undefined;
 }
 
 function stableJson(value: unknown): string {

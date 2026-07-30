@@ -2,10 +2,11 @@ import { Injectable, UnauthorizedException } from "@nestjs/common";
 import { and, eq, or, sql } from "drizzle-orm";
 import type { FastifyReply, FastifyRequest } from "fastify";
 import { sessions, users } from "@masterdns/db";
-import { createOpaqueToken, hashToken, verifyPassword } from "@masterdns/crypto";
+import { createOpaqueToken, hashToken } from "@masterdns/crypto";
 import { DatabaseService } from "../infrastructure/database.module.js";
 import { env } from "../config/env.js";
 import { SESSION_COOKIE } from "./auth.guard.js";
+import { verifyLoginCredentials } from "./login-credentials.js";
 
 const SESSION_AGE_SECONDS = 7 * 24 * 60 * 60;
 
@@ -20,7 +21,8 @@ export class AuthService {
       or(sql`lower(${users.username}) = ${normalized}`, sql`lower(${users.email}) = ${normalized}`),
     )).limit(1);
     const user = rows[0];
-    if (!user || !(await verifyPassword(user.passwordHash, password))) throw new UnauthorizedException("用户名或密码错误");
+    const credentialsValid = await verifyLoginCredentials(user?.passwordHash, password);
+    if (!user || !credentialsValid) throw new UnauthorizedException("用户名或密码错误");
     const token = createOpaqueToken();
     const expiresAt = new Date(Date.now() + SESSION_AGE_SECONDS * 1000);
     await this.database.db.insert(sessions).values({
