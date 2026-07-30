@@ -1,0 +1,3 @@
+CREATE UNIQUE INDEX "health_check_one_active_pool_unique" ON "health_check_configs" USING btree ("pool_id") WHERE "health_check_configs"."pool_id" is not null and "health_check_configs"."enabled" = true;--> statement-breakpoint
+CREATE UNIQUE INDEX "health_check_one_active_endpoint_unique" ON "health_check_configs" USING btree ("endpoint_id") WHERE "health_check_configs"."endpoint_id" is not null and "health_check_configs"."enabled" = true;--> statement-breakpoint
+CREATE UNIQUE INDEX "health_check_one_active_binding_unique" ON "health_check_configs" USING btree ("domain_binding_id") WHERE "health_check_configs"."domain_binding_id" is not null and "health_check_configs"."enabled" = true;

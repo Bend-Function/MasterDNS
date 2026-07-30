@@ -74,6 +74,15 @@ install_agent_binary() {
   mv "$AGENT_PATH.tmp" "$AGENT_PATH"
 }
 
+validate_config_value() {
+  value="$1"
+  label="$2"
+  case "$value" in
+    *"'"*|*"
+"*) echo "$label contains unsupported characters" >&2; exit 2 ;;
+  esac
+}
+
 case "$ACTION" in
   status)
     systemctl --no-pager status masterdns-ddns.timer masterdns-ddns.service
@@ -106,18 +115,22 @@ esac
 
 [ -n "$API_URL" ] || { echo "--url is required" >&2; exit 2; }
 [ -n "$INSTALL_TOKEN" ] || { echo "--token is required" >&2; exit 2; }
+case "$API_URL" in http://*|https://*) ;; *) echo "--url must use http:// or https://" >&2; exit 2 ;; esac
+validate_config_value "$API_URL" "API URL"
+validate_config_value "$INSTALL_TOKEN" "Install token"
+validate_config_value "$INTERFACE" "Interface"
+validate_config_value "$IPV4" "IPv4 address"
+validate_config_value "$IPV6" "IPv6 address"
 command -v systemctl >/dev/null 2>&1 || { echo "systemd is required" >&2; exit 1; }
 
 install_dependencies
 create_user
 
-EXCHANGE_PAYLOAD="$(python3 - "$INSTALL_TOKEN" <<'PY'
-import json
-import sys
-print(json.dumps({"installToken": sys.argv[1]}, separators=(",", ":")))
-PY
+EXCHANGE_RESPONSE="$(
+  printf '%s' "$INSTALL_TOKEN" |
+    python3 -c 'import json,sys; print(json.dumps({"installToken": sys.stdin.read()}, separators=(",", ":")))' |
+    curl -fsS --connect-timeout 10 --max-time 30 -H 'Content-Type: application/json' --data-binary @- "${API_URL%/}/api/v1/ddns/exchange"
 )"
-EXCHANGE_RESPONSE="$(curl -fsS --connect-timeout 10 --max-time 30 -H 'Content-Type: application/json' --data "$EXCHANGE_PAYLOAD" "${API_URL%/}/api/v1/ddns/exchange")"
 RUNTIME_TOKEN="$(printf '%s' "$EXCHANGE_RESPONSE" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runtimeToken"])')"
 [ -n "$RUNTIME_TOKEN" ] || { echo "Server did not return a runtime token" >&2; exit 1; }
 

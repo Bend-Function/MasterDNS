@@ -34,6 +34,7 @@ export const endpointLifecycleEnum = pgEnum("endpoint_lifecycle", ["enabled", "d
 export const addressFamilyEnum = pgEnum("address_family", ["4", "6"]);
 export const addressStateEnum = pgEnum("address_state", ["candidate", "current", "previous"]);
 export const healthStateEnum = pgEnum("health_state", ["unknown", "healthy", "degraded", "unhealthy", "recovering"]);
+export const healthStatPeriodEnum = pgEnum("health_stat_period", ["hour", "day"]);
 export const bindingStateEnum = pgEnum("binding_state", ["healthy", "switching", "failed", "drifted"]);
 export const operationSourceEnum = pgEnum("operation_source", ["user", "failover", "recovery", "ddns", "drift", "sync", "rollback"]);
 export const operationStatusEnum = pgEnum("operation_status", ["pending", "running", "succeeded", "partial", "failed", "superseded"]);
@@ -116,6 +117,7 @@ export const endpointPools = pgTable("endpoint_pools", {
   checkIntervalSeconds: integer("check_interval_seconds").notNull().default(15),
   checkTimeoutMs: integer("check_timeout_ms").notNull().default(3000),
   switchCooldownSeconds: integer("switch_cooldown_seconds").notNull().default(300),
+  allDownReminderSeconds: integer("all_down_reminder_seconds").notNull().default(1800),
   state: healthStateEnum("state").notNull().default("unknown"),
   policyRevision: integer("policy_revision").notNull().default(1),
   roundRobinCursor: uuid("round_robin_cursor"),
@@ -128,6 +130,7 @@ export const endpointPools = pgTable("endpoint_pools", {
   index("endpoint_pools_owner_idx").on(table.ownerUserId),
   check("pool_thresholds_positive", sql`${table.failureThreshold} > 0 and ${table.successThreshold} > 0`),
   check("pool_check_interval_valid", sql`${table.checkIntervalSeconds} >= 5`),
+  check("pool_reminder_interval_valid", sql`${table.allDownReminderSeconds} >= 60`),
 ]);
 
 export const endpoints = pgTable("endpoints", {
@@ -152,6 +155,10 @@ export const endpointAddresses = pgTable("endpoint_addresses", {
   address: varchar("address", { length: 45 }).notNull(),
   state: addressStateEnum("state").notNull(),
   source: endpointAddressModeEnum("source").notNull(),
+  healthState: healthStateEnum("health_state").notNull().default("unknown"),
+  consecutiveSuccesses: integer("consecutive_successes").notNull().default(0),
+  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
   observedAt: timestamp("observed_at", { withTimezone: true }).notNull().defaultNow(),
   promotedAt: timestamp("promoted_at", { withTimezone: true }),
   replacedAt: timestamp("replaced_at", { withTimezone: true }),
@@ -225,6 +232,9 @@ export const healthCheckConfigs = pgTable("health_check_configs", {
   check("health_check_exactly_one_scope", sql`num_nonnulls(${table.poolId}, ${table.endpointId}, ${table.domainBindingId}) = 1`),
   index("health_check_pool_idx").on(table.poolId),
   index("health_check_endpoint_idx").on(table.endpointId),
+  uniqueIndex("health_check_one_active_pool_unique").on(table.poolId).where(sql`${table.poolId} is not null and ${table.enabled} = true`),
+  uniqueIndex("health_check_one_active_endpoint_unique").on(table.endpointId).where(sql`${table.endpointId} is not null and ${table.enabled} = true`),
+  uniqueIndex("health_check_one_active_binding_unique").on(table.domainBindingId).where(sql`${table.domainBindingId} is not null and ${table.enabled} = true`),
 ]);
 
 export const healthCheckResults = pgTable("health_check_results", {
@@ -242,6 +252,39 @@ export const healthCheckResults = pgTable("health_check_results", {
 }, (table) => [
   index("health_results_endpoint_time_idx").on(table.endpointId, table.checkedAt),
   index("health_results_binding_time_idx").on(table.domainBindingId, table.checkedAt),
+]);
+
+export const healthCheckStats = pgTable("health_check_stats", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  endpointId: uuid("endpoint_id").notNull().references(() => endpoints.id, { onDelete: "cascade" }),
+  domainBindingId: uuid("domain_binding_id").references(() => domainBindings.id, { onDelete: "cascade" }),
+  scopeKey: varchar("scope_key", { length: 64 }).notNull(),
+  period: healthStatPeriodEnum("period").notNull(),
+  bucketStart: timestamp("bucket_start", { withTimezone: true }).notNull(),
+  sampleCount: integer("sample_count").notNull(),
+  successCount: integer("success_count").notNull(),
+  averageLatencyMs: real("average_latency_ms").notNull(),
+  minimumLatencyMs: real("minimum_latency_ms").notNull(),
+  maximumLatencyMs: real("maximum_latency_ms").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  uniqueIndex("health_stats_scope_period_bucket_unique").on(table.endpointId, table.scopeKey, table.period, table.bucketStart),
+  index("health_stats_endpoint_time_idx").on(table.endpointId, table.period, table.bucketStart),
+]);
+
+export const bindingEndpointHealth = pgTable("binding_endpoint_health", {
+  domainBindingId: uuid("domain_binding_id").notNull().references(() => domainBindings.id, { onDelete: "cascade" }),
+  endpointId: uuid("endpoint_id").notNull().references(() => endpoints.id, { onDelete: "cascade" }),
+  healthState: healthStateEnum("health_state").notNull().default("unknown"),
+  consecutiveSuccesses: integer("consecutive_successes").notNull().default(0),
+  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
+  stateChangedAt: timestamp("state_changed_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (table) => [
+  primaryKey({ columns: [table.domainBindingId, table.endpointId] }),
+  index("binding_endpoint_health_endpoint_idx").on(table.endpointId),
 ]);
 
 export const ddnsAgents = pgTable("ddns_agents", {
@@ -368,6 +411,7 @@ export const notificationDeliveries = pgTable("notification_deliveries", {
   payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
   status: deliveryStatusEnum("status").notNull().default("pending"),
   attempts: integer("attempts").notNull().default(0),
+  durationMs: integer("duration_ms"),
   nextRetryAt: timestamp("next_retry_at", { withTimezone: true }),
   responseStatus: integer("response_status"),
   responseExcerpt: varchar("response_excerpt", { length: 512 }),

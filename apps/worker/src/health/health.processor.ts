@@ -5,6 +5,7 @@ import { CheckerRegistry } from "@masterdns/checkers";
 import type { HealthCheckConfig, HealthCheckJob, HealthState, PoolReconcileJob } from "@masterdns/contracts";
 import { healthCheckConfigSchema, queueNames } from "@masterdns/contracts";
 import {
+  bindingEndpointHealth,
   ddnsAgents,
   domainBindings,
   endpointAddresses,
@@ -42,6 +43,11 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
     if (!target) return;
     const config = healthCheckConfigSchema.parse(target.config.config);
     if (config.type !== target.config.checkerType) throw new Error("Health checker type does not match its config");
+    const lockKey = ["masterdns", "health-lock", target.endpoint.id, target.config.id, target.binding?.id ?? "base", target.address.id].join(":");
+    const lockToken = randomUUID();
+    const acquired = await this.queues.redis.set(lockKey, lockToken, "PX", config.timeoutMs + 5_000, "NX");
+    if (acquired !== "OK") return;
+    try {
     const checker = this.registry.get(config.type);
     const port = config.type === "tcp" ? config.port : config.port ?? (config.protocol === "https" ? 443 : 80);
     const hostname = config.type === "http" ? config.hostname ?? target.binding?.fqdn : undefined;
@@ -56,11 +62,21 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
       await tx.execute(sql`select id from endpoints where id = ${target.endpoint.id} for update`);
       const [current] = await tx.select().from(endpoints).where(eq(endpoints.id, target.endpoint.id)).limit(1);
       if (!current) return null;
-      const next = applyHealthResult({
-        state: current.healthState,
-        consecutiveSuccesses: current.consecutiveSuccesses,
-        consecutiveFailures: current.consecutiveFailures,
-      }, result.success, {
+      const [bindingHealth] = target.binding
+        ? await tx.select().from(bindingEndpointHealth).where(and(
+          eq(bindingEndpointHealth.domainBindingId, target.binding.id),
+          eq(bindingEndpointHealth.endpointId, current.id),
+        )).limit(1)
+        : [];
+      const checkingCandidate = target.address.state === "candidate" && !target.binding;
+      const observation = checkingCandidate
+        ? { state: target.address.healthState, consecutiveSuccesses: target.address.consecutiveSuccesses, consecutiveFailures: target.address.consecutiveFailures }
+        : bindingHealth
+          ? { state: bindingHealth.healthState, consecutiveSuccesses: bindingHealth.consecutiveSuccesses, consecutiveFailures: bindingHealth.consecutiveFailures }
+          : target.binding
+            ? { state: "unknown" as const, consecutiveSuccesses: 0, consecutiveFailures: 0 }
+            : { state: current.healthState, consecutiveSuccesses: current.consecutiveSuccesses, consecutiveFailures: current.consecutiveFailures };
+      const next = applyHealthResult(observation, result.success, {
         failureThreshold: target.pool.failureThreshold,
         successThreshold: target.pool.successThreshold,
       });
@@ -77,17 +93,46 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
         errorDetail: result.errorDetail?.slice(0, 512) ?? null,
         checkedAt: result.checkedAt,
       });
-      await tx.update(endpoints).set({
-        healthState: next.state,
-        consecutiveSuccesses: next.consecutiveSuccesses,
-        consecutiveFailures: next.consecutiveFailures,
-        lastCheckedAt: result.checkedAt,
-        ...(next.state !== current.healthState ? { stateChangedAt: result.checkedAt } : {}),
-        updatedAt: new Date(),
-      }).where(eq(endpoints.id, current.id));
+      if (checkingCandidate) {
+        await tx.update(endpointAddresses).set({
+          healthState: next.state,
+          consecutiveSuccesses: next.consecutiveSuccesses,
+          consecutiveFailures: next.consecutiveFailures,
+          lastCheckedAt: result.checkedAt,
+        }).where(eq(endpointAddresses.id, target.address.id));
+      } else if (target.binding) {
+        await tx.insert(bindingEndpointHealth).values({
+          domainBindingId: target.binding.id,
+          endpointId: current.id,
+          healthState: next.state,
+          consecutiveSuccesses: next.consecutiveSuccesses,
+          consecutiveFailures: next.consecutiveFailures,
+          lastCheckedAt: result.checkedAt,
+          stateChangedAt: next.state !== observation.state ? result.checkedAt : bindingHealth?.stateChangedAt ?? result.checkedAt,
+        }).onConflictDoUpdate({
+          target: [bindingEndpointHealth.domainBindingId, bindingEndpointHealth.endpointId],
+          set: {
+            healthState: next.state,
+            consecutiveSuccesses: next.consecutiveSuccesses,
+            consecutiveFailures: next.consecutiveFailures,
+            lastCheckedAt: result.checkedAt,
+            ...(next.state !== observation.state ? { stateChangedAt: result.checkedAt } : {}),
+            updatedAt: new Date(),
+          },
+        });
+      } else {
+        await tx.update(endpoints).set({
+          healthState: next.state,
+          consecutiveSuccesses: next.consecutiveSuccesses,
+          consecutiveFailures: next.consecutiveFailures,
+          lastCheckedAt: result.checkedAt,
+          ...(next.state !== current.healthState ? { stateChangedAt: result.checkedAt } : {}),
+          updatedAt: new Date(),
+        }).where(eq(endpoints.id, current.id));
+      }
 
       let promoted = false;
-      if (target.address.state === "candidate" && next.state === "healthy") {
+      if (checkingCandidate && next.state === "healthy") {
         await tx.update(endpointAddresses).set({
           state: "previous",
           replacedAt: new Date(),
@@ -101,18 +146,37 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
           .where(eq(endpointAddresses.id, target.address.id));
         await tx.update(ddnsAgents).set({ lastIpChangedAt: new Date(), updatedAt: new Date() })
           .where(eq(ddnsAgents.endpointId, current.id));
+        await tx.update(endpoints).set({
+          healthState: "healthy",
+          consecutiveSuccesses: next.consecutiveSuccesses,
+          consecutiveFailures: 0,
+          lastCheckedAt: result.checkedAt,
+          stateChangedAt: current.healthState === "healthy" ? current.stateChangedAt : result.checkedAt,
+          updatedAt: new Date(),
+        }).where(eq(endpoints.id, current.id));
         promoted = true;
+      } else if (checkingCandidate && next.state === "unhealthy" && observation.state !== "unhealthy") {
+        await tx.update(endpoints).set({
+          healthState: "unhealthy",
+          consecutiveSuccesses: 0,
+          consecutiveFailures: next.consecutiveFailures,
+          lastCheckedAt: result.checkedAt,
+          stateChangedAt: result.checkedAt,
+          updatedAt: new Date(),
+        }).where(eq(endpoints.id, current.id));
       }
 
-      const poolEndpoints = await tx.select({ state: endpoints.healthState }).from(endpoints)
-        .where(eq(endpoints.poolId, target.pool.id));
-      await tx.update(endpointPools).set({ state: aggregatePoolState(poolEndpoints.map((item) => item.state)), updatedAt: new Date() })
-        .where(eq(endpointPools.id, target.pool.id));
+      if (!target.binding) {
+        const poolEndpoints = await tx.select({ state: endpoints.healthState }).from(endpoints)
+          .where(eq(endpoints.poolId, target.pool.id));
+        await tx.update(endpointPools).set({ state: aggregatePoolState(poolEndpoints.map((item) => item.state)), updatedAt: new Date() })
+          .where(eq(endpointPools.id, target.pool.id));
+      }
 
-      if (promoted) return { trigger: "configuration" as const, previous: current.healthState, next: next.state };
-      if (next.state === current.healthState) return null;
-      if (next.state === "unhealthy") return { trigger: "failure" as const, previous: current.healthState, next: next.state };
-      if (next.state === "healthy" && current.healthState !== "healthy") return { trigger: "recovery" as const, previous: current.healthState, next: next.state };
+      if (promoted) return { trigger: "configuration" as const, previous: observation.state, next: next.state };
+      if (next.state === observation.state) return null;
+      if (next.state === "unhealthy") return { trigger: "failure" as const, previous: observation.state, next: next.state };
+      if (next.state === "healthy" && observation.state !== "healthy") return { trigger: "recovery" as const, previous: observation.state, next: next.state };
       return null;
     });
 
@@ -124,9 +188,13 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
         trigger: transition.trigger,
         endpointId: target.endpoint.id,
       };
-      const delay = transition.trigger === "recovery" && target.pool.recoveryMode === "delayed"
-        ? target.pool.recoveryDelaySeconds * 1000
-        : 0;
+      const delay = recoveryReconcileDelayMs({
+        trigger: transition.trigger,
+        recoveryMode: target.pool.recoveryMode,
+        recoveryDelaySeconds: target.pool.recoveryDelaySeconds,
+        switchCooldownSeconds: target.pool.switchCooldownSeconds,
+        lastReconciledAt: target.pool.lastReconciledAt,
+      });
       await this.queues.reconcile.add("reconcile-pool", data, {
         jobId: `reconcile-${eventId}`,
         delay,
@@ -135,6 +203,14 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
         removeOnComplete: 5_000,
         removeOnFail: 5_000,
       });
+    }
+    } finally {
+      await this.queues.redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        lockKey,
+        lockToken,
+      );
     }
   }
 
@@ -156,6 +232,21 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
     if (!pool || !config || !address) return null;
     return { endpoint, pool, config, binding, address };
   }
+}
+
+export function recoveryReconcileDelayMs(input: {
+  trigger: PoolReconcileJob["trigger"];
+  recoveryMode: "automatic" | "keep_current" | "manual" | "delayed";
+  recoveryDelaySeconds: number;
+  switchCooldownSeconds: number;
+  lastReconciledAt: Date | null;
+}, now = Date.now()): number {
+  if (input.trigger !== "recovery") return 0;
+  const configuredRecoveryDelay = input.recoveryMode === "delayed" ? input.recoveryDelaySeconds * 1000 : 0;
+  const cooldownRemaining = input.lastReconciledAt
+    ? Math.max(0, input.lastReconciledAt.getTime() + input.switchCooldownSeconds * 1000 - now)
+    : 0;
+  return Math.max(configuredRecoveryDelay, cooldownRemaining);
 }
 
 function aggregatePoolState(states: HealthState[]): HealthState {

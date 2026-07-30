@@ -11,6 +11,9 @@ import { QueueService } from "../../infrastructure/queue.module.js";
 type CreateAccountInput =
   | { name: string; ownerUserId?: string | undefined; provider: "cloudflare"; apiToken: string }
   | { name: string; ownerUserId?: string | undefined; provider: "aliyun"; accessKeyId: string; accessKeySecret: string; regionId?: string | undefined };
+type RotateCredentialsInput =
+  | { provider: "cloudflare"; apiToken: string }
+  | { provider: "aliyun"; accessKeyId: string; accessKeySecret: string; regionId?: string | undefined };
 
 @Injectable()
 export class ProviderAccountsService {
@@ -29,6 +32,10 @@ export class ProviderAccountsService {
   async create(actor: AuthUser, input: CreateAccountInput) {
     const ownerUserId = actor.role === "admin" && input.ownerUserId ? input.ownerUserId : actor.id;
     if (actor.role !== "admin" && input.ownerUserId && input.ownerUserId !== actor.id) throw new ForbiddenException("不能为其他用户创建云账号");
+    if (actor.role === "admin" && input.ownerUserId) {
+      const [owner] = await this.database.db.select({ id: users.id }).from(users).where(eq(users.id, input.ownerUserId)).limit(1);
+      if (!owner) throw new NotFoundException("账号所有者不存在");
+    }
     const credentials = providerCredentialsOnly(input);
     const adapter = createProviderAdapter(credentials);
     const capabilities = await adapter.verifyCredentials();
@@ -66,6 +73,39 @@ export class ProviderAccountsService {
     return publicAccount(updated);
   }
 
+  async rotateCredentials(actor: AuthUser, id: string, input: RotateCredentialsInput) {
+    const current = await this.findOwned(actor, id);
+    if (current.provider !== input.provider) throw new ForbiddenException("不能更改云账号的 Provider 类型");
+    const credentials = providerCredentialsOnly(input);
+    const capabilities = await createProviderAdapter(credentials).verifyCredentials();
+    const encrypted = encryptJson(credentials, this.encryptionKey, current.credentialKeyVersion);
+    const [updated] = await this.database.db.update(providerAccounts).set({
+      credentialCiphertext: encrypted.ciphertext,
+      credentialIv: encrypted.iv,
+      credentialTag: encrypted.tag,
+      credentialKeyVersion: encrypted.keyVersion,
+      credentialHint: credentialHint(input),
+      capabilities,
+      status: "active",
+      errorCode: null,
+      lastVerifiedAt: new Date(),
+      updatedAt: new Date(),
+    }).where(eq(providerAccounts.id, id)).returning();
+    if (!updated) throw new Error("Provider credential rotation returned no row");
+    await this.database.db.insert(auditLogs).values({
+      ownerUserId: current.ownerUserId,
+      actorUserId: actor.id,
+      source: "user",
+      action: "provider_account.credentials_rotate",
+      resourceType: "provider_account",
+      resourceId: id,
+      beforeSnapshot: publicAccount(current),
+      afterSnapshot: publicAccount(updated),
+    });
+    await this.queues.sync.add("sync-provider-account", { providerAccountId: id }, { jobId: `provider-sync-${id}-${Date.now()}`, removeOnComplete: 100, removeOnFail: 500 });
+    return publicAccount(updated);
+  }
+
   private async findOwned(actor: AuthUser, id: string) {
     const condition = actor.role === "admin"
       ? eq(providerAccounts.id, id)
@@ -76,12 +116,12 @@ export class ProviderAccountsService {
   }
 }
 
-function providerCredentialsOnly(input: CreateAccountInput): ProviderCredentials {
+function providerCredentialsOnly(input: CreateAccountInput | RotateCredentialsInput): ProviderCredentials {
   if (input.provider === "cloudflare") return { provider: "cloudflare", apiToken: input.apiToken };
   return { provider: "aliyun", accessKeyId: input.accessKeyId, accessKeySecret: input.accessKeySecret, ...(input.regionId ? { regionId: input.regionId } : {}) };
 }
 
-function credentialHint(input: CreateAccountInput): string {
+function credentialHint(input: CreateAccountInput | RotateCredentialsInput): string {
   if (input.provider === "cloudflare") return "API Token";
   return `AccessKey ...${input.accessKeyId.slice(-4)}`;
 }

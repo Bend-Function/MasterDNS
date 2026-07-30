@@ -7,13 +7,12 @@ import { createOpaqueToken, hashToken } from "@masterdns/crypto";
 import {
   auditLogs,
   ddnsAgents,
-  domainBindings,
   endpointAddresses,
   endpointPools,
   endpoints,
   healthCheckConfigs,
 } from "@masterdns/db";
-import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, eq, isNull, or, sql } from "drizzle-orm";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { env } from "../../config/env.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
@@ -199,25 +198,22 @@ export class DdnsService {
   }
 
   private async enqueueCandidateChecks(poolId: string, endpointId: string, addressId: string) {
-    const bindingIds = this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId));
     const configs = await this.database.db.select().from(healthCheckConfigs).where(and(
       eq(healthCheckConfigs.enabled, true),
       or(
         eq(healthCheckConfigs.endpointId, endpointId),
         eq(healthCheckConfigs.poolId, poolId),
-        inArray(healthCheckConfigs.domainBindingId, bindingIds),
       ),
     ));
     const endpointConfigs = configs.filter((config) => config.endpointId === endpointId);
-    const base = endpointConfigs.length > 0 ? endpointConfigs : configs.filter((config) => config.poolId === poolId);
-    const effective = [...base, ...configs.filter((config) => config.domainBindingId)];
+    const effective = endpointConfigs.length > 0 ? endpointConfigs : configs.filter((config) => config.poolId === poolId);
+    if (effective.length === 0) throw new BadRequestException("DDNS 候选地址没有可用的节点或 Pool 健康检查，无法安全发布");
     await Promise.all(effective.map((config) => {
       const data: HealthCheckJob = {
         endpointId,
         configId: config.id,
         addressId,
         manual: true,
-        ...(config.domainBindingId ? { bindingId: config.domainBindingId } : {}),
       };
       return this.queues.health.add("check-ddns-candidate", data, {
         jobId: `ddns-health-${addressId}-${config.id}-${Date.now()}`,

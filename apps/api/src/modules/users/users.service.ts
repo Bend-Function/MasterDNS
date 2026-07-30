@@ -18,9 +18,14 @@ export class UsersService {
 
   async create(actor: AuthUser, input: { username: string; email?: string | undefined; password: string; role: "admin" | "user" }) {
     assertAdmin(actor);
-    const existing = await this.database.db.select({ id: users.id }).from(users)
+    const existingUsername = await this.database.db.select({ id: users.id }).from(users)
       .where(sql`lower(${users.username}) = ${input.username.toLowerCase()}`).limit(1);
-    if (existing.length > 0) throw new ConflictException("用户名已存在");
+    if (existingUsername.length > 0) throw new ConflictException("用户名已存在");
+    if (input.email) {
+      const existingEmail = await this.database.db.select({ id: users.id }).from(users)
+        .where(sql`lower(${users.email}) = ${input.email.toLowerCase()}`).limit(1);
+      if (existingEmail.length > 0) throw new ConflictException("邮箱已被其他用户使用");
+    }
     const [created] = await this.database.db.insert(users).values({
       username: input.username.trim(),
       email: input.email?.trim() || null,

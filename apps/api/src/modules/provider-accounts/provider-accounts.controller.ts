@@ -10,6 +10,10 @@ const createSchema = z.discriminatedUnion("provider", [
   z.object({ ...base, provider: z.literal("aliyun"), accessKeyId: z.string().trim().min(8).max(128), accessKeySecret: z.string().trim().min(16).max(256), regionId: z.string().trim().max(80).optional() }),
 ]);
 const statusSchema = z.object({ status: z.enum(["active", "disabled"]) });
+const rotateSchema = z.discriminatedUnion("provider", [
+  z.object({ provider: z.literal("cloudflare"), apiToken: z.string().trim().min(20).max(512) }),
+  z.object({ provider: z.literal("aliyun"), accessKeyId: z.string().trim().min(8).max(128), accessKeySecret: z.string().trim().min(16).max(256), regionId: z.string().trim().max(80).optional() }),
+]);
 
 @Controller("v1/provider-accounts")
 export class ProviderAccountsController {
@@ -27,5 +31,10 @@ export class ProviderAccountsController {
   @Patch(":id/status")
   status(@CurrentUser() actor: AuthUser, @Param("id") id: string, @Body() body: unknown) {
     return this.accounts.setStatus(actor, id, statusSchema.parse(body).status);
+  }
+
+  @Patch(":id/credentials")
+  credentials(@CurrentUser() actor: AuthUser, @Param("id") id: string, @Body() body: unknown) {
+    return this.accounts.rotateCredentials(actor, id, rotateSchema.parse(body));
   }
 }

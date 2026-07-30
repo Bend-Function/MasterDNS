@@ -3,15 +3,19 @@ import { setTimeout as delay } from "node:timers/promises";
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import type { DnsRecordInput, OperationJob, ProviderRecord } from "@masterdns/contracts";
 import { ProviderError, queueNames } from "@masterdns/contracts";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import {
   auditLogs,
   bindingAssignments,
   dnsRecords,
   domainBindings,
+  endpointAddresses,
   endpointPools,
+  endpoints,
+  healthCheckConfigs,
   operationSteps,
   operations,
+  policyVersions,
   providerAccounts,
   zones,
 } from "@masterdns/db";
@@ -39,12 +43,15 @@ const stepInputSchema = z.object({
   endpointId: z.string().uuid().optional(),
   assignmentMode: z.enum(["single", "set"]).optional(),
   previousEndpointIds: z.array(z.string().uuid()).optional(),
+  deleteBinding: z.boolean().optional(),
 });
 
 @Injectable()
 export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OperationProcessor.name);
   private worker?: Worker<OperationJob>;
+  private recoveryTimer?: NodeJS.Timeout;
+  private recovering = false;
 
   constructor(
     private readonly database: DatabaseService,
@@ -60,11 +67,44 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     });
     this.worker.on("failed", (job, error) => this.logger.error(`Operation job ${job?.id ?? "unknown"} failed: ${safeError(error)}`));
     await this.recoverPending();
+    this.recoveryTimer = setInterval(() => void this.recoverPending(), 30_000);
+    this.recoveryTimer.unref();
   }
 
-  async onModuleDestroy() { await this.worker?.close(); }
+  async onModuleDestroy() {
+    if (this.recoveryTimer) clearInterval(this.recoveryTimer);
+    await this.worker?.close();
+  }
 
   private async process(job: Job<OperationJob>) {
+    const operationId = job.data.operationId;
+    const lockKey = `masterdns:operation-lock:${operationId}`;
+    const lockToken = randomUUID();
+    if (await this.queues.redis.set(lockKey, lockToken, "PX", 90_000, "NX") !== "OK") return;
+    const refreshTimer = setInterval(() => {
+      void this.queues.redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('pexpire', KEYS[1], ARGV[2]) else return 0 end",
+        1,
+        lockKey,
+        lockToken,
+        90_000,
+      ).catch(() => undefined);
+    }, 30_000);
+    refreshTimer.unref();
+    try {
+      return await this.processLocked(job);
+    } finally {
+      clearInterval(refreshTimer);
+      await this.queues.redis.eval(
+        "if redis.call('get', KEYS[1]) == ARGV[1] then return redis.call('del', KEYS[1]) else return 0 end",
+        1,
+        lockKey,
+        lockToken,
+      );
+    }
+  }
+
+  private async processLocked(job: Job<OperationJob>) {
     const operationId = job.data.operationId;
     const [operation] = await this.database.db.select().from(operations).where(eq(operations.id, operationId)).limit(1);
     if (!operation || ["succeeded", "superseded"].includes(operation.status)) return;
@@ -121,7 +161,73 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     for (const bindingId of bindingIds) {
       const related = finalSteps.filter((step) => stepInputSchema.safeParse(step.input).data?.bindingId === bindingId);
       const state = related.some((step) => step.status === "failed") ? "failed" : related.every((step) => ["succeeded", "skipped"].includes(step.status)) ? "healthy" : "switching";
-      await this.database.db.update(domainBindings).set({ state, updatedAt: new Date() }).where(eq(domainBindings.id, bindingId));
+      const shouldDelete = state === "healthy" && related.some((step) => stepInputSchema.safeParse(step.input).data?.deleteBinding === true);
+      if (shouldDelete) {
+        const [binding] = await this.database.db.select({ poolId: domainBindings.poolId }).from(domainBindings).where(eq(domainBindings.id, bindingId)).limit(1);
+        await this.database.db.transaction(async (tx) => {
+          await tx.delete(domainBindings).where(eq(domainBindings.id, bindingId));
+          if (binding) {
+            const [pool] = await tx.update(endpointPools).set({ policyRevision: sql`${endpointPools.policyRevision} + 1`, updatedAt: new Date() })
+              .where(eq(endpointPools.id, binding.poolId)).returning();
+            if (pool) {
+              const [endpointRows, addresses, bindings, checks] = await Promise.all([
+                tx.select().from(endpoints).where(eq(endpoints.poolId, binding.poolId)),
+                tx.select({ address: endpointAddresses }).from(endpointAddresses).innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, binding.poolId)),
+                tx.select().from(domainBindings).where(eq(domainBindings.poolId, binding.poolId)),
+                tx.select().from(healthCheckConfigs).where(or(
+                  eq(healthCheckConfigs.poolId, binding.poolId),
+                  inArray(healthCheckConfigs.endpointId, tx.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, binding.poolId))),
+                  inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, binding.poolId))),
+                )),
+              ]);
+              await tx.insert(policyVersions).values({
+                poolId: binding.poolId,
+                version: pool.policyRevision,
+                snapshot: { pool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings, healthChecks: checks },
+                reason: "binding.delete",
+                actorUserId: operation.actorUserId,
+              });
+            }
+          }
+          await tx.insert(auditLogs).values({
+            ownerUserId: operation.ownerUserId,
+            actorUserId: operation.actorUserId,
+            source: operation.source,
+            action: "binding.delete",
+            resourceType: "domain_binding",
+            resourceId: bindingId,
+            operationId: operation.id,
+          });
+        });
+      } else {
+        await this.database.db.update(domainBindings).set({ state, updatedAt: new Date() }).where(eq(domainBindings.id, bindingId));
+      }
+    }
+    if (operation.resourceType === "endpoint_pool" && operation.resourceId) {
+      const eventId = `operation-${operation.id}`;
+      await this.queues.notifications.add("fanout-event", {
+        kind: "fanout",
+        event: {
+          eventId,
+          eventType: status === "succeeded" ? "dns.automatic_change_succeeded" : "dns.automatic_change_failed",
+          ownerUserId: operation.ownerUserId,
+          poolId: operation.resourceId,
+          occurredAt: new Date().toISOString(),
+          payload: {
+            summary: status === "succeeded" ? "Automatic DNS changes were applied and verified." : "One or more automatic DNS changes failed.",
+            operationId: operation.id,
+            status,
+            succeededSteps: succeeded,
+            failedSteps: failed,
+          },
+        },
+      }, {
+        jobId: `fanout-${eventId}`,
+        attempts: 3,
+        backoff: { type: "exponential", delay: 1_000 },
+        removeOnComplete: 5_000,
+        removeOnFail: 5_000,
+      });
     }
   }
 
@@ -135,11 +241,15 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
       if (!input.record) throw new ProviderError("Create step is missing record input", "validation_failed", adapter.provider);
       remote = step.attempts > 0 ? await findMatchingRecord(adapter, input.zoneExternalId, input.record) : null;
       remote ??= await adapter.createRecord(input.zoneExternalId, input.record);
+      remote = await verifyRemoteRecord(adapter, input.zoneExternalId, remote.externalId, input.record);
     } else if (step.action === "update") {
       if (!input.record || !input.recordExternalId) throw new ProviderError("Update step is incomplete", "validation_failed", adapter.provider);
       const existing = await adapter.getRecord(input.zoneExternalId, input.recordExternalId);
       if (!existing) throw new ProviderError("DNS record no longer exists", "not_found", adapter.provider);
-      remote = await adapter.updateRecord(input.zoneExternalId, input.recordExternalId, input.record);
+      remote = recordMatches(existing, input.record)
+        ? existing
+        : await adapter.updateRecord(input.zoneExternalId, input.recordExternalId, input.record);
+      remote = await verifyRemoteRecord(adapter, input.zoneExternalId, remote.externalId, input.record);
     } else {
       if (!input.recordExternalId) throw new ProviderError("Delete step is missing record ID", "validation_failed", adapter.provider);
       const existing = await adapter.getRecord(input.zoneExternalId, input.recordExternalId);
@@ -183,6 +293,9 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
           });
         }
       }
+      if (recordId && operation.resourceType === "dns_record" && !operation.resourceId) {
+        await tx.update(operations).set({ resourceId: recordId, updatedAt: new Date() }).where(eq(operations.id, operation.id));
+      }
       await tx.update(operationSteps).set({
         status: "succeeded",
         ...(recordId ? { dnsRecordId: recordId } : {}),
@@ -213,9 +326,18 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
   }
 
   private async recoverPending() {
-    const rows = await this.database.db.select({ id: operations.id }).from(operations).where(inArray(operations.status, ["pending", "running"]));
-    for (const { id } of rows) {
-      await this.queues.operations.add("execute-operation", { operationId: id }, { jobId: id, attempts: 5, backoff: { type: "exponential", delay: 1000 }, removeOnComplete: 1000, removeOnFail: 1000 });
+    if (this.recovering) return;
+    this.recovering = true;
+    try {
+      const rows = await this.database.db.select({ id: operations.id }).from(operations).where(inArray(operations.status, ["pending", "running"]));
+      const slot = Math.floor(Date.now() / 30_000);
+      for (const { id } of rows) {
+        await this.queues.operations.add("execute-operation", { operationId: id }, { jobId: `recover-operation-${id}-${slot}`, attempts: 5, backoff: { type: "exponential", delay: 1000 }, removeOnComplete: 1000, removeOnFail: 1000 });
+      }
+    } catch (error) {
+      this.logger.error(`Operation recovery scan failed: ${safeError(error)}`);
+    } finally {
+      this.recovering = false;
     }
   }
 
@@ -244,11 +366,48 @@ async function findMatchingRecord(adapter: Awaited<ReturnType<ProviderRuntimeSer
   let cursor: string | undefined;
   do {
     const page = await adapter.listRecords(zoneId, cursor);
-    const match = page.items.find((record) => record.type === expected.type && record.name.toLowerCase() === expected.name.toLowerCase() && record.content === expected.content);
+    const match = page.items.find((record) => recordMatches(record, expected));
     if (match) return match;
     cursor = page.nextCursor;
   } while (cursor);
   return null;
+}
+
+async function verifyRemoteRecord(
+  adapter: Awaited<ReturnType<ProviderRuntimeService["forAccount"]>>["adapter"],
+  zoneId: string,
+  recordId: string,
+  expected: DnsRecordInput,
+): Promise<ProviderRecord> {
+  const verified = await adapter.getRecord(zoneId, recordId);
+  if (!verified || !recordMatches(verified, expected)) {
+    throw new ProviderError("DNS record did not match the desired state after write", "transient_failure", adapter.provider);
+  }
+  return verified;
+}
+
+export function recordMatches(record: ProviderRecord, expected: DnsRecordInput): boolean {
+  if (record.type !== expected.type
+    || normalizeName(record.name) !== normalizeName(expected.name)
+    || record.content !== expected.content
+    || record.ttl !== expected.ttl
+    || (record.priority ?? null) !== (expected.priority ?? null)) return false;
+  return Object.entries(expected.providerMetadata).every(([key, value]) => value === undefined || deepEqual(record.providerMetadata[key], value));
+}
+
+function normalizeName(value: string): string {
+  return value.toLowerCase().replace(/\.$/, "");
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) return left.length === right.length && left.every((item, index) => deepEqual(item, right[index]));
+  if (left && right && typeof left === "object" && typeof right === "object") {
+    const leftEntries = Object.entries(left as Record<string, unknown>);
+    const rightEntries = Object.entries(right as Record<string, unknown>);
+    return leftEntries.length === rightEntries.length && leftEntries.every(([key, value]) => deepEqual(value, (right as Record<string, unknown>)[key]));
+  }
+  return false;
 }
 
 function toDnsRecordValues(zoneId: string, record: ProviderRecord, management: "unmanaged" | "managed", poolId?: string): typeof dnsRecords.$inferInsert {

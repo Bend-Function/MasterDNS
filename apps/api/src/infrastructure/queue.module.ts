@@ -13,6 +13,20 @@ export class QueueService implements OnModuleDestroy {
   readonly sync = new Queue(queueNames.sync, { connection: this.redis });
   readonly notifications = new Queue(queueNames.notifications, { connection: this.redis });
 
+  async incrementRateLimit(key: string, windowMs: number): Promise<number> {
+    const result = await this.redis.eval(
+      "local value = redis.call('incr', KEYS[1]); if value == 1 then redis.call('pexpire', KEYS[1], ARGV[1]); end; return value",
+      1,
+      key,
+      windowMs,
+    );
+    return Number(result);
+  }
+
+  async ping(): Promise<string> {
+    return this.redis.ping();
+  }
+
   async onModuleDestroy() {
     await Promise.all([this.operations.close(), this.health.close(), this.reconcile.close(), this.sync.close(), this.notifications.close()]);
     await this.redis.quit();

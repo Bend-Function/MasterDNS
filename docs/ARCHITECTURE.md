@@ -235,7 +235,8 @@ sequenceDiagram
 ### 9.2 Heartbeat
 
 ```http
-POST /api/v1/ddns/agents/{token}/heartbeat
+POST /api/v1/ddns/heartbeat
+Authorization: Bearer <runtime-token>
 Content-Type: application/json
 
 {

@@ -1,0 +1,2 @@
+ALTER TABLE "endpoint_pools" ADD COLUMN "all_down_reminder_seconds" integer DEFAULT 1800 NOT NULL;--> statement-breakpoint
+ALTER TABLE "endpoint_pools" ADD CONSTRAINT "pool_reminder_interval_valid" CHECK ("endpoint_pools"."all_down_reminder_seconds" >= 60);

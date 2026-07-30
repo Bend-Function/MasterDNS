@@ -8,6 +8,48 @@
       "when": 1785383976128,
       "tag": "0000_square_misty_knight",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785388362827,
+      "tag": "0001_friendly_captain_britain",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785388779644,
+      "tag": "0002_wealthy_the_captain",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1785388902825,
+      "tag": "0003_absent_colossus",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1785389139335,
+      "tag": "0004_lethal_newton_destine",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785389554254,
+      "tag": "0005_fat_risque",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785391932344,
+      "tag": "0006_spotty_hawkeye",
+      "breakpoints": true
     }
   ]
 }

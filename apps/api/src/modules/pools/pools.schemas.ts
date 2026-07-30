@@ -16,6 +16,7 @@ export const createPoolSchema = z.object({
   checkIntervalSeconds: z.number().int().min(5).max(3600).default(15),
   checkTimeoutMs: z.number().int().min(100).max(60_000).default(3000),
   switchCooldownSeconds: z.number().int().min(0).max(86_400).default(300),
+  allDownReminderSeconds: z.number().int().min(60).max(86_400).default(1800),
 });
 
 export const updatePoolSchema = createPoolSchema.omit({ strategy: true }).partial().extend({
@@ -61,6 +62,8 @@ export const updateBindingSchema = z.object({
 
 export const createHealthCheckSchema = z.object({ config: healthCheckConfigSchema });
 export const reconcilePoolSchema = z.object({ force: z.boolean().default(false) });
+export const restorePolicyVersionSchema = z.object({ force: z.boolean().default(false) });
+export const policyVersionParamSchema = z.coerce.number().int().positive();
 
 export type CreatePoolInput = z.infer<typeof createPoolSchema>;
 export type UpdatePoolInput = z.infer<typeof updatePoolSchema>;

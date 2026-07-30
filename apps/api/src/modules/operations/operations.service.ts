@@ -27,11 +27,6 @@ export class OperationsService {
   constructor(private readonly database: DatabaseService, private readonly queues: QueueService) {}
 
   async createDnsOperation(input: DnsOperationInput) {
-    const [existing] = await this.database.db.select().from(operations).where(eq(operations.idempotencyKey, input.idempotencyKey)).limit(1);
-    if (existing) {
-      if (existing.ownerUserId !== input.ownerUserId) throw new ConflictException("幂等键已被其他资源使用");
-      return existing;
-    }
     const result = await this.database.db.transaction(async (tx) => {
       const [operation] = await tx.insert(operations).values({
         ownerUserId: input.ownerUserId,
@@ -42,8 +37,13 @@ export class OperationsService {
         ...(input.dnsRecordId ? { resourceId: input.dnsRecordId } : {}),
         ...(input.beforeSnapshot !== undefined ? { beforeSnapshot: input.beforeSnapshot } : {}),
         ...(input.record !== undefined ? { desiredSnapshot: input.record } : {}),
-      }).returning();
-      if (!operation) throw new Error("Operation insert returned no row");
+      }).onConflictDoNothing({ target: operations.idempotencyKey }).returning();
+      if (!operation) {
+        const [existing] = await tx.select().from(operations).where(eq(operations.idempotencyKey, input.idempotencyKey)).limit(1);
+        if (!existing) throw new Error("Idempotent operation lookup returned no row");
+        if (existing.ownerUserId !== input.ownerUserId) throw new ConflictException("幂等键已被其他资源使用");
+        return { operation: existing, created: false };
+      }
       await tx.insert(operationSteps).values({
         operationId: operation.id,
         sequence: 1,
@@ -57,16 +57,18 @@ export class OperationsService {
           ...(input.record ? { record: input.record } : {}),
         },
       });
-      return operation;
+      return { operation, created: true };
     });
-    await this.queues.operations.add("execute-operation", { operationId: result.id }, {
-      jobId: result.id,
-      attempts: 5,
-      backoff: { type: "exponential", delay: 1000 },
-      removeOnComplete: 1000,
-      removeOnFail: 1000,
-    });
-    return result;
+    if (result.created) {
+      await this.queues.operations.add("execute-operation", { operationId: result.operation.id }, {
+        jobId: result.operation.id,
+        attempts: 5,
+        backoff: { type: "exponential", delay: 1000 },
+        removeOnComplete: 1000,
+        removeOnFail: 1000,
+      });
+    }
+    return result.operation;
   }
 
   async list(actor: AuthUser, limit = 50) {

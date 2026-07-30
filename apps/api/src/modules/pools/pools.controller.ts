@@ -7,6 +7,8 @@ import {
   createHealthCheckSchema,
   createPoolSchema,
   reconcilePoolSchema,
+  policyVersionParamSchema,
+  restorePolicyVersionSchema,
   updateBindingSchema,
   updateEndpointSchema,
   updatePoolSchema,
@@ -40,6 +42,11 @@ export class PoolsController {
   @Post(":poolId/reconcile")
   reconcile(@CurrentUser() actor: AuthUser, @Param("poolId") poolId: string, @Body() body: unknown) {
     return this.pools.reconcile(actor, poolId, reconcilePoolSchema.parse(body));
+  }
+
+  @Post(":poolId/policy-versions/:version/restore")
+  restorePolicyVersion(@CurrentUser() actor: AuthUser, @Param("poolId") poolId: string, @Param("version") version: string, @Body() body: unknown) {
+    return this.pools.restorePolicyVersion(actor, poolId, policyVersionParamSchema.parse(version), restorePolicyVersionSchema.parse(body));
   }
 
   @Delete(":poolId")

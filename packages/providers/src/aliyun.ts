@@ -10,8 +10,12 @@ import {
   type DescribeDomainRecordsResponse,
   DescribeDomainsRequest,
   type DescribeDomainsResponse,
+  SetDomainRecordStatusRequest,
+  type SetDomainRecordStatusResponse,
   UpdateDomainRecordRequest,
   type UpdateDomainRecordResponse,
+  UpdateDNSSLBWeightRequest,
+  type UpdateDNSSLBWeightResponse,
 } from "@alicloud/alidns20150109";
 import { $OpenApiUtil } from "@alicloud/openapi-core";
 import type {
@@ -48,6 +52,8 @@ type AliDnsClient = {
   describeDomainRecordInfo(request: DescribeDomainRecordInfoRequest): Promise<DescribeDomainRecordInfoResponse>;
   addDomainRecord(request: AddDomainRecordRequest): Promise<AddDomainRecordResponse>;
   updateDomainRecord(request: UpdateDomainRecordRequest): Promise<UpdateDomainRecordResponse>;
+  updateDNSSLBWeight(request: UpdateDNSSLBWeightRequest): Promise<UpdateDNSSLBWeightResponse>;
+  setDomainRecordStatus(request: SetDomainRecordStatusRequest): Promise<SetDomainRecordStatusResponse>;
   deleteDomainRecord(request: DeleteDomainRecordRequest): Promise<DeleteDomainRecordResponse>;
 };
 
@@ -139,13 +145,16 @@ export class AliyunDnsAdapter implements DnsProviderAdapter {
       const response = await this.client.addDomainRecord(new AddDomainRecordRequest(toAliyunInput(zoneExternalId, input)));
       const recordId = response.body?.recordId;
       if (!recordId) throw new ProviderError("Aliyun did not return the created record ID", "unknown_provider_error", this.provider);
+      await this.applyMetadata(recordId, input);
       return (await this.getRecord(zoneExternalId, recordId)) ?? recordFromInput(recordId, zoneExternalId, input);
     });
   }
 
   async updateRecord(zoneExternalId: string, recordExternalId: string, input: DnsRecordInput): Promise<ProviderRecord> {
     return this.wrap(async () => {
+      const before = await this.getRecord(zoneExternalId, recordExternalId);
       await this.client.updateDomainRecord(new UpdateDomainRecordRequest({ recordId: recordExternalId, ...toAliyunInput(zoneExternalId, input) }));
+      await this.applyMetadata(recordExternalId, input, before ?? undefined);
       return (await this.getRecord(zoneExternalId, recordExternalId)) ?? recordFromInput(recordExternalId, zoneExternalId, input);
     });
   }
@@ -160,6 +169,21 @@ export class AliyunDnsAdapter implements DnsProviderAdapter {
     } catch (error) {
       if (error instanceof ProviderError) throw error;
       throw mapAliyunError(error);
+    }
+  }
+
+  private async applyMetadata(recordId: string, input: DnsRecordInput, before?: ProviderRecord) {
+    const requestedWeight = input.providerMetadata.weight;
+    if (typeof requestedWeight === "number" && requestedWeight !== before?.providerMetadata.weight) {
+      if (!Number.isInteger(requestedWeight) || requestedWeight < 1 || requestedWeight > 100) {
+        throw new ProviderError("Aliyun DNS weight must be an integer from 1 to 100", "validation_failed", this.provider);
+      }
+      await this.client.updateDNSSLBWeight(new UpdateDNSSLBWeightRequest({ recordId, weight: requestedWeight }));
+    }
+    const requestedStatus = normalizeAliyunStatus(input.providerMetadata.status);
+    const previousStatus = normalizeAliyunStatus(before?.providerMetadata.status);
+    if (requestedStatus && requestedStatus !== previousStatus) {
+      await this.client.setDomainRecordStatus(new SetDomainRecordStatusRequest({ recordId, status: requestedStatus }));
     }
   }
 }
@@ -201,6 +225,14 @@ function toAliyunInput(zoneExternalId: string, input: DnsRecordInput): Record<st
 
 function recordFromInput(recordId: string, zoneExternalId: string, input: DnsRecordInput): ProviderRecord {
   return { externalId: recordId, zoneExternalId, ...input };
+}
+
+function normalizeAliyunStatus(value: unknown): "Enable" | "Disable" | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.toLowerCase();
+  if (normalized === "enable" || normalized === "enabled") return "Enable";
+  if (normalized === "disable" || normalized === "disabled") return "Disable";
+  throw new ProviderError("Aliyun DNS status must be Enable or Disable", "validation_failed", "aliyun");
 }
 
 function fqdnFromRr(rr: string, zone: string): string {

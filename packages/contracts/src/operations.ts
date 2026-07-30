@@ -26,4 +26,14 @@ export type PoolReconcileJob = {
   force?: boolean;
 };
 export type ZoneSyncJob = { providerAccountId: string; zoneId?: string };
-export type NotificationJob = { deliveryId: string };
+export type NotificationEvent = {
+  eventId: string;
+  eventType: string;
+  ownerUserId: string;
+  poolId?: string;
+  occurredAt: string;
+  payload: Record<string, unknown>;
+};
+export type NotificationJob =
+  | { kind: "fanout"; event: NotificationEvent }
+  | { kind: "deliver"; deliveryId: string };

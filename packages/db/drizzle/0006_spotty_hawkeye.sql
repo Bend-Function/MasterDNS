@@ -1,0 +1,1 @@
+ALTER TABLE "notification_deliveries" ADD COLUMN "duration_ms" integer;

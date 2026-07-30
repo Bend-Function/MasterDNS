@@ -31,6 +31,7 @@ erDiagram
     ENDPOINTS ||--o{ BINDING_ASSIGNMENTS : serves
     ZONES ||--o{ DOMAIN_BINDINGS : targets
     HEALTH_CHECK_CONFIGS ||--o{ HEALTH_CHECK_RESULTS : produces
+    ENDPOINTS ||--o{ HEALTH_CHECK_STATS : aggregates
     ENDPOINTS ||--o{ HEALTH_CHECK_RESULTS : checked
     DOMAIN_BINDINGS ||--o{ HEALTH_CHECK_RESULTS : optionally_checked
     OPERATIONS ||--o{ OPERATION_STEPS : contains
@@ -197,9 +198,13 @@ Pool 配置为默认值，Endpoint 配置覆盖 Pool，Domain Binding 配置覆�
 
 ### `health_check_results`
 
-高频分区表，包含 `config_id`、`endpoint_id`、可选 `domain_binding_id`、可选 `probe_id`、`success`、`latency_ms`、`error_code`、截断脱敏的 `error_detail`、`checked_at`。
+高频结果表，包含 `config_id`、`endpoint_id`、可选 `domain_binding_id`、可选 `probe_id`、`success`、`latency_ms`、`error_code`、截断脱敏的 `error_detail`、`checked_at`。
 
 索引以 `(endpoint_id, checked_at desc)` 和 `(domain_binding_id, checked_at desc)` 为主。原始数据保留 30 天后按分区删除，聚合数据写入单独的小时/天统计表。
+
+### `health_check_stats`
+
+按 Endpoint 和可选 Domain Binding 保存小时、天级统计，包含样本数、成功数及平均/最小/最大延迟。默认保留 365 天，维护任务可在 Worker 重启后从仍在保留期内的原始结果重新生成。
 
 ## 8. DDNS Agent
 
@@ -257,7 +262,7 @@ Pool 与 Channel 多对多关联，并包含事件过滤和是否覆盖用户默
 
 ### `notification_deliveries`
 
-保存事件 ID、Channel、状态、尝试次数、下次重试时间、HTTP 状态码、截断脱敏响应、发送时间。`event_id + channel_id` 唯一，防止重复投递。
+保存事件 ID、Channel、状态、尝试次数、下次重试时间、HTTP 状态码、投递耗时、截断脱敏响应、发送时间。`event_id + channel_id` 唯一，防止重复投递。
 
 ## 11. 数据不变量
 

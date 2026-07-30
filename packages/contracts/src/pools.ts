@@ -17,6 +17,7 @@ export type StrategyBinding = {
   id: string;
   originalEndpointId?: string;
   currentEndpointIds: string[];
+  endpointHealthStates?: Record<string, HealthState>;
 };
 
 export type StrategyContext = {

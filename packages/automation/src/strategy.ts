@@ -7,7 +7,9 @@ import type {
 } from "@masterdns/contracts";
 
 export function evaluateStrategy(context: StrategyContext): StrategyDecision {
-  const healthy = context.endpoints.filter(isAvailable);
+  // Strategy evaluation keeps a working assignment count so one reconcile can
+  // spread several failed bindings instead of selecting the same least-loaded node.
+  const healthy = context.endpoints.filter(isAvailable).map((endpoint) => ({ ...endpoint }));
   if (context.strategy === "healthy_set") return evaluateHealthySet(context, healthy);
 
   const decisions: BindingDecision[] = [];
@@ -15,19 +17,29 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
   let noHealthyEndpoints = false;
 
   for (const binding of context.bindings) {
-    const currentHealthy = binding.currentEndpointIds.some((id) => healthy.some((endpoint) => endpoint.id === id));
+    const bindingHealthy = healthyForBinding(context, binding, healthy);
+    const currentHealthy = binding.currentEndpointIds.some((id) => bindingHealthy.some((endpoint) => endpoint.id === id));
     const recoverOriginal = context.trigger === "recovery"
       && (context.recoveryMode === "automatic" || context.recoveryMode === "delayed")
       && binding.originalEndpointId !== undefined
-      && healthy.some((endpoint) => endpoint.id === binding.originalEndpointId)
+      && bindingHealthy.some((endpoint) => endpoint.id === binding.originalEndpointId)
       && !binding.currentEndpointIds.includes(binding.originalEndpointId);
     const shouldSelect = context.trigger === "rebalance" || context.trigger === "configuration" || !currentHealthy || recoverOriginal;
     if (!shouldSelect) continue;
 
+    for (const endpointId of binding.currentEndpointIds) {
+      const current = healthy.find((endpoint) => endpoint.id === endpointId);
+      if (current) current.activeBindingCount = Math.max(0, current.activeBindingCount - 1);
+    }
+
     const selected = recoverOriginal
-      ? healthy.find((endpoint) => endpoint.id === binding.originalEndpointId)
-      : selectEndpoint(healthy, context.selectionMode, context.eventId, binding, cursor);
+      ? bindingHealthy.find((endpoint) => endpoint.id === binding.originalEndpointId)
+      : selectEndpoint(bindingHealthy, context.selectionMode, context.eventId, binding, cursor);
     if (!selected) {
+      for (const endpointId of binding.currentEndpointIds) {
+        const current = healthy.find((endpoint) => endpoint.id === endpointId);
+        if (current) current.activeBindingCount += 1;
+      }
       noHealthyEndpoints = true;
       decisions.push({
         bindingId: binding.id,
@@ -38,6 +50,7 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
       continue;
     }
     cursor = context.selectionMode === "round_robin" ? selected.id : cursor;
+    selected.activeBindingCount += 1;
     if (context.trigger !== "configuration" && binding.currentEndpointIds.length === 1 && binding.currentEndpointIds[0] === selected.id) continue;
     decisions.push({
       bindingId: binding.id,
@@ -56,11 +69,12 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
 }
 
 function evaluateHealthySet(context: StrategyContext, healthy: StrategyEndpoint[]): StrategyDecision {
-  const desired = healthy.map((endpoint) => endpoint.id).sort();
-  const noHealthyEndpoints = desired.length === 0;
+  let noHealthyEndpoints = false;
   const decisions = context.bindings.flatMap((binding): BindingDecision[] => {
+    const desired = healthyForBinding(context, binding, healthy).map((endpoint) => endpoint.id).sort();
+    noHealthyEndpoints ||= desired.length === 0;
     const current = [...binding.currentEndpointIds].sort();
-    if (noHealthyEndpoints) {
+    if (desired.length === 0) {
       return [{ bindingId: binding.id, previousEndpointIds: current, desiredEndpointIds: current, reason: "no_healthy_endpoint" }];
     }
     if (context.trigger !== "configuration" && sameIds(current, desired)) return [];
@@ -72,6 +86,13 @@ function evaluateHealthySet(context: StrategyContext, healthy: StrategyEndpoint[
     }];
   });
   return { eventId: context.eventId, decisions, noHealthyEndpoints };
+}
+
+function healthyForBinding(context: StrategyContext, binding: StrategyBinding, fallback: StrategyEndpoint[]): StrategyEndpoint[] {
+  if (!binding.endpointHealthStates) return fallback;
+  return context.endpoints
+    .filter((endpoint) => endpoint.lifecycle === "enabled" && binding.endpointHealthStates?.[endpoint.id] === "healthy")
+    .map((endpoint) => fallback.find((candidate) => candidate.id === endpoint.id) ?? { ...endpoint });
 }
 
 function selectEndpoint(

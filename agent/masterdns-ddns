@@ -54,14 +54,18 @@ print(json.dumps(payload, separators=(",", ":")))
 PY
 )"
 
-curl -fsS \
+AUTH_CONFIG="$(mktemp)"
+trap 'rm -f "$AUTH_CONFIG"' EXIT HUP INT TERM
+chmod 0600 "$AUTH_CONFIG"
+printf 'header = "Authorization: Bearer %s"\n' "$MASTERDNS_RUNTIME_TOKEN" > "$AUTH_CONFIG"
+
+printf '%s' "$PAYLOAD" | curl -fsS \
+  --config "$AUTH_CONFIG" \
   --retry 3 \
   --retry-all-errors \
-  --retry-delay 2 \
   --connect-timeout 10 \
   --max-time 30 \
-  -H "Authorization: Bearer $MASTERDNS_RUNTIME_TOKEN" \
   -H "Content-Type: application/json" \
-  --data "$PAYLOAD" \
+  --data-binary @- \
   "${MASTERDNS_API_URL%/}/api/v1/ddns/heartbeat"
 printf '\n'

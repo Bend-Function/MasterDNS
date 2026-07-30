@@ -10,12 +10,14 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run src --passWithNoTests"
+    "test": "vitest run src --passWithNoTests",
+    "test:e2e:cloudflare": "tsx scripts/cloudflare-e2e.ts"
   },
   "dependencies": {
     "@alicloud/alidns20150109": "^4.6.0",
     "@alicloud/openapi-core": "^1.0.8",
     "@masterdns/contracts": "workspace:*",
     "cloudflare": "^7.0.0"
-  }
+  },
+  "devDependencies": { "tsx": "^4.23.1" }
 }

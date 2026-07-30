@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
-import type { HealthCheckConfig, PoolReconcileJob } from "@masterdns/contracts";
+import { healthCheckConfigSchema, type HealthCheckConfig, type PoolReconcileJob } from "@masterdns/contracts";
 import {
   auditLogs,
   bindingAssignments,
   ddnsAgents,
+  dnsRecords,
   domainBindings,
   endpointAddresses,
   endpointPools,
@@ -12,11 +13,14 @@ import {
   failoverEvents,
   healthCheckConfigs,
   healthCheckResults,
+  operationSteps,
+  operations,
   policyVersions,
   providerAccounts,
   zones,
 } from "@masterdns/db";
-import { and, asc, desc, eq, inArray, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { z } from "zod";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -28,6 +32,57 @@ import type {
   UpdateEndpointInput,
   UpdatePoolInput,
 } from "./pools.schemas.js";
+
+const policySnapshotSchema = z.object({
+  pool: z.object({
+    name: z.string().min(1).max(120),
+    description: z.string().nullable().optional(),
+    strategy: z.enum(["primary_backup", "healthy_set", "assignment_pool"]),
+    selectionMode: z.enum(["random", "ordered", "round_robin", "least_assigned"]),
+    recoveryMode: z.enum(["automatic", "keep_current", "manual", "delayed"]),
+    recoveryDelaySeconds: z.number().int().nonnegative(),
+    failureThreshold: z.number().int().positive(),
+    successThreshold: z.number().int().positive(),
+    checkIntervalSeconds: z.number().int().min(5),
+    checkTimeoutMs: z.number().int().positive(),
+    switchCooldownSeconds: z.number().int().nonnegative(),
+    allDownReminderSeconds: z.number().int().min(60).default(1800),
+    enabled: z.boolean(),
+  }),
+  endpoints: z.array(z.object({
+    id: z.string().uuid(),
+    name: z.string().min(1).max(120),
+    addressMode: z.enum(["static", "ddns"]),
+    priority: z.number().int().nonnegative(),
+    lifecycle: z.enum(["enabled", "disabled", "maintenance", "draining"]),
+  })),
+  addresses: z.array(z.object({
+    endpointId: z.string().uuid(),
+    family: z.enum(["4", "6"]),
+    address: z.string().min(1),
+    state: z.enum(["candidate", "current", "previous"]),
+    source: z.enum(["static", "ddns"]),
+  })).default([]),
+  bindings: z.array(z.object({
+    id: z.string().uuid(),
+    zoneId: z.string().uuid(),
+    fqdn: z.string().min(1).max(255),
+    recordType: z.enum(["A", "AAAA"]),
+    ttl: z.number().int().positive(),
+    providerMetadata: z.record(z.string(), z.unknown()).default({}),
+    originalEndpointId: z.string().uuid().nullable().optional(),
+  })),
+  healthChecks: z.array(z.object({
+    id: z.string().uuid(),
+    poolId: z.string().uuid().nullable().optional(),
+    endpointId: z.string().uuid().nullable().optional(),
+    domainBindingId: z.string().uuid().nullable().optional(),
+    checkerType: z.string().min(1),
+    config: z.record(z.string(), z.unknown()),
+    enabled: z.boolean(),
+    revision: z.number().int().positive(),
+  }).refine((check) => [check.poolId, check.endpointId, check.domainBindingId].filter(Boolean).length === 1, "健康检查作用域无效")),
+});
 
 @Injectable()
 export class PoolsService {
@@ -98,11 +153,163 @@ export class PoolsService {
 
   async update(actor: AuthUser, poolId: string, input: UpdatePoolInput) {
     const current = await this.findOwnedPool(actor, poolId);
+    const effectiveStrategy = input.strategy ?? current.strategy;
+    if (effectiveStrategy !== "healthy_set") {
+      const missingOriginal = await this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(and(
+        eq(domainBindings.poolId, poolId),
+        isNull(domainBindings.originalEndpointId),
+      )).limit(1);
+      if (missingOriginal.length > 0) throw new ConflictException("切换到该策略前，必须为每个域名绑定指定原始节点");
+    }
     const [updated] = await this.database.db.update(endpointPools).set({ ...input, updatedAt: new Date() }).where(eq(endpointPools.id, poolId)).returning();
     if (!updated) throw new Error("Pool update returned no row");
     await this.recordPolicyChange(actor, poolId, "pool.update", current, updated);
     await this.enqueueReconcile(poolId, "configuration");
     return updated;
+  }
+
+  async restorePolicyVersion(actor: AuthUser, poolId: string, version: number, input: { force: boolean }) {
+    const currentPool = await this.findOwnedPool(actor, poolId);
+    const [targetVersion] = await this.database.db.select().from(policyVersions).where(and(
+      eq(policyVersions.poolId, poolId),
+      eq(policyVersions.version, version),
+    )).limit(1);
+    if (!targetVersion) throw new NotFoundException("策略版本不存在");
+    const parsed = policySnapshotSchema.safeParse(targetVersion.snapshot);
+    if (!parsed.success) throw new ConflictException("该历史版本格式不完整，无法安全回滚");
+    const snapshot = parsed.data;
+    const [currentEndpoints, currentBindings, currentChecks, currentAddresses] = await Promise.all([
+      this.database.db.select().from(endpoints).where(eq(endpoints.poolId, poolId)),
+      this.database.db.select().from(domainBindings).where(eq(domainBindings.poolId, poolId)),
+      this.database.db.select().from(healthCheckConfigs).where(or(
+        eq(healthCheckConfigs.poolId, poolId),
+        inArray(healthCheckConfigs.endpointId, this.database.db.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, poolId))),
+        inArray(healthCheckConfigs.domainBindingId, this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
+      )),
+      this.database.db.select({ address: endpointAddresses }).from(endpointAddresses)
+        .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, poolId)),
+    ]);
+    if (!sameIdSet(currentEndpoints, snapshot.endpoints) || !sameIdSet(currentBindings, snapshot.bindings)) {
+      throw new ConflictException("旧版本与当前版本的节点或域名绑定集合不同；请先通过节点/绑定流程恢复相同结构，再重试策略回滚");
+    }
+    const endpointIds = new Set(snapshot.endpoints.map((endpoint) => endpoint.id));
+    const bindingIds = new Set(snapshot.bindings.map((binding) => binding.id));
+    for (const endpoint of snapshot.endpoints) {
+      const currentAddresses = snapshot.addresses.filter((address) => address.endpointId === endpoint.id && address.state === "current");
+      if (endpoint.addressMode === "static" && currentAddresses.length === 0) throw new ConflictException(`历史节点 ${endpoint.name} 没有可恢复的静态地址`);
+    }
+    for (const check of snapshot.healthChecks) {
+      const config = healthCheckConfigSchema.safeParse(check.config);
+      const validScope = check.poolId === poolId
+        || Boolean(check.endpointId && endpointIds.has(check.endpointId))
+        || Boolean(check.domainBindingId && bindingIds.has(check.domainBindingId));
+      if (!config.success || config.data.type !== check.checkerType || !validScope) throw new ConflictException("历史版本包含无效的健康检查配置");
+    }
+
+    const restoredPool = await this.database.db.transaction(async (tx) => {
+      const [pool] = await tx.update(endpointPools).set({
+        name: snapshot.pool.name,
+        description: snapshot.pool.description ?? null,
+        strategy: snapshot.pool.strategy,
+        selectionMode: snapshot.pool.selectionMode,
+        recoveryMode: snapshot.pool.recoveryMode,
+        recoveryDelaySeconds: snapshot.pool.recoveryDelaySeconds,
+        failureThreshold: snapshot.pool.failureThreshold,
+        successThreshold: snapshot.pool.successThreshold,
+        checkIntervalSeconds: snapshot.pool.checkIntervalSeconds,
+        checkTimeoutMs: snapshot.pool.checkTimeoutMs,
+        switchCooldownSeconds: snapshot.pool.switchCooldownSeconds,
+        allDownReminderSeconds: snapshot.pool.allDownReminderSeconds,
+        enabled: snapshot.pool.enabled,
+        pausedAt: snapshot.pool.enabled ? null : new Date(),
+        enabledAt: snapshot.pool.enabled ? new Date() : currentPool.enabledAt,
+        policyRevision: sql`${endpointPools.policyRevision} + 1`,
+        updatedAt: new Date(),
+      }).where(eq(endpointPools.id, poolId)).returning();
+      if (!pool) throw new NotFoundException("IP Pool 不存在");
+
+      for (const endpoint of snapshot.endpoints) {
+        await tx.update(endpoints).set({
+          name: endpoint.name,
+          addressMode: endpoint.addressMode,
+          priority: endpoint.priority,
+          lifecycle: endpoint.lifecycle,
+          updatedAt: new Date(),
+        }).where(and(eq(endpoints.id, endpoint.id), eq(endpoints.poolId, poolId)));
+        if (endpoint.addressMode === "static") {
+          for (const family of ["4", "6"] as const) {
+            const desired = snapshot.addresses.find((address) => address.endpointId === endpoint.id && address.family === family && address.state === "current" && address.source === "static");
+            await replaceStaticAddress(tx, endpoint.id, family, desired?.address ?? null);
+          }
+        }
+      }
+      for (const binding of snapshot.bindings) {
+        await tx.update(domainBindings).set({
+          zoneId: binding.zoneId,
+          fqdn: binding.fqdn,
+          recordType: binding.recordType,
+          ttl: binding.ttl,
+          providerMetadata: binding.providerMetadata,
+          originalEndpointId: binding.originalEndpointId ?? null,
+          desiredRevision: pool.policyRevision,
+          updatedAt: new Date(),
+        }).where(and(eq(domainBindings.id, binding.id), eq(domainBindings.poolId, poolId)));
+      }
+
+      const targetCheckIds = new Set(snapshot.healthChecks.map((check) => check.id));
+      const removedCheckIds = currentChecks.filter((check) => !targetCheckIds.has(check.id)).map((check) => check.id);
+      if (removedCheckIds.length > 0) await tx.delete(healthCheckConfigs).where(inArray(healthCheckConfigs.id, removedCheckIds));
+      for (const check of snapshot.healthChecks) {
+        await tx.insert(healthCheckConfigs).values({
+          id: check.id,
+          poolId: check.poolId ?? null,
+          endpointId: check.endpointId ?? null,
+          domainBindingId: check.domainBindingId ?? null,
+          checkerType: check.checkerType,
+          config: check.config,
+          enabled: check.enabled,
+          revision: check.revision,
+        }).onConflictDoUpdate({
+          target: healthCheckConfigs.id,
+          set: {
+            poolId: check.poolId ?? null,
+            endpointId: check.endpointId ?? null,
+            domainBindingId: check.domainBindingId ?? null,
+            checkerType: check.checkerType,
+            config: check.config,
+            enabled: check.enabled,
+            revision: check.revision,
+            updatedAt: new Date(),
+          },
+        });
+      }
+
+      const [restoredEndpoints, restoredAddresses, restoredBindings, restoredChecks] = await Promise.all([
+        tx.select().from(endpoints).where(eq(endpoints.poolId, poolId)),
+        tx.select({ address: endpointAddresses }).from(endpointAddresses).innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, poolId)),
+        tx.select().from(domainBindings).where(eq(domainBindings.poolId, poolId)),
+        tx.select().from(healthCheckConfigs).where(or(
+          eq(healthCheckConfigs.poolId, poolId),
+          inArray(healthCheckConfigs.endpointId, tx.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, poolId))),
+          inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
+        )),
+      ]);
+      const restoredSnapshot = { pool, endpoints: restoredEndpoints, addresses: restoredAddresses.map((row) => row.address), bindings: restoredBindings, healthChecks: restoredChecks };
+      await tx.insert(policyVersions).values({ poolId, version: pool.policyRevision, snapshot: restoredSnapshot, reason: `policy.rollback:${version}`, actorUserId: actor.id });
+      await tx.insert(auditLogs).values({
+        ownerUserId: currentPool.ownerUserId,
+        actorUserId: actor.id,
+        source: "rollback",
+        action: "policy.rollback",
+        resourceType: "endpoint_pool",
+        resourceId: poolId,
+        beforeSnapshot: { pool: currentPool, endpoints: currentEndpoints, addresses: currentAddresses.map((row) => row.address), bindings: currentBindings, healthChecks: currentChecks },
+        afterSnapshot: { restoredFromVersion: version, newVersion: pool.policyRevision },
+      });
+      return pool;
+    });
+    const reconcile = await this.enqueueReconcile(poolId, "configuration", input.force);
+    return { pool: restoredPool, restoredFromVersion: version, reconcile };
   }
 
   async pause(actor: AuthUser, poolId: string) {
@@ -239,9 +446,12 @@ export class PoolsService {
   }
 
   async updateBinding(actor: AuthUser, poolId: string, bindingId: string, input: UpdateBindingInput) {
-    await this.findOwnedPool(actor, poolId);
+    const pool = await this.findOwnedPool(actor, poolId);
     const current = await this.findBinding(poolId, bindingId);
     if (input.originalEndpointId) await this.findEndpoint(poolId, input.originalEndpointId);
+    if (pool.strategy !== "healthy_set" && !(input.originalEndpointId ?? current.originalEndpointId)) {
+      throw new BadRequestException("该策略需要为域名指定原始节点");
+    }
     const { forceApply, ...fields } = input;
     const [updated] = await this.database.db.update(domainBindings).set({ ...fields, updatedAt: new Date() })
       .where(eq(domainBindings.id, bindingId)).returning();
@@ -254,18 +464,74 @@ export class PoolsService {
   async deleteBinding(actor: AuthUser, poolId: string, bindingId: string) {
     const pool = await this.findOwnedPool(actor, poolId);
     const binding = await this.findBinding(poolId, bindingId);
-    const applied = await this.database.db.select({ id: bindingAssignments.dnsRecordId }).from(bindingAssignments)
-      .where(and(eq(bindingAssignments.domainBindingId, bindingId), eq(bindingAssignments.applied, true))).limit(1);
-    if (applied.length > 0) throw new ConflictException("该绑定仍有已发布 DNS 记录，请先暂停并解除发布后再删除");
-    await this.database.db.delete(domainBindings).where(eq(domainBindings.id, bindingId));
-    await this.recordPolicyChange(actor, poolId, "binding.delete", binding, undefined, pool.ownerUserId);
-    return { deleted: true };
+    const published = await this.database.db.select({ assignment: bindingAssignments, record: dnsRecords })
+      .from(bindingAssignments).innerJoin(dnsRecords, eq(bindingAssignments.dnsRecordId, dnsRecords.id))
+      .where(and(eq(bindingAssignments.domainBindingId, bindingId), eq(bindingAssignments.applied, true)));
+    if (published.length === 0) {
+      await this.database.db.delete(domainBindings).where(eq(domainBindings.id, bindingId));
+      await this.recordPolicyChange(actor, poolId, "binding.delete", binding, undefined, pool.ownerUserId);
+      return { deleted: true };
+    }
+    const [zone] = await this.database.db.select({ zone: zones, providerAccountId: providerAccounts.id })
+      .from(zones).innerJoin(providerAccounts, eq(zones.providerAccountId, providerAccounts.id))
+      .where(eq(zones.id, binding.zoneId)).limit(1);
+    if (!zone) throw new NotFoundException("绑定对应的 Zone 不存在");
+    const operation = await this.database.db.transaction(async (tx) => {
+      const [created] = await tx.insert(operations).values({
+        ownerUserId: pool.ownerUserId,
+        actorUserId: actor.id,
+        source: "user",
+        idempotencyKey: `binding-delete:${binding.id}:${randomUUID()}`,
+        resourceType: "domain_binding",
+        resourceId: binding.id,
+        policyRevision: pool.policyRevision,
+        beforeSnapshot: binding,
+      }).returning();
+      if (!created) throw new Error("Binding delete operation insert returned no row");
+      await tx.insert(operationSteps).values(published.map(({ assignment, record }, index) => ({
+        operationId: created.id,
+        sequence: index + 1,
+        providerAccountId: zone.providerAccountId,
+        zoneId: zone.zone.id,
+        dnsRecordId: record.id,
+        action: "delete" as const,
+        input: {
+          zoneExternalId: zone.zone.externalId,
+          recordExternalId: record.externalId,
+          management: "managed",
+          poolId,
+          bindingId,
+          endpointId: assignment.endpointId,
+          assignmentMode: pool.strategy === "healthy_set" ? "set" : "single",
+          deleteBinding: true,
+        },
+      })));
+      await tx.update(domainBindings).set({ state: "switching", updatedAt: new Date() }).where(eq(domainBindings.id, bindingId));
+      return created;
+    });
+    await this.queues.operations.add("execute-operation", { operationId: operation.id }, {
+      jobId: operation.id,
+      attempts: 5,
+      backoff: { type: "exponential", delay: 1_000 },
+      removeOnComplete: 5_000,
+      removeOnFail: 5_000,
+    });
+    return operation;
   }
 
   async createHealthCheck(actor: AuthUser, poolId: string, scope: "pool" | "endpoint" | "binding", scopeId: string | undefined, config: HealthCheckConfig) {
     await this.findOwnedPool(actor, poolId);
     if (scope === "endpoint") await this.findEndpoint(poolId, requiredId(scopeId));
     if (scope === "binding") await this.findBinding(poolId, requiredId(scopeId));
+    const existing = await this.database.db.select({ id: healthCheckConfigs.id }).from(healthCheckConfigs).where(and(
+      eq(healthCheckConfigs.enabled, true),
+      scope === "pool"
+        ? eq(healthCheckConfigs.poolId, poolId)
+        : scope === "endpoint"
+          ? eq(healthCheckConfigs.endpointId, requiredId(scopeId))
+          : eq(healthCheckConfigs.domainBindingId, requiredId(scopeId)),
+    )).limit(1);
+    if (existing.length > 0) throw new ConflictException("该作用域已有启用中的健康检查，请先删除或停用后再创建");
     const [created] = await this.database.db.insert(healthCheckConfigs).values({
       ...(scope === "pool" ? { poolId } : {}),
       ...(scope === "endpoint" ? { endpointId: scopeId } : {}),
@@ -396,4 +662,10 @@ function normalizeFqdn(value: string, zoneName: string): string {
 function requiredId(value: string | undefined): string {
   if (!value) throw new BadRequestException("缺少资源 ID");
   return value;
+}
+
+function sameIdSet(left: Array<{ id: string }>, right: Array<{ id: string }>): boolean {
+  if (left.length !== right.length) return false;
+  const ids = new Set(left.map((item) => item.id));
+  return right.every((item) => ids.has(item.id));
 }

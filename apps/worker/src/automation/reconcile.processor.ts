@@ -1,15 +1,17 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { evaluateStrategy } from "@masterdns/automation";
-import type { DnsRecordInput, PoolReconcileJob, StrategyDecision } from "@masterdns/contracts";
+import type { DnsRecordInput, NotificationEvent, PoolReconcileJob, StrategyDecision } from "@masterdns/contracts";
 import { queueNames } from "@masterdns/contracts";
 import {
   bindingAssignments,
+  bindingEndpointHealth,
   dnsRecords,
   domainBindings,
   endpointAddresses,
   endpointPools,
   endpoints,
   failoverEvents,
+  healthCheckConfigs,
   operationSteps,
   operations,
   providerAccounts,
@@ -57,7 +59,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         .where(eq(operations.idempotencyKey, idempotencyKey)).limit(1);
       if (existingOperation) return { operationId: existingOperation.id };
 
-      const [poolEndpoints, bindings, assignments, addresses] = await Promise.all([
+      const [poolEndpoints, bindings, assignments, addresses, bindingHealthRows, bindingCheckRows] = await Promise.all([
         tx.select().from(endpoints).where(eq(endpoints.poolId, pool.id)),
         tx.select().from(domainBindings).where(eq(domainBindings.poolId, pool.id)),
         tx.select().from(bindingAssignments)
@@ -66,8 +68,17 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         tx.select().from(endpointAddresses)
           .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id))
           .where(and(eq(endpoints.poolId, pool.id), eq(endpointAddresses.state, "current"))),
+        tx.select({ health: bindingEndpointHealth })
+          .from(bindingEndpointHealth)
+          .innerJoin(domainBindings, eq(bindingEndpointHealth.domainBindingId, domainBindings.id))
+          .where(eq(domainBindings.poolId, pool.id)),
+        tx.select({ domainBindingId: healthCheckConfigs.domainBindingId })
+          .from(healthCheckConfigs)
+          .innerJoin(domainBindings, eq(healthCheckConfigs.domainBindingId, domainBindings.id))
+          .where(and(eq(domainBindings.poolId, pool.id), eq(healthCheckConfigs.enabled, true))),
       ]);
       const assignmentRows = assignments.map((row) => row.binding_assignments);
+      const bindingsWithHealthOverrides = new Set(bindingCheckRows.flatMap((row) => row.domainBindingId ? [row.domainBindingId] : []));
       const decision = evaluateStrategy({
         eventId: job.data.eventId,
         trigger: job.data.trigger,
@@ -87,10 +98,19 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
             id: binding.id,
             ...(binding.originalEndpointId ? { originalEndpointId: binding.originalEndpointId } : {}),
             currentEndpointIds: applied,
+            ...(bindingsWithHealthOverrides.has(binding.id) ? {
+              endpointHealthStates: Object.fromEntries(poolEndpoints.map((endpoint) => [
+                endpoint.id,
+                job.data.force && endpoint.lifecycle === "enabled"
+                  ? "healthy"
+                  : bindingHealthRows.find((row) => row.health.domainBindingId === binding.id && row.health.endpointId === endpoint.id)?.health.healthState ?? "unknown",
+              ])),
+            } : {}),
           };
         }),
         ...(pool.roundRobinCursor ? { roundRobinCursor: pool.roundRobinCursor } : {}),
       });
+      const queuedNotifications: NotificationEvent[] = [];
 
       if (!pool.enabled) {
         await tx.insert(failoverEvents).values({
@@ -100,19 +120,22 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           evidence: eventEvidence(job.data, pool.policyRevision),
           decision,
         });
-        return null;
+        return { notifications: [notificationEvent(pool, job.data, decision, "pool.automation_paused")] };
       }
 
       if (decision.noHealthyEndpoints) {
-        await tx.update(endpointPools).set({ state: "unhealthy", updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
+        const unavailableBindings = decision.decisions.filter((item) => item.reason === "no_healthy_endpoint");
+        const entirePoolUnavailable = bindings.length > 0 && unavailableBindings.length === bindings.length;
+        const eventType = entirePoolUnavailable ? "pool.no_healthy_endpoint" : "binding.no_healthy_endpoint";
+        await tx.update(endpointPools).set({ state: entirePoolUnavailable ? "unhealthy" : "degraded", updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
         await tx.insert(failoverEvents).values({
           poolId: pool.id,
           endpointId: job.data.endpointId ?? null,
-          eventType: "pool.no_healthy_endpoint",
+          eventType,
           evidence: eventEvidence(job.data, pool.policyRevision),
           decision,
         });
-        return null;
+        queuedNotifications.push(notificationEvent(pool, job.data, decision, eventType));
       }
 
       const bindingIds = decision.decisions.map((item) => item.bindingId);
@@ -157,7 +180,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         } else {
           this.planSingleAssignment(pending, item, binding, zone, existing, recordMap, addressMap, pool.id);
         }
-        await tx.update(domainBindings).set({ state: pending.some((step) => step.input.bindingId === binding.id) ? "switching" : "healthy", desiredRevision: pool.policyRevision, updatedAt: new Date() })
+        await tx.update(domainBindings).set({ state: item.reason === "no_healthy_endpoint" ? "failed" : pending.some((step) => step.input.bindingId === binding.id) ? "switching" : "healthy", desiredRevision: pool.policyRevision, updatedAt: new Date() })
           .where(eq(domainBindings.id, binding.id));
       }
 
@@ -173,7 +196,10 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           evidence: eventEvidence(job.data, pool.policyRevision),
           decision,
         });
-        return null;
+        if (queuedNotifications.length === 0 && (job.data.trigger === "failure" || job.data.trigger === "recovery")) {
+          queuedNotifications.push(notificationEvent(pool, job.data, decision, reconcileEventType(job.data.trigger)));
+        }
+        return { notifications: queuedNotifications };
       }
 
       const [operation] = await tx.insert(operations).values({
@@ -204,13 +230,27 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         decision,
       });
       await tx.update(endpointPools).set({ lastReconciledAt: new Date(), updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
-      return { operationId: operation.id };
+      return {
+        operationId: operation.id,
+        notifications: queuedNotifications.length > 0
+          ? queuedNotifications
+          : [notificationEvent(pool, job.data, decision, reconcileEventType(job.data.trigger))],
+      };
     });
 
     if (outcome?.operationId) {
       await this.queues.operations.add("execute-operation", { operationId: outcome.operationId }, {
         jobId: outcome.operationId,
         attempts: 5,
+        backoff: { type: "exponential", delay: 1_000 },
+        removeOnComplete: 5_000,
+        removeOnFail: 5_000,
+      });
+    }
+    for (const notification of outcome?.notifications ?? []) {
+      await this.queues.notifications.add("fanout-event", { kind: "fanout", event: notification }, {
+        jobId: `fanout-${notification.eventId}-${notification.eventType}`,
+        attempts: 3,
         backoff: { type: "exponential", delay: 1_000 },
         removeOnComplete: 5_000,
         removeOnFail: 5_000,
@@ -345,6 +385,35 @@ function eventEvidence(job: PoolReconcileJob, policyRevision: number) {
 
 function operationSource(trigger: PoolReconcileJob["trigger"]): "failover" | "recovery" {
   return trigger === "recovery" ? "recovery" : "failover";
+}
+
+function reconcileEventType(trigger: PoolReconcileJob["trigger"]): string {
+  if (trigger === "failure") return "endpoint.unhealthy";
+  if (trigger === "recovery") return "endpoint.recovered";
+  return "pool.reconciled";
+}
+
+function notificationEvent(
+  pool: typeof endpointPools.$inferSelect,
+  job: PoolReconcileJob,
+  decision: StrategyDecision,
+  eventType: string,
+): NotificationEvent {
+  return {
+    eventId: job.eventId,
+    eventType,
+    ownerUserId: pool.ownerUserId,
+    poolId: pool.id,
+    occurredAt: new Date().toISOString(),
+    payload: {
+      summary: eventType === "pool.no_healthy_endpoint" || eventType === "binding.no_healthy_endpoint"
+        ? `${eventType === "pool.no_healthy_endpoint" ? `Pool ${pool.name}` : `A binding in Pool ${pool.name}`} has no healthy endpoints; current DNS records were preserved.`
+        : `Pool ${pool.name} processed ${job.trigger}.`,
+      poolName: pool.name,
+      endpointId: job.endpointId ?? null,
+      decision,
+    },
+  };
 }
 
 function safeError(error: unknown): string {
