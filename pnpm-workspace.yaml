@@ -1,0 +1,15 @@
+packages:
+  - "apps/*"
+  - "packages/*"
+
+allowBuilds:
+  '@alicloud/openapi-core': true
+  '@node-rs/argon2': true
+  esbuild: true
+  msgpackr-extract: true
+  sharp: true
+  unrs-resolver: true
+
+minimumReleaseAgeExclude:
+  - bullmq@5.81.3
+  - msgpackr@2.0.5

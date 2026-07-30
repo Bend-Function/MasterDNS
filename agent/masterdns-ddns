@@ -1,0 +1,67 @@
+#!/bin/sh
+set -eu
+
+CONFIG_FILE="${MASTERDNS_DDNS_CONFIG:-/etc/masterdns-ddns/config}"
+if [ ! -r "$CONFIG_FILE" ]; then
+  echo "MasterDNS DDNS config is not readable: $CONFIG_FILE" >&2
+  exit 1
+fi
+
+# shellcheck disable=SC1090
+. "$CONFIG_FILE"
+: "${MASTERDNS_API_URL:?MASTERDNS_API_URL is required}"
+: "${MASTERDNS_RUNTIME_TOKEN:?MASTERDNS_RUNTIME_TOKEN is required}"
+
+discover_ipv4() {
+  if [ -n "${MASTERDNS_IPV4:-}" ]; then
+    printf '%s' "$MASTERDNS_IPV4"
+  elif [ -n "${MASTERDNS_INTERFACE:-}" ]; then
+    ip -4 -o addr show dev "$MASTERDNS_INTERFACE" scope global 2>/dev/null | awk 'NR == 1 { split($4, a, "/"); print a[1] }'
+  else
+    curl -4 -fsS --max-time 10 https://api.ipify.org
+  fi
+}
+
+discover_ipv6() {
+  if [ -n "${MASTERDNS_IPV6:-}" ]; then
+    printf '%s' "$MASTERDNS_IPV6"
+  elif [ -n "${MASTERDNS_INTERFACE:-}" ]; then
+    ip -6 -o addr show dev "$MASTERDNS_INTERFACE" scope global 2>/dev/null | awk 'NR == 1 { split($4, a, "/"); print a[1] }'
+  else
+    curl -6 -fsS --max-time 10 https://api6.ipify.org
+  fi
+}
+
+IPV4="$(discover_ipv4 2>/dev/null || true)"
+IPV6="$(discover_ipv6 2>/dev/null || true)"
+HOSTNAME_VALUE="$(hostname -f 2>/dev/null || hostname)"
+
+if [ -z "$IPV4" ] && [ -z "$IPV6" ]; then
+  echo "No public IPv4 or IPv6 address could be discovered" >&2
+  exit 1
+fi
+
+PAYLOAD="$(python3 - "$IPV4" "$IPV6" "$HOSTNAME_VALUE" <<'PY'
+import json
+import sys
+
+payload = {"hostname": sys.argv[3], "agentVersion": "1.0.0"}
+if sys.argv[1]:
+    payload["ipv4"] = sys.argv[1]
+if sys.argv[2]:
+    payload["ipv6"] = sys.argv[2]
+print(json.dumps(payload, separators=(",", ":")))
+PY
+)"
+
+curl -fsS \
+  --retry 3 \
+  --retry-all-errors \
+  --retry-delay 2 \
+  --connect-timeout 10 \
+  --max-time 30 \
+  -H "Authorization: Bearer $MASTERDNS_RUNTIME_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data "$PAYLOAD" \
+  "${MASTERDNS_API_URL%/}/api/v1/ddns/heartbeat"
+printf '\n'

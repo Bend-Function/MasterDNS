@@ -1,0 +1,29 @@
+{
+  "name": "masterdns",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "pnpm build:packages && pnpm --filter @masterdns/api build && pnpm --filter @masterdns/worker build && pnpm --filter @masterdns/web build",
+    "build:packages": "pnpm --filter './packages/**' -r build",
+    "dev": "pnpm build:packages && pnpm --parallel --filter './packages/**' --filter './apps/**' dev",
+    "dev:web": "pnpm build:packages && pnpm --filter @masterdns/web dev",
+    "dev:api": "pnpm build:packages && pnpm --filter @masterdns/api dev",
+    "dev:worker": "pnpm build:packages && pnpm --filter @masterdns/worker dev",
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test",
+    "test:coverage": "pnpm -r --if-present test:coverage",
+    "db:generate": "pnpm --filter @masterdns/db generate",
+    "db:migrate": "pnpm --filter @masterdns/db migrate",
+    "db:seed": "pnpm --filter @masterdns/db seed"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "4.0.18"
+  }
+}
