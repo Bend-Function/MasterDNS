@@ -22,10 +22,10 @@ export class RotationStore {
       if (!incident || incident.status === "complete") return;
       const c = await lockRotationContext(tx, incident.slotId);
       const lease = await acquireRotationLease(tx, c.physicalKey, randomUUID());
-      if (!lease) return;
+      if (!lease) { await deferFailedClaim(tx, id); return; }
       const [physical] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey));
       if (physical?.incidentId && physical.incidentId !== id) {
-        await releaseRotationLease(tx, lease); return;
+        await releaseRotationLease(tx, lease); await deferFailedClaim(tx, id); return;
       }
       return lease;
     });
@@ -130,11 +130,19 @@ export class RotationStore {
       if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.unresolvedStepId, stepId)));
       if (status === "applied" && !incident.pausedByUserId && ["rotation_runtime_failed", "cloud_convergence_timeout", "temporary_cloud_error"].includes(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null }).where(eq(rotationIncidents.id, id));
       if (status === "ambiguous") await this.pauseIn(tx, incident, "resource_ownership_ambiguous", now);
-      if (!conflict && typeof receipt.candidateAddress === "string" && isIP(receipt.candidateAddress) === Number(c.slot.family)) {
-        const attached = !step.plan.action.endsWith("allocate") && status === "applied";
-        await tx.insert(rotationResources).values({ incidentId: id, attemptId: step.attemptId, address: receipt.candidateAddress, allocationId: typeof receipt.allocationId === "string" ? receipt.allocationId : null, resourceId: typeof receipt.resourceId === "string" ? receipt.resourceId : null, origin: "system", ownershipAttemptId: step.attemptId, role: "candidate", attached, referenced: attached, snapshot: { receipt, slot: step.plan.arguments.slot } }).onConflictDoUpdate({ target: [rotationResources.attemptId, rotationResources.role], set: { resourceId: sql`coalesce(${rotationResources.resourceId}, ${typeof receipt.resourceId === "string" ? receipt.resourceId : null})`, attached, referenced: attached, snapshot: { receipt, slot: step.plan.arguments.slot } } });
-      }
       const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, step.attemptId)).orderBy(asc(rotationSteps.sequence));
+      if (!conflict && typeof receipt.candidateAddress === "string" && isIP(receipt.candidateAddress) === Number(c.slot.family)
+        && (incident.phase === "cloud" || incident.phase === "candidate")) {
+        // Receipt arrival order is not cloud-plan order. A late allocation read
+        // must not replace a later applied attachment's aggregate resource state.
+        const confirmed = steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.receipt?.candidateAddress === receipt.candidateAddress).at(-1);
+        const resourceReceipt = confirmed?.receipt ?? receipt;
+        const attached = !!confirmed && !confirmed.plan.action.endsWith("allocate");
+        const referenced = c.address?.address === resourceReceipt.candidateAddress;
+        const resourceId = typeof resourceReceipt.resourceId === "string" ? resourceReceipt.resourceId : null;
+        const snapshot = { receipt: resourceReceipt, slot: (confirmed ?? step).plan.arguments.slot };
+        await tx.insert(rotationResources).values({ incidentId: id, attemptId: step.attemptId, address: receipt.candidateAddress, allocationId: typeof resourceReceipt.allocationId === "string" ? resourceReceipt.allocationId : null, resourceId, origin: "system", ownershipAttemptId: step.attemptId, role: "candidate", attached, referenced, snapshot }).onConflictDoUpdate({ target: [rotationResources.attemptId, rotationResources.role], set: { resourceId: sql`coalesce(${rotationResources.resourceId}, ${resourceId})`, attached, referenced, snapshot } });
+      }
       if (steps.every(s => s.status === "applied")) await this.installCandidate(tx, c, incident, steps, now);
       await tx.update(rotationIncidents).set({ nextRunAt: new Date(now.getTime() + (status === "pending" ? 5000 : 0)) }).where(eq(rotationIncidents.id, id));
     });
@@ -215,4 +223,10 @@ function stepSnapshot(s: Step): RotationStepSnapshot {
   if (s.status === "pending" || s.status === "in_flight") return { stepId: s.id, status: s.status, observeDeadline: s.observeDeadline!.getTime() };
   if (s.status === "rejected_no_effect") return { stepId: s.id, status: s.status, reason: s.errorCode as RotationCloudRejection, retryAt: s.retryAt?.getTime() ?? null };
   return { stepId: s.id, status: s.status };
+}
+
+async function deferFailedClaim(tx: RotationTransaction, id: string) {
+  // Preserve later deadlines while moving busy/foreign-plan work behind other
+  // due incidents. Failed claims must not monopolize the oldest queue page.
+  await tx.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '15 seconds')` }).where(eq(rotationIncidents.id, id));
 }

@@ -51,9 +51,15 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
   const [attempt] = incident.currentAttemptId ? await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, incident.currentAttemptId)).for("update") : [];
   const continuingCloud = incident.phase === "cloud" && !!attempt?.charged;
   if (incident.phase === "cloud" && attempt) {
-    const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt.id));
+    const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt.id)).for("update");
     if (steps.some(s => !["prepared", "rejected_no_effect", "applied"].includes(s.status))) throw new Error("cloud_observation_required");
     if (!continuingCloud) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, attempt.id));
+    else for (const step of steps.filter(s => s.status === "rejected_no_effect")) {
+      // Explicit fresh authorization may retry a conclusively rejected step of
+      // this charged plan. The original allocation, charge and receipts survive.
+      await tx.update(rotationSteps).set({ status: "prepared", errorCode: null, retryAt: null, updatedAt: h.now }).where(eq(rotationSteps.id, step.id));
+      await rotationAudit(tx, incident, "rotation.step_reprepared", actorUserId, { stepId: step.id, attemptId: attempt.id, previousStatus: step.status, previousErrorCode: step.errorCode, previousRetryAt: step.retryAt });
+    }
   }
   const segmentId = randomUUID();
   await tx.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: id, maxAttempts: c.policy!.maxAttempts, actorUserId });
