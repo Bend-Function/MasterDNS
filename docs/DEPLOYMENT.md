@@ -122,7 +122,7 @@ docker compose ps
 
 恢复操作会覆盖目标数据库，应只在明确的恢复窗口执行。完整恢复需要同时具备数据库备份和对应的 `MASTER_ENCRYPTION_KEY`；Redis 卷可以重建，Worker 会扫描未完成的 Operation、持久通知状态与通知投递并重新入队。
 
-备份只能恢复平台的持久状态。恢复旧数据库前先停止 Web、API、Worker 和 migration，防止旧状态继续驱动副作用；恢复后先核对 AWS、DNS、candidate/current/publication 与 cleanup 的远端实际状态，再恢复自动化。数据库备份不能撤销已经执行的 EC2/Lightsail 或 DNS 写入，也不能找回已释放且不可复原的地址。
+备份只能恢复平台的持久状态。恢复旧数据库前先停止 Web、API、Worker 和 migration，防止旧状态继续驱动副作用；恢复后先核对 AWS/Azure/Linode、DNS、candidate/current/publication 与 cleanup 的远端实际状态，再恢复自动化。数据库备份不能撤销已经执行的 EC2/Lightsail、Azure/Linode 或 DNS 写入，也不能找回已释放且不可复原的地址。
 
 ## 10. 升级与回退
 
@@ -139,7 +139,7 @@ docker compose logs --since=10m migrate api worker
 
 升级预检是只读操作。若它报告同一 Zone、FQDN 和记录类型被多个 Pool 绑定，应在旧版本仍运行时根据报告中的 Binding/Pool ID 保留一个业务上正确的绑定，并删除或改名其他绑定；预检不会替操作员选择或删除数据。重复运行预检直至通过后再执行 `docker compose up -d`。健康检查唯一约束升级会按 `updated_at`、`created_at`、`id` 顺序保留每个 scope 最新的启用配置，并自动禁用其余旧配置。
 
-migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 `MASTER_ENCRYPTION_KEY`、旧镜像标签和旧 Agent 精确版本。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。down migration 即使存在也不能撤销已经执行的 AWS 或 DNS 写入；回退后必须按远端读取结果人工处置 partial publication、ambiguous ownership 和 cleanup failure，不能只回退代码。
+migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 `MASTER_ENCRYPTION_KEY`、旧镜像标签和旧 Agent 精确版本。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。down migration 即使存在也不能撤销已经执行的云计算或 DNS 写入；回退后必须按远端读取结果人工处置 partial publication、ambiguous ownership 和 cleanup failure，不能只回退代码。
 
 ## 11. 常见检查
 
@@ -152,3 +152,23 @@ migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 
 - Probe 一直 unknown：检查 Agent 时间、在线状态、地址族能力、任务 deadline、有效票数和 private CIDR 策略；不要把 unknown 当作 failure。
 - DNS 部分发布：查看 rotation publication 与对应 Operation/Step，先读取各 DNS 厂商远端值，再决定重试或人工修复。
 - cleanup 失败：核对地址归属、引用关系、release opt-in 和远端附着状态；无法确认归属时保留资源并人工处理。
+
+## 云计算账号、地址绑定与轮换
+
+“云计算账号”与 DNS Provider 凭证独立。选择 AWS、Microsoft Azure 或 Linode / Akamai Cloud 后输入对应凭证；修改凭证必须保持 Provider 和远端账号身份一致。凭证在 API 验证后加密保存，浏览器在关闭表单、切换 Provider 或退出会话时清空草稿。区域标识以 Provider 返回的区域为准，留空表示扫描该账号可见区域，不代表全局写权限。
+
+| 云 Provider / 服务 | 凭证 | 区域示例 | 初始轮换范围 |
+| --- | --- | --- | --- |
+| AWS / EC2、Lightsail | 专用 IAM AccessKey，可选 Session Token；管理员可使用部署身份或 AssumeRole | `ap-southeast-2` | 保留已有 EC2/Lightsail 能力与限制 |
+| Azure / Virtual Machine | Service Principal：Tenant ID、Subscription ID、Client ID、Client Secret | `australiaeast` | 运行中的独立 VM，精确的现有 NIC IP 配置，Standard / Regional / Static 公网 IPv4 或 IPv6 |
+| Linode / Akamai Cloud | Personal Access Token | `us-east` | 运行中的实例、唯一旧版配置、已启用 Network Helper、default 启动模式和简单公网接口；仅 IPv4 轮换 |
+
+先同步清单，核对实例、地址和能力原因，再开启“允许 MasterDNS 管理”。只做绑定与监控时可将全部轮换权限保持关闭；Linode SLAAC IPv6 不可替换，但已发现的实际公网主机地址可绑定 AAAA 和监控。新版 Linode Interfaces、复杂网络及不支持的 Azure 拓扑也不得以“开启管理”绕过能力检查。路由前缀不能当作已配置主机地址发布。
+
+IPv4、IPv6、停止/启动/重启和旧地址释放是独立显式授权，默认关闭；轮换策略也必须单独开启。技术能力可用与凭证验证成功都不证明写权限、配额或公网可达性。Azure 需要 VM/NIC/公网 IP/子网读取、公网 IP write/join、NIC write、适用 join 和异步操作读取权限；清理另需 delete。Linode 轮换需要 `linodes:read_write`、`ips:read_only` 和 `events:read_only`（对应 read_write 或 `*` 可满足 scope 检查），以及用户对所选实例和 profile 的有效访问权限。
+
+Linode 额外 IPv4 需要支持团队批准配额并产生费用。换址会重启实例以应用 Network Helper 配置；候选地址通过外部健康复测后才能发布 DNS。另行授权释放旧 IPv4 后，发布后的清理会再次重启以移除旧配置，必须预留两次服务中断。清理重启后的完整健康阈值也需重新满足；`cleanup_health_failed` 表示探测未恢复，`probe_insufficient` 表示证据不足。控制面 running 或重启 API 成功不能代替 guest 网络与外部健康验收。MasterDNS 不会自动启用 Network Helper，也不提交配额申请。
+
+Azure 的 whole-NIC PUT 没有已证明的外部原子 CAS 保证；MasterDNS 内部锁无法防止第三方在最终读取与写入之间修改 NIC。Linode 丢失分配响应时不能根据新增地址清单认领资源或重新分配，重启事件也无法在所有情况下区分同用户的并发手动操作。遇到 ambiguous 状态应先核实远端与持久证据，不能通过反复提交来猜测成功。
+
+完整权限、拓扑、恢复及外部并发边界见 [Azure](providers/azure.md) 和 [Linode](providers/linode.md)。本批验收进度与未执行项目见 [Azure/Linode 验收记录](validation/azure-linode.md)。Go Agent 协议未变，未修改或重新发布 Agent；继续使用已审核的独立发布版本。

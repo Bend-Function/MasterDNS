@@ -131,3 +131,17 @@
 - Worker/Redis 重启后，持久通知状态和 retrying delivery 能恢复；相同语义状态在同一 channel 只产生一条 delivery，后续状态转换产生新事件。
 - 分别验证 probe insufficient/unknown、target failure/recovery、rotation exhausted、permission/quota、DNS partial、cleanup failed/completed；通知 payload 和日志不含 Token、凭证、自定义 header、原始云请求、完整配置或 plan。
 - Playwright 验证桌面和移动端无阻塞操作问题。
+
+## 7. Azure / Linode 云计算扩展
+
+状态与精确执行证据统一记录在 [Azure/Linode 验收记录](validation/azure-linode.md)。以下是验收要求，不能据此推断每项已执行。
+
+- Web 表单验证 AWS、Azure Service Principal、Linode PAT 的正确 payload；隐藏的其他 Provider 字段不能发送。覆盖 Provider 切换、关闭、退出会话的草稿清空，服务端 Provider 不匹配、凭证替换保持账号身份，以及失败重试的 idempotency key 和迟到响应隔离。
+- 控制台正确显示 Provider、服务、区域示例、实际能力原因、配额错误；Linode 重启授权在策略开启和手动执行前生效，并说明换址重启与释放后的第二次重启。不可轮换的 SLAAC IPv6 仍可绑定监控，默认权限均关闭。
+- Azure REST fake 覆盖精确 NIC IP 配置、IPv4/IPv6 与 sibling/private 配置保留、异步轮询、所有权、丢失响应和受保护清理；Linode REST fake 覆盖旧版配置、Network Helper、权限/配额、不可认领的未知分配、带 actor/watermark 的两次重启和清理恢复。
+- API/Worker/数据库集成覆盖 Provider 凭证与 scope 校验、工厂选择、发现元数据保留、授权与预算、fence/version、候选外部复测先于 DNS，以及重启/崩溃后持久恢复。Linode 清理重启之后必须重新达到完整健康成功阈值；区分 `cleanup_health_failed` 与 `probe_insufficient`。
+- AWS EC2/Lightsail 回归、全项目 typing/lint/tests、规范仓库内的生产 Turbopack 构建，以及隔离 PostgreSQL 空库 migration 与升级验收需独立记录。Web worktree 构建不能代替控制器最终集成分支验收。
+- 真实云验收仅使用隔离 Azure dual-stack VM 或 Linode 实例与测试 DNS，并验证公网入口、实际出口、guest 网络、DNS 收敛、费用、权限不足、清理和并发外部修改。未执行时必须明确标为未执行；HTTP fake 不等于真实云成功。
+- Azure 外部 NIC 并发 CAS 无保证；Linode 不确定分配不能从 inventory 差集推断，普通 IPv4 分配缺少不可变 generation、重启缺少请求相关 token，均需保留运维限制。具体边界见 [Azure](providers/azure.md) 与 [Linode](providers/linode.md)。
+- 桌面和移动端视觉/交互验收需在可用的授权浏览器环境完成。当前记录的原生 Mac 锁定与 Codex 浏览器认证不可用不会被自动化绕过；如未恢复，视觉验收保持待完成。
+- 本批不修改 Agent 协议，也不重新发布 Go Agent；平台构建不证明已进行新的 Agent 二进制验收。
