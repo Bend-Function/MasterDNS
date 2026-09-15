@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { CloudStep, SlotRef } from '@masterdns/contracts';
-import { azureCapabilities, nicSupported, pipSupported, type AzureCloudAdapter, type AzureRead, type AzureResource, type AzureSlotEvidence } from './azure.js';
+import { azureCapabilities, azurePublicIpMetadata, nicSupported, pipSupported, type AzureCloudAdapter, type AzureRead, type AzureResource, type AzureSlotEvidence } from './azure.js';
 import { NETWORK_API, equalArmId, retryAfter, type AzureResponse } from './azure-http.js';
 import { CloudError } from './errors.js';
 import type { CloudInventory, CloudObservation, CloudStepResult } from './provider.js';
@@ -277,7 +277,18 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         if (step.action === 'azure.public-ip.allocate') {
             if (!old)
                 return { ...a.receipt, status: 'ambiguous' };
-            return { ...receipt(adapter, a), ...a.receipt, candidateAddress: candidate.properties.ipAddress, status: 'applied' };
+            const bound = equalArmId(candidate.properties.ipConfiguration?.id, a.slot.interfaceId);
+            if (bound !== equalArmId(current.binding, candidateId(a)) || (bound && old.properties.ipConfiguration))
+                return { ...a.receipt, status: 'ambiguous' };
+            const baseReceipt = receipt(adapter, a);
+            return {
+                ...baseReceipt, ...a.receipt, candidateAddress: candidate.properties.ipAddress, status: 'applied',
+                after: {
+                    ...baseReceipt.after, ...a.receipt?.after,
+                    addressMetadata: azurePublicIpMetadata(candidate, bound, bound ? candidate.properties.ipConfiguration.id : undefined, 'public_ip_unattached'),
+                    privateAddress: current.configuration.properties.privateIPAddress,
+                },
+            };
         }
         const persisted = validateCandidateReceipt(a);
         if (candidate.properties.ipAddress !== persisted.candidateAddress)

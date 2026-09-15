@@ -47,6 +47,15 @@ export function pipSupported(pip: AzureResource, family: 4 | 6): boolean {
         && (p.ddosSettings === undefined || ownKeys(p.ddosSettings, ['protectionMode', 'ddosProtectionPlan']))
         && (pip.zones === undefined || Array.isArray(pip.zones) && pip.zones.every((z: unknown) => typeof z === 'string'));
 }
+/** Normalized public-IP evidence; an unbound allocation must not imply NIC ownership. */
+export function azurePublicIpMetadata(pip: AzureResource, supported: boolean, ipConfigurationId?: string, reason = 'public_ip_topology_unsupported'): Record<string, unknown> {
+    return {
+        supported, ...(!supported ? { reason } : {}), sku: pip.sku, zones: pip.zones ?? [],
+        allocationMethod: pip.properties.publicIPAllocationMethod,
+        ...(pip.properties.resourceGuid === undefined ? {} : { resourceGuid: pip.properties.resourceGuid }),
+        ...(ipConfigurationId === undefined ? {} : { ipConfigurationId }),
+    };
+}
 export function nicSupported(nic: AzureResource): boolean {
     const p = nic.properties ?? {};
     return p.provisioningState === 'Succeeded'
@@ -181,7 +190,7 @@ export class AzureCloudAdapter implements CloudAdapter {
                     const actualFamily = isIP(pip.properties?.ipAddress);
                     const pipOk = family !== undefined && actualFamily === family && pipSupported(pip, family) && equalArmId(pip.properties.ipConfiguration?.id, configId) && pip.location?.toLowerCase() === ref.region;
                     if (actualFamily === 4 || actualFamily === 6)
-                        iface.addresses.push({ address: pip.properties.ipAddress, family: actualFamily, primary: cp.primary === true, allocationId: pid, resourceId: pid, privateAddress: cp.privateIPAddress, metadata: { supported: pipOk, ...(!pipOk ? { reason: 'public_ip_topology_unsupported' } : {}), sku: pip.sku, zones: pip.zones ?? [], allocationMethod: pip.properties.publicIPAllocationMethod, resourceGuid: pip.properties.resourceGuid, ipConfigurationId: configId } });
+                        iface.addresses.push({ address: pip.properties.ipAddress, family: actualFamily, primary: cp.primary === true, allocationId: pid, resourceId: pid, privateAddress: cp.privateIPAddress, metadata: azurePublicIpMetadata(pip, pipOk, configId) });
                 }
                 inventory.interfaces.push(iface);
             }

@@ -55,6 +55,24 @@ describe('Azure exact-resource rotation', () => {
         expect(f.writes[1]!.url).toBe(nicId);
         expect(f.resources[otherId]).toEqual(otherBefore);
     });
+    it.each([4, 6] as const)('preserves independent metadata for an allocated but unattached IPv%s candidate', async family => {
+        const f = await prepare(fixture(family));
+        const initial = await f.adapter.execute(f.steps[0]!);
+        f.resources[initial.allocationId!].properties.resourceGuid = 'allocated-candidate-generation';
+        const step = { ...f.steps[0]!, arguments: { ...f.steps[0]!.arguments, receipt: initial, previousExecution: true } };
+        const observation = await f.adapter.observeDetails(step);
+        expect(observation.status).toBe('applied');
+        expect(observation.after?.addressMetadata).toEqual({ supported: false, reason: 'public_ip_unattached', sku: { name: 'Standard', tier: 'Regional' }, zones: ['1'], allocationMethod: 'Static', resourceGuid: 'allocated-candidate-generation' });
+        expect(observation.after?.privateAddress).toBe(f.resources[nicId].properties.ipConfigurations[0].properties.privateIPAddress);
+        expect(observation.after?.addressMetadata).not.toHaveProperty('ipConfigurationId');
+        expect(observation.after?.pollAfter).toBe(initial.after?.pollAfter);
+        const recovered = await f.adapter.execute(step);
+        expect(recovered.after?.addressMetadata).toEqual(observation.after?.addressMetadata);
+        expect(f.resources[nicId].properties.ipConfigurations[0].properties.publicIPAddress.id).toBe(pipId);
+        expect(f.writes).toHaveLength(1);
+        f.resources[initial.allocationId!].properties.ipConfiguration = { id: configId };
+        expect(await f.adapter.observeDetails(step)).toMatchObject({ status: 'ambiguous' });
+    });
     it('recovers an allocated candidate after a lost response without a second PUT', async () => {
         const f = await prepare();
         const candidate = await f.adapter.execute(f.steps[0]!);
