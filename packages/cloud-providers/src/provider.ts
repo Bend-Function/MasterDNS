@@ -9,6 +9,8 @@ export type CloudAddress = {
   family: 4 | 6;
   primary: boolean;
   allocationId?: string;
+  privateAddress?: string;
+  resourceId?: string;
   prefixLength?: number;
 };
 
@@ -32,14 +34,30 @@ export type Capability = {
   canRestoreOldAddress: boolean;
 };
 
+export type CloudObservationStatus = "pending" | "applied" | "not_applied" | "ambiguous";
+
+export type CloudStepResult = {
+  remoteId?: string;
+  allocationId?: string;
+  operationId?: string;
+  operationIds?: string[];
+  candidateAddress?: string;
+  candidateRepeated?: boolean;
+  before?: Record<string, unknown>;
+  after?: Record<string, unknown>;
+};
+
+export type CloudObservation = CloudStepResult & { status: CloudObservationStatus };
+
 export interface CloudAdapter {
   verifyIdentity(): Promise<{ externalAccountId: string }>;
   listScopes(): Promise<string[]>;
   discover(region: string, cursor?: string): Promise<CloudPage>;
   inspect(ref: CloudRef): Promise<CloudInventory>;
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability;
-  execute(step: CloudStep): Promise<{ remoteId?: string }>;
-  observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous">;
+  execute(step: CloudStep): Promise<CloudStepResult>;
+  observe(step: CloudStep): Promise<CloudObservationStatus>;
+  observeDetails?(step: CloudStep): Promise<CloudObservation>;
 }
 
 export type AwsSend = (command: any) => Promise<any>;

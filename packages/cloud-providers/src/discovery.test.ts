@@ -105,7 +105,7 @@ describe("EC2 read adapter", () => {
           addresses: [
             { address: "10.0.0.4", family: 4, primary: true },
             { address: "10.0.0.5", family: 4, primary: false },
-            { address: "198.51.100.10", family: 4, primary: false, allocationId: "eipalloc-01" },
+            { address: "198.51.100.10", family: 4, primary: false, allocationId: "eipalloc-01", privateAddress: "10.0.0.5" },
             { address: "2001:db8::4", family: 6, primary: true },
           ],
         }],
@@ -273,4 +273,15 @@ describe("Lightsail read adapter", () => {
     await expect(adapter.inspect({ accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn }))
       .rejects.toMatchObject({ code: "remote_identity_changed", retryable: false });
   });
+});
+
+it("keeps missing Lightsail addressing metadata unknown rather than claiming dual-stack support", async () => {
+  const adapter = new LightsailCloudAdapter("local-account", credentials, {
+    lightsailSend: async command => command instanceof GetInstancesCommand
+      ? { instances: [{ name: "one", arn: "arn:one", ipv6Addresses: ["2001:db8::1"] }] }
+      : { staticIps: [] },
+  });
+  const inventory = (await adapter.discover("us-east-1")).items[0]!;
+  const slot = { ...inventory.ref, slotId: "v6", interfaceId: "primary", family: 6 as const, address: "2001:db8::1" };
+  expect(adapter.capabilities(slot, inventory)).toMatchObject({ available: false, reason: "lightsail_address_type_unknown" });
 });

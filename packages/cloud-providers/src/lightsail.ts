@@ -12,8 +12,9 @@ import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js";
+import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
-import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage } from "./provider.js";
+import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
 
 export class LightsailCloudAdapter implements CloudAdapter {
   private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
@@ -34,7 +35,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
       ?? this.stsClient.send(command);
   }
 
-  private lightsailSend(region: string, command: GetRegionsCommand | GetInstancesCommand | GetInstanceCommand | GetStaticIpsCommand) {
+  private lightsailSend(region: string, command: Parameters<AwsSend>[0]) {
     if (this.dependencies.lightsailSend !== undefined) return this.dependencies.lightsailSend(command);
     let client = this.lightsailClients.get(region);
     if (client === undefined) {
@@ -131,11 +132,19 @@ export class LightsailCloudAdapter implements CloudAdapter {
     return evaluateCapabilities(slot, inventory);
   }
 
-  async execute(_step: CloudStep): Promise<{ remoteId?: string }> {
-    throw new CloudError("cloud_writes_not_enabled", false);
+  async execute(step: CloudStep): Promise<CloudStepResult> {
+    try {
+      return await executeLightsailRotation(step, this.accountId, command => this.lightsailSend((step.arguments.slot as SlotRef)?.region, command));
+    } catch (error) { throw normalizeAwsError(error); }
   }
 
-  async observe(_step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
-    throw new CloudError("cloud_writes_not_enabled", false);
+  async observeDetails(step: CloudStep): Promise<CloudObservation> {
+    try {
+      return await observeLightsailRotation(step, this.accountId, command => this.lightsailSend((step.arguments.slot as SlotRef)?.region, command));
+    } catch (error) { throw normalizeAwsError(error); }
+  }
+
+  async observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
+    return (await this.observeDetails(step)).status;
   }
 }

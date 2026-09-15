@@ -1,4 +1,9 @@
 export type CloudErrorCode =
+  | "rotation_unsupported"
+  | "invalid_rotation_step"
+  | "resource_ownership_ambiguous"
+  | "cleanup_not_authorized"
+  | "cloud_operation_failed"
   | "cloud_writes_not_enabled"
   | "credentials_expired"
   | "invalid_credentials"
@@ -18,14 +23,16 @@ export class CloudError extends Error {
     readonly code: CloudErrorCode,
     readonly retryable: boolean,
     readonly retryAfterMs?: number,
+    readonly reason?: string,
   ) {
     super(code);
   }
 
-  toJSON(): { name: string; code: CloudErrorCode; retryable: boolean; retryAfterMs?: number } {
-    return this.retryAfterMs === undefined
-      ? { name: this.name, code: this.code, retryable: this.retryable }
-      : { name: this.name, code: this.code, retryable: this.retryable, retryAfterMs: this.retryAfterMs };
+  toJSON(): { name: string; code: CloudErrorCode; retryable: boolean; retryAfterMs?: number; reason?: string } {
+    return { name: this.name, code: this.code, retryable: this.retryable,
+      ...(this.retryAfterMs === undefined ? {} : { retryAfterMs: this.retryAfterMs }),
+      ...(this.reason === undefined ? {} : { reason: this.reason }),
+    };
   }
 }
 

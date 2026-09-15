@@ -10,8 +10,9 @@ import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapEc2Instance } from "./discovery.js";
+import { executeEc2Rotation, observeEc2Rotation } from "./ec2-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
-import type { AwsAdapterDependencies, AwsCredentials, Capability, CloudAdapter, CloudInventory, CloudPage } from "./provider.js";
+import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
 
 export class Ec2CloudAdapter implements CloudAdapter {
   private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
@@ -32,14 +33,14 @@ export class Ec2CloudAdapter implements CloudAdapter {
       ?? this.stsClient.send(command);
   }
 
-  private ec2Send(region: string, command: DescribeRegionsCommand | DescribeInstancesCommand | DescribeNetworkInterfacesCommand) {
+  private ec2Send(region: string, command: Parameters<AwsSend>[0]) {
     if (this.dependencies.ec2Send !== undefined) return this.dependencies.ec2Send(command);
     let client = this.ec2Clients.get(region);
     if (client === undefined) {
       client = new EC2Client({ ...awsClientOptions, region, credentials: this.credentialSource });
       this.ec2Clients.set(region, client);
     }
-    return client.send(command);
+    return (client.send.bind(client) as AwsSend)(command);
   }
 
   async verifyIdentity(): Promise<{ externalAccountId: string }> {
@@ -108,11 +109,19 @@ export class Ec2CloudAdapter implements CloudAdapter {
     return evaluateCapabilities(slot, inventory);
   }
 
-  async execute(_step: CloudStep): Promise<{ remoteId?: string }> {
-    throw new CloudError("cloud_writes_not_enabled", false);
+  async execute(step: CloudStep): Promise<CloudStepResult> {
+    try {
+      return await executeEc2Rotation(step, this.accountId, command => this.ec2Send((step.arguments.slot as SlotRef)?.region, command));
+    } catch (error) { throw normalizeAwsError(error); }
   }
 
-  async observe(_step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
-    throw new CloudError("cloud_writes_not_enabled", false);
+  async observeDetails(step: CloudStep): Promise<CloudObservation> {
+    try {
+      return await observeEc2Rotation(step, this.accountId, command => this.ec2Send((step.arguments.slot as SlotRef)?.region, command));
+    } catch (error) { throw normalizeAwsError(error); }
+  }
+
+  async observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
+    return (await this.observeDetails(step)).status;
   }
 }

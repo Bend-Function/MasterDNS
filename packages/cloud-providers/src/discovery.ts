@@ -28,6 +28,7 @@ function ec2Addresses(networkInterface: InstanceNetworkInterface | NetworkInterf
         primary: address.Primary ?? false,
       };
       if (association.AllocationId !== undefined) publicAddress.allocationId = association.AllocationId;
+      if (address.PrivateIpAddress !== undefined) publicAddress.privateAddress = address.PrivateIpAddress;
       addresses.push(publicAddress);
     }
   }
@@ -78,8 +79,9 @@ export function mapLightsailInstance(
   }
   if (instance.publicIpAddress !== undefined) {
     const address: CloudAddress = { address: instance.publicIpAddress, family: 4, primary: true };
-    const allocationId = staticIps.find((staticIp) => staticIp.attachedTo === instance.name && staticIp.ipAddress === instance.publicIpAddress)?.name;
-    if (allocationId !== undefined) address.allocationId = allocationId;
+    const staticIp = staticIps.find((candidate) => candidate.attachedTo === instance.name && candidate.ipAddress === instance.publicIpAddress);
+    if (staticIp?.name !== undefined) address.allocationId = staticIp.name;
+    if (staticIp?.arn !== undefined) address.resourceId = staticIp.arn;
     addresses.push(address);
   }
   for (const address of instance.ipv6Addresses ?? []) {
@@ -90,7 +92,7 @@ export function mapLightsailInstance(
     nativeName: instance.name,
     name: instance.name,
     state: instance.state?.name ?? "unknown",
-    ipv6Only: instance.ipAddressType === "ipv6",
+    ...(["ipv4", "dualstack", "ipv6"].includes(instance.ipAddressType ?? "") ? { ipv6Only: instance.ipAddressType === "ipv6" } : {}),
     interfaces: [{ id: "primary", addresses }],
   };
 }

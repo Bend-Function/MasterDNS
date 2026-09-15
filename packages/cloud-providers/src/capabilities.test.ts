@@ -30,7 +30,7 @@ describe("capability evaluation", () => {
       available: true,
       permission: "unverified",
       requiresStop: false,
-      releasesOldAddress: false,
+      releasesOldAddress: true,
       canRestoreOldAddress: false,
     });
   });
@@ -73,4 +73,15 @@ describe("capability evaluation", () => {
     const slot = { ...inventory.ref, slotId: "secondary-eni", interfaceId: "eni-secondary", address: "198.51.100.8", family: 4 as const };
     expect(evaluateCapabilities(slot, inventory)).toMatchObject({ available: false, reason: "secondary_interface_unsupported" });
   });
+});
+
+it("reports Lightsail IPv6 address loss separately from retained static IPv4 allocations", () => {
+  const ref = { accountId: "local", service: "lightsail" as const, region: "us-east-1", instanceId: "arn:one" };
+  const inventory: CloudInventory = { ref, name: "one", nativeName: "one", state: "running", ipv6Only: false, interfaces: [{ id: "primary", addresses: [
+    { address: "2001:db8::1", family: 6, primary: true },
+    { address: "198.51.100.1", family: 4, primary: true, allocationId: "old-static" },
+  ] }] };
+  const slot = { ...ref, slotId: "v6", interfaceId: "primary", family: 6 as const, address: "2001:db8::1" };
+  expect(evaluateCapabilities(slot, inventory)).toMatchObject({ available: true, releasesOldAddress: true, canRestoreOldAddress: false, requiresStop: false });
+  expect(evaluateCapabilities({ ...slot, family: 4, address: "198.51.100.1" }, inventory)).toMatchObject({ available: true, releasesOldAddress: false });
 });
