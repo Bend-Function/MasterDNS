@@ -46,6 +46,8 @@ export function publicationAuthorizationError(c: RotationContext) {
   if (c.conflictingManager) return "conflicting_manager";
 }
 export function livePublicationMatches(c: RotationContext, live: CloudInventory) {
+  const metadata = c.address?.metadata;
+  const providerMetadata = metadata?.providerMetadata as Record<string, unknown> | undefined;
   return (
     live.ref.accountId === c.account.id &&
     live.ref.instanceId === c.instance.externalId &&
@@ -58,7 +60,9 @@ export function livePublicationMatches(c: RotationContext, live: CloudInventory)
           (a) =>
             a.family === Number(c.slot.family) &&
             a.address === c.address?.address &&
-            (!c.address.remoteAllocationId || a.allocationId === c.address.remoteAllocationId),
+            (!c.address.remoteAllocationId || a.allocationId === c.address.remoteAllocationId) &&
+            (!metadata?.resourceId || a.resourceId === metadata.resourceId) &&
+            (!providerMetadata?.resourceGuid || a.metadata?.resourceGuid === providerMetadata.resourceGuid),
         ),
     )
   );

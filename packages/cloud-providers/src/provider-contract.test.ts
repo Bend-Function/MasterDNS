@@ -11,7 +11,7 @@ describe("provider dispatch contracts", () => {
     expect(await adapter.verifyIdentity()).toEqual({ externalAccountId: "123456789012" });
     expect(() => createCloudAdapter({ accountId: "account", service: "ec2", credentials: { kind: "linode_token", token: "secret" } })).toThrow("invalid_credentials");
     expect(() => createCloudAdapter({ accountId: "account", provider: "azure", service: "ec2", credentials: { kind: "role" } })).toThrow("invalid_credentials");
-    expect(() => createCloudAdapter({ accountId: "account", service: "linode", credentials: { kind: "linode_token", token: "secret" } })).toThrow(expect.objectContaining({ code: "rotation_unsupported", reason: "service_unavailable" }));
+    expect(createCloudAdapter({ accountId: "account", service: "linode", credentials: { kind: "linode_token", token: "secret" } }).constructor.name).toBe("LinodeCloudAdapter");
   });
   it("maps scopes without routing a new service through Lightsail", () => {
     expect(cloudProviderServices).toEqual({ aws: ["ec2", "lightsail"], azure: ["azure_vm"], linode: ["linode"] });
@@ -21,7 +21,7 @@ describe("provider dispatch contracts", () => {
     for (const service of ["azure_vm", "linode"] as const) {
       const slot: SlotRef = { accountId: "account", service, region: "region", instanceId: "instance", interfaceId: "interface", slotId: "slot", family: 4, address: "192.0.2.1" };
       const inventory: CloudInventory = { ref: slot, name: "instance", state: "running", interfaces: [{ id: "interface", addresses: [{ address: slot.address, family: 4, primary: true }] }] };
-      expect(evaluateCapabilities(slot, inventory)).toMatchObject({ available: false, reason: "service_unavailable" });
+      expect(evaluateCapabilities(slot, inventory)).toMatchObject({ available: false, reason: service === "azure_vm" ? "address_not_found" : "linode_new_interfaces_unsupported" });
       expect(() => planCloudRotation(slot, inventory, { allowStop: true, attemptId: "attempt" })).toThrow("rotation_unsupported");
       const step = makeRotationStep(service === "azure_vm" ? "azure.public-ip.allocate" : "linode.ipv4.allocate", { slot, before: inventory, phase: "rotation", attemptId: "attempt", allowStop: true, priorReceipts: [{ action: "allocate", receipt: { candidateAddress: "192.0.2.2" } }] }, 0);
       expect(rotationArguments(step).priorReceipts).toEqual([{ action: "allocate", receipt: { candidateAddress: "192.0.2.2" } }]);

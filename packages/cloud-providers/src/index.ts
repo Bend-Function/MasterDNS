@@ -8,3 +8,5 @@ export * from "./lightsail.js";
 export * from "./provider.js";
 export * from "./rotation-plan.js";
 export * from "./resource-ownership.js";
+export * from "./azure.js";
+export * from "./linode.js";

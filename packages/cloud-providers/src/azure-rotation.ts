@@ -45,9 +45,10 @@ export function planAzureRotation(slot: SlotRef, inventory: CloudInventory, opti
 export function planAzureCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {
     if (!options.releaseAuthorized || !options.publishedAddress || options.publishedAddress === slot.address || isIP(options.publishedAddress) !== slot.family)
         throw new CloudError('cleanup_not_authorized', false);
-    planAzureRotation(slot, inventory, { allowStop: false, attemptId: options.attemptId });
+    if (!options.publishedInventory) planAzureRotation(slot, inventory, { allowStop: false, attemptId: options.attemptId });
     const args: RotationStepArguments = { slot, before: inventory, ...options, phase: 'post_publish_cleanup' };
     validateSnapshot(args);
+    if (args.publishedInventory) publishedAddress(args);
     const step = makeRotationStep('azure.public-ip.delete', args, 0);
     step.arguments.azureCandidateId = candidateId(args);
     return [step];
@@ -61,7 +62,7 @@ function argumentsFor(adapter: AzureCloudAdapter, step: CloudStep): RotationStep
     const a = rotationArguments(step);
     if (a.slot.service !== 'azure_vm' || a.slot.accountId !== adapter.accountId || !['azure.public-ip.allocate', 'azure.public-ip.associate', 'azure.public-ip.delete'].includes(step.action))
         throw new CloudError('invalid_rotation_step', false);
-    if (!azureCapabilities(a.slot, a.before).available)
+    if (!(a.phase === 'post_publish_cleanup' && a.publishedInventory) && !azureCapabilities(a.slot, a.before).available)
         ambiguous();
     adapter.http.resourceId(originalId(a), 'Microsoft.Network', 'publicIPAddresses');
     adapter.http.resourceId(candidateId(a), 'Microsoft.Network', 'publicIPAddresses');
@@ -71,10 +72,30 @@ function argumentsFor(adapter: AzureCloudAdapter, step: CloudStep): RotationStep
         if (a.phase !== 'post_publish_cleanup' || !a.releaseAuthorized || isIP(a.publishedAddress ?? '') !== a.slot.family || a.publishedAddress === a.slot.address)
             throw new CloudError('cleanup_not_authorized', false);
         validateSnapshot(a);
+        if (a.publishedInventory) publishedAddress(a);
     }
     else if (a.phase !== 'rotation')
         throw new CloudError('invalid_rotation_step', false);
     return a;
+}
+/** Cleanup owns the old allocation independently of whichever later attempt is published. */
+function publishedAddress(a: RotationStepArguments) {
+    const inventory = a.publishedInventory ?? ambiguous();
+    const slot = { ...a.slot, address: a.publishedAddress ?? '' };
+    if (!azureCapabilities(slot, inventory).available) return ambiguous();
+    const address = inventory.interfaces.find(i => equalArmId(i.id, slot.interfaceId))?.addresses.find(ip => ip.address === slot.address && ip.family === slot.family);
+    if (!address?.allocationId || !equalArmId(address.resourceId, address.allocationId) || equalArmId(address.allocationId, originalId(a))) return ambiguous();
+    if (a.publishedReceipt && (a.publishedReceipt.candidateAddress !== address.address || !equalArmId(a.publishedReceipt.allocationId, address.allocationId) || !equalArmId(a.publishedReceipt.resourceId, address.resourceId))) return ambiguous();
+    return address;
+}
+function cleanupOwnership(a: RotationStepArguments, old: AzureResource): void {
+    checkOld(a, old);
+    if (old.properties.ipConfiguration) ambiguous();
+    if (a.ownershipAttemptId && (!equalArmId(old.id, candidateId({ ...a, attemptId: a.ownershipAttemptId })) || !Object.entries(tags({ ...a, attemptId: a.ownershipAttemptId })).every(([key, value]) => old.tags?.[key] === value))) ambiguous();
+    const proof = a.cleanupReceipt;
+    if (proof && (proof.candidateAddress !== a.slot.address || !equalArmId(proof.allocationId, originalId(a)) || !equalArmId(proof.resourceId, originalId(a)))) ambiguous();
+    const metadata = proof?.after?.addressMetadata as Record<string, unknown> | undefined;
+    if (metadata?.resourceGuid !== undefined && old.properties.resourceGuid !== metadata.resourceGuid) ambiguous();
 }
 function validateCandidateReceipt(a: RotationStepArguments): CloudStepResult {
     const receipt = a.candidateReceipt;
@@ -138,8 +159,12 @@ async function context(adapter: AzureCloudAdapter, a: RotationStepArguments): Pr
     const nic = read.nics.get(evidence.nicId.toLowerCase()) ?? ambiguous();
     const configuration = nic.properties.ipConfigurations.find((c: AzureResource) => equalArmId(c.id, a.slot.interfaceId)) ?? ambiguous();
     const binding = configuration.properties.publicIPAddress?.id;
-    if (!equalArmId(binding, originalId(a)) && !equalArmId(binding, candidateId(a)))
-        ambiguous();
+    if (a.phase === 'post_publish_cleanup' && a.publishedInventory) {
+        const published = publishedAddress(a);
+        const installed = current!.addresses.find(address => address.address === a.publishedAddress && address.family === a.slot.family);
+        if (!equalArmId(binding, published.allocationId) || !installed || !equalArmId(installed.allocationId, published.allocationId) ||
+            (published.metadata?.resourceGuid !== undefined && installed.metadata?.resourceGuid !== published.metadata.resourceGuid)) ambiguous();
+    } else if (!equalArmId(binding, originalId(a)) && !equalArmId(binding, candidateId(a))) ambiguous();
     return { read, nic, configuration, binding };
 }
 function writableNic(nic: AzureResource, configurationId: string, newId: string): AzureResource {
@@ -209,6 +234,12 @@ export async function executeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         return ambiguous();
     }
     const current = await context(adapter, a);
+    if (step.action === 'azure.public-ip.delete' && a.publishedInventory) {
+        const response = await adapter.http.getResource(originalId(a), NETWORK_API, true);
+        if (response.status !== 404) cleanupOwnership(a, response.body);
+        const result = response.status === 404 ? undefined : await adapter.http.request(`${originalId(a)}?api-version=${NETWORK_API}`, 'DELETE');
+        return { ...receipt(adapter, a, result), allocationId: originalId(a), resourceId: originalId(a), candidateAddress: a.publishedAddress! };
+    }
     const oldResponse = await adapter.http.getResource(originalId(a), NETWORK_API, step.action === 'azure.public-ip.delete');
     const old = oldResponse.status === 404 ? undefined : oldResponse.body;
     if (old)
@@ -263,6 +294,11 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         if (operation.status === 'pending')
             return { ...a.receipt, ...(operation.after ? { after: operation.after } : {}), status: 'pending' };
         const current = await context(adapter, a);
+        if (step.action === 'azure.public-ip.delete' && a.publishedInventory) {
+            const response = await adapter.http.getResource(originalId(a), NETWORK_API, true);
+            if (response.status !== 404) cleanupOwnership(a, response.body);
+            return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: a.publishedAddress!, status: response.status === 404 ? 'applied' : 'pending' };
+        }
         const oldResponse = await adapter.http.getResource(originalId(a), NETWORK_API, true);
         const old = oldResponse.status === 404 ? undefined : oldResponse.body;
         if (old)

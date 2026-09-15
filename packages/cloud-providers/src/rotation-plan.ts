@@ -1,5 +1,7 @@
 import type { CloudStep, SlotRef } from "@masterdns/contracts";
 
+import { planAzureRotation, planAzureCleanup } from "./azure-rotation.js";
+import { planLinodeRotation, planLinodeCleanup } from "./linode-rotation.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { CloudError } from "./errors.js";
 import type { CloudInventory, CloudStepResult } from "./provider.js";
@@ -42,6 +44,12 @@ export type RotationStepArguments = {
   publishedAddress?: string;
   ownershipAttemptId?: string;
   ownershipSnapshot?: CleanupOwnershipSnapshot;
+  /** Fresh selected replacement topology, independent of the old resource attempt. */
+  publishedInventory?: CloudInventory;
+  publishedReceipt?: CloudStepResult;
+  publishedAttemptId?: string;
+  /** Immutable applied allocation receipt for a system-owned cleanup resource. */
+  cleanupReceipt?: CloudStepResult;
 };
 
 export function rotationArguments(step: CloudStep): RotationStepArguments {
@@ -71,6 +79,8 @@ export function makeRotationStep(action: RotationAction, args: RotationStepArgum
 }
 
 export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string }): CloudStep[] {
+  if (slot.service === "azure_vm") return planAzureRotation(slot, inventory, options);
+  if (slot.service === "linode") return planLinodeRotation(slot, inventory, options);
   const capability = evaluateCapabilities(slot, inventory);
   if (!capability.available) throw new CloudError("rotation_unsupported", false, undefined, capability.reason);
   if (capability.requiresStop && !options.allowStop) throw new CloudError("rotation_unsupported", false, undefined, "stop_not_authorized");
@@ -80,12 +90,13 @@ export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, opti
     actions = slot.family === 6 ? ["ec2.ipv6.assign"]
       : address.allocationId ? ["ec2.eip.allocate", "ec2.eip.associate"]
         : ["ec2.auto-ipv4.disable", "ec2.auto-ipv4.enable"];
-  } else {
+  } else if (slot.service === "lightsail") {
     if (!inventory.nativeName) throw new CloudError("rotation_unsupported", false, undefined, "native_name_missing");
     if (slot.family === 6) actions = ["lightsail.ipv6.disable", "lightsail.ipv6.enable"];
     else if (address.allocationId) actions = ["lightsail.static-ip.allocate", "lightsail.static-ip.detach", "lightsail.static-ip.attach"];
     else actions = ["lightsail.static-ip.allocate", "lightsail.static-ip.attach"];
   }
+  else throw new CloudError("rotation_unsupported", false, undefined, "service_unavailable");
   const args: RotationStepArguments = { slot, attemptId: options.attemptId, before: inventory, phase: "rotation" };
   const steps = actions.map((action, index) => makeRotationStep(action, args, index));
   rotationArguments(steps[0]!);
@@ -99,10 +110,19 @@ export type CleanupPlanOptions = {
   publishedAddress: string;
   ownershipAttemptId?: string;
   ownershipSnapshot?: CleanupOwnershipSnapshot;
+  /** Fresh selected replacement topology, independent of the old resource attempt. */
+  publishedInventory?: CloudInventory;
+  publishedReceipt?: CloudStepResult;
+  publishedAttemptId?: string;
+  /** Immutable applied allocation receipt for a system-owned cleanup resource. */
+  cleanupReceipt?: CloudStepResult;
   allowStop?: boolean;
 };
 
 export function planCloudRotationCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {
+  if (slot.service === "azure_vm") return planAzureCleanup(slot, inventory, options);
+  if (slot.service === "linode") return planLinodeCleanup(slot, inventory, options);
+  if (slot.service !== "ec2" && slot.service !== "lightsail") throw new CloudError("rotation_unsupported", false, undefined, "service_unavailable");
   if (!options.releaseAuthorized || !options.publishedAddress || options.publishedAddress === slot.address) throw new CloudError("cleanup_not_authorized", false);
   // Validate the original slot against its persisted pre-rotation inventory.
   planCloudRotation(slot, inventory, { allowStop: false, attemptId: options.attemptId });

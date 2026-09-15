@@ -97,14 +97,14 @@ describe("cloud account and authorization API", () => {
   it("reconstructs exact normalized provider metadata and standard address fields for capability evaluation", async () => {
     const f = await fixture();
     const ipConfigurationId = "/subscriptions/22222222-2222-4222-8222-222222222222/resourceGroups/" + "r".repeat(90) + "/providers/Microsoft.Network/networkInterfaces/" + "n".repeat(90) + "/ipConfigurations/exact-config";
-    const instanceMetadata = { azure: { supported: true } };
-    const interfaceMetadata = { nicId: ipConfigurationId.split("/ipConfigurations/")[0], ipConfigurationId };
-    const addressMetadata = { sku: "Standard", allocationMethod: "Static" };
-    await connection.db.update(cloudInstances).set({ service: "azure_vm", region: "australiaeast", metadata: { present: true, providerMetadata: instanceMetadata } }).where(eq(cloudInstances.id, f.instance.id));
+    const instanceMetadata = { supported: true };
+    const interfaceMetadata = { nicId: ipConfigurationId.split("/ipConfigurations/")[0], ipConfigurationId, supported: true };
+    const addressMetadata = { supported: true, sku: { name: "Standard", tier: "Regional" }, zones: [], allocationMethod: "Static", ipConfigurationId };
+    await connection.db.update(cloudInstances).set({ service: "azure_vm", region: "australiaeast", state: "running", metadata: { present: true, providerMetadata: instanceMetadata } }).where(eq(cloudInstances.id, f.instance.id));
     await connection.db.update(cloudInterfaces).set({ externalId: ipConfigurationId, metadata: { primaryAddresses: [f.address.address], providerMetadata: interfaceMetadata } }).where(eq(cloudInterfaces.id, f.iface.id));
     await connection.db.update(cloudAddresses).set({ remoteAllocationId: ipConfigurationId + "/allocation", metadata: { providerMetadata: addressMetadata, privateAddress: "10.0.0.4", resourceId: ipConfigurationId + "/resource" } }).where(eq(cloudAddresses.id, f.address.id));
     const slots = await service.slots(f.actor, f.instance.id);
-    expect(slots[0]!.capability).toMatchObject({ available: false, reason: "service_unavailable" });
+    expect(slots[0]!.capability).toMatchObject({ available: true, requiresStop: false });
     expect(vi.mocked(evaluateCapabilities).mock.lastCall?.[1]).toMatchObject({ metadata: instanceMetadata, interfaces: [{ id: ipConfigurationId, metadata: interfaceMetadata, addresses: [{ metadata: addressMetadata, privateAddress: "10.0.0.4", resourceId: ipConfigurationId + "/resource", allocationId: ipConfigurationId + "/allocation" }] }] });
     expect(JSON.stringify(await service.list(f.actor))).not.toContain("test-secret-access-key");
   });

@@ -610,3 +610,11 @@ it.each(["new-link", "restore"] as const)(
     expect(await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
   },
 );
+
+it("does not publish a recreated provider allocation with a different persisted resource identity", async () => {
+  const f = await fixture();
+  await f.d.update(db.cloudAddresses).set({ remoteAllocationId: "allocation", metadata: { resourceId: "resource", providerMetadata: { resourceGuid: "original-guid" } } }).where(eq(db.cloudAddresses.id, f.address.id));
+  Object.assign(f.live.interfaces[0]!.addresses[0]!, { allocationId: "allocation", resourceId: "resource", metadata: { resourceGuid: "replacement-guid" } });
+  await expect(f.service.publishSlot(f.slot.id)).rejects.toThrow("live_cloud_address_changed");
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.currentVersion).toBe(0);
+});

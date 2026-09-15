@@ -377,3 +377,32 @@ it("keeps attached candidate resources authoritative when an old lease's allocat
   expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateVersion).toBe(2);
   expect(f.state.writes).toHaveLength(2);
 });
+
+it("carries every applied allocation receipt and trusted earlier receipts to the next durable step", async () => {
+  const f = await fixture();
+  await drive(f, 3);
+  await drive(f, 1);
+  const steps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, (await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id)))[0]!.id));
+  const associate = steps.find(step => step.plan.action === "ec2.eip.associate")!;
+  expect(associate.plan.arguments.candidateReceipt).toMatchObject({ allocationId: "eipalloc-1" });
+  expect(associate.plan.arguments.priorReceipts).toMatchObject([{ action: "ec2.eip.allocate", receipt: { allocationId: "eipalloc-1" } }]);
+});
+it("checks fresh allowStopStart before accepting a persisted reboot step", async () => {
+  const f = await fixture();
+  await drive(f, 3);
+  const [attempt] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+  const [next] = await connection.db.select().from(rotationSteps).where(and(eq(rotationSteps.attemptId, attempt!.id), eq(rotationSteps.status, "prepared")));
+  await connection.db.update(rotationSteps).set({ plan: { ...next!.plan, action: "linode.instance.reboot", arguments: { ...next!.plan.arguments, allowStop: true } } }).where(eq(rotationSteps.id, next!.id));
+  await drive(f, 1);
+  expect(f.state.writes).toHaveLength(1);
+});
+
+it("persists validated candidate address metadata immediately after rotation", async () => {
+  const f = await fixture();
+  const observe = f.adapter.observeDetails!.bind(f.adapter);
+  f.adapter.observeDetails = async step => ({ ...await observe(step), after: { addressMetadata: { supported: true, sku: "Standard", resourceGuid: "candidate-guid" }, privateAddress: "10.0.0.4" }, resourceId: "candidate-resource" });
+  await drive(f, 5);
+  const [slot] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id));
+  const [candidate] = await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.id, slot!.candidateAddressId!));
+  expect(candidate!.metadata).toEqual({ providerMetadata: { supported: true, sku: "Standard", resourceGuid: "candidate-guid" }, privateAddress: "10.0.0.4", resourceId: "candidate-resource" });
+});

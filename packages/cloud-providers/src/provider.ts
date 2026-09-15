@@ -75,6 +75,7 @@ export interface CloudAdapter {
 export type AwsSend = (command: any) => Promise<any>;
 
 export type AwsAdapterDependencies = {
+  fetch?: typeof fetch;
   stsSend?: AwsSend;
   ec2Send?: AwsSend;
   lightsailSend?: AwsSend;

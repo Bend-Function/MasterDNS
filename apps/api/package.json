@@ -10,7 +10,8 @@
     "start": "node dist/main.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run src --passWithNoTests",
-    "test:cloud-binding-reconcile": "vitest run test/cloud-binding-reconcile.test.ts"
+    "test:cloud-binding-reconcile": "vitest run test/cloud-binding-reconcile.test.ts",
+    "test:provider-rotation": "vitest run test/provider-rotation-acceptance.test.ts"
   },
   "dependencies": {
     "@fastify/cookie": "^11.0.2",

@@ -102,8 +102,10 @@ export class RotationStore {
       if (run.action.kind !== "execute" || run.action.operation !== "cloud_step" || run.action.stepId !== stepId || !run.attempt || !run.physical || run.physical.unresolvedStepId || run.physical.incidentId !== id) return;
       const error = rotationAuthorizationError(c); if (error) throw new Error(error);
       const step = run.steps.find(s => s.id === stepId)!;
-      const allocation = run.steps.find(s => s.plan.action === "lightsail.static-ip.allocate" && s.status === "applied");
-      const plan = { ...step.plan, arguments: { ...step.plan.arguments, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
+      if (step.plan.action === "linode.instance.reboot" && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
+      const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
+      const allocation = prior.filter(s => s.plan.action.endsWith(".allocate")).at(-1);
+      const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
       if (!run.attempt.charged) {
         await tx.update(rotationAttempts).set({ charged: true, chargedAt: run.h.now, status: "cloud" }).where(eq(rotationAttempts.id, run.attempt.id));
         await tx.update(rotationBudgetSegments).set({ attemptsUsed: run.budget.attemptsUsed + 1 }).where(eq(rotationBudgetSegments.id, run.budget.id));
@@ -123,7 +125,7 @@ export class RotationStore {
       if (!step || step.attemptId !== incident.currentAttemptId) throw new Error("rotation_step_changed");
       const now = await databaseNow(tx); const old = step.receipt ?? {};
       const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]);
-      const receipt = { ...old, ...result, ...(old.resourceId ? { resourceId: old.resourceId } : {}), ...(old.allocationId ? { allocationId: old.allocationId } : {}) };
+      const receipt = { ...old, ...(step.status === "applied" ? {} : result), ...(old.resourceId ? { resourceId: old.resourceId } : {}), ...(old.allocationId ? { allocationId: old.allocationId } : {}) };
       const status = conflict ? "ambiguous" : step.status === "ambiguous" ? "ambiguous" : step.status === "applied" ? "applied" : observation ? (result as CloudObservation).status : "pending";
       await tx.update(rotationSteps).set({ receipt, status, updatedAt: now }).where(eq(rotationSteps.id, stepId));
       await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result }, createdAt: now });
@@ -203,7 +205,11 @@ export class RotationStore {
     if (c.addressVersion !== incident.addressVersion || c.physicalKey !== incident.physicalKey) { await this.pauseIn(tx, incident, "address_version_changed", now); return; }
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, steps[0]!.attemptId));
     if (!attempt) throw new Error("rotation_attempt_missing");
-    const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, origin: "system", attemptId: attempt.id, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, scanGeneration: c.instance.scanGeneration } }).returning();
+    const providerMetadata = result.after?.addressMetadata;
+    const metadata = { providerMetadata: providerMetadata && typeof providerMetadata === "object" && !Array.isArray(providerMetadata) ? providerMetadata : {},
+      ...(typeof result.after?.privateAddress === "string" ? { privateAddress: result.after.privateAddress } : {}),
+      ...(result.resourceId ? { resourceId: result.resourceId } : {}) };
+    const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, metadata, origin: "system", attemptId: attempt.id, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, scanGeneration: c.instance.scanGeneration, metadata } }).returning();
     const version = Math.max(c.slot.currentVersion, c.slot.candidateVersion) + 1;
     await tx.update(managedAddressSlots).set({ candidateAddressId: address!.id, candidateVersion: version, updatedAt: now }).where(eq(managedAddressSlots.id, c.slot.id));
     await tx.update(addressHealthStates).set(resetHealthEvidence).where(eq(addressHealthStates.slotId, c.slot.id));

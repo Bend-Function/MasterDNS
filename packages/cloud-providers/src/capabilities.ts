@@ -1,3 +1,5 @@
+import { azureCapabilities } from "./azure.js";
+import { linodeCapabilities } from "./linode.js";
 import { isIP } from "node:net";
 import type { SlotRef } from "@masterdns/contracts";
 
@@ -13,6 +15,8 @@ const unavailable = (reason: string): Capability => ({
 });
 
 export function evaluateCapabilities(slot: SlotRef, inventory: CloudInventory): Capability {
+  if (slot.service === "azure_vm") return azureCapabilities(slot, inventory);
+  if (slot.service === "linode") return linodeCapabilities(slot, inventory);
   const ref = inventory.ref;
   if (ref.service !== "ec2" && ref.service !== "lightsail") return unavailable("service_unavailable");
   if (slot.accountId !== ref.accountId || slot.service !== ref.service || slot.region !== ref.region || slot.instanceId !== ref.instanceId) {

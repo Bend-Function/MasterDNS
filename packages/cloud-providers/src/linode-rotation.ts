@@ -64,13 +64,36 @@ async function exactIp(adapter: LinodeCloudAdapter, address: string): Promise<Li
   catch (error) { if (error instanceof CloudError && error.code === "resource_not_found") return undefined; throw error; }
 }
 function verifyAssigned(args: RotationStepArguments, ip: LinodeIp | undefined, address: string): void {
-  if (!ip || ip.address !== address || ip.type !== "ipv4" || ip.public !== true || ip.linode_id !== Number(args.slot.instanceId) || ip.region !== args.slot.region) throw new CloudError("resource_ownership_ambiguous", false);
+  if (!ip || ip.address !== address || ip.type !== "ipv4" || ip.public !== true || ip.linode_id !== Number(args.slot.instanceId) || ip.region !== args.slot.region || ip.reserved === true) throw new CloudError("resource_ownership_ambiguous", false);
 }
 async function verifyCandidate(args: RotationStepArguments, adapter: LinodeCloudAdapter, inventory: CloudInventory, receipt = candidateReceipt(args)): Promise<CloudStepResult> {
   const address = verifyReceipt(args, receipt);
   verifyAssigned(args, await exactIp(adapter, address), address);
   if (!ipv4(inventory).includes(address)) throw new CloudError("resource_ownership_ambiguous", false);
   return { ...receipt, candidateAddress: address, candidateRepeated: (args.failedCandidates ?? []).includes(address) };
+}
+function verifyAllocationProof(args: RotationStepArguments, receipt: CloudStepResult, address: string, attemptId: string): void {
+  if (receipt.candidateAddress !== address || receipt.allocationId !== address || receipt.resourceId !== linodeIpResource(args.slot.instanceId, address)
+    || receipt.after?.externalAccountId !== args.before.metadata?.externalAccountId || receipt.after?.instanceId !== args.slot.instanceId
+    || receipt.after?.region !== args.slot.region || receipt.after?.configId !== args.before.metadata?.configId || receipt.after?.attemptId !== attemptId
+    || !Array.isArray(receipt.before?.ipv4) || receipt.before.ipv4.includes(address)) throw new CloudError("resource_ownership_ambiguous", false);
+}
+async function verifyPublished(args: RotationStepArguments, adapter: LinodeCloudAdapter, current: CloudInventory): Promise<CloudStepResult> {
+  if (!args.publishedInventory) return verifyCandidate(args, adapter, current);
+  const address = args.publishedAddress!;
+  requireCapability({ ...args.slot, address }, args.publishedInventory, args.allowStop);
+  identity(args, args.publishedInventory, false);
+  if (args.ownershipAttemptId) {
+    if (!args.cleanupReceipt) throw new CloudError("resource_ownership_ambiguous", false);
+    verifyAllocationProof(args, args.cleanupReceipt, args.slot.address, args.ownershipAttemptId);
+  }
+  if (args.publishedReceipt) {
+    if (!args.publishedAttemptId) throw new CloudError("resource_ownership_ambiguous", false);
+    verifyAllocationProof(args, args.publishedReceipt, address, args.publishedAttemptId);
+  }
+  verifyAssigned(args, await exactIp(adapter, address), address);
+  if (!ipv4(current).includes(address)) throw new CloudError("resource_ownership_ambiguous", false);
+  return { ...(args.publishedReceipt ?? {}), candidateAddress: address, allocationId: address, resourceId: linodeIpResource(args.slot.instanceId, address) };
 }
 function currentCapability(args: RotationStepArguments, inventory: CloudInventory, selected = args.slot.address, permission: "read" | "write" = "write"): void {
   // During observation an in-progress reboot can report rebooting. Configuration and permission checks still apply.
@@ -114,7 +137,7 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
       candidateRepeated: (args.failedCandidates ?? []).includes(ip.address), before, after: { ...snapshot(current), attemptId: args.attemptId } };
   }
   if (args.phase === "post_publish_cleanup") assertCleanup(args);
-  const candidate = await verifyCandidate(args, adapter, current);
+  const candidate = args.phase === "post_publish_cleanup" ? await verifyPublished(args, adapter, current) : await verifyCandidate(args, adapter, current);
   if (args.phase === "post_publish_cleanup" && candidate.candidateAddress !== args.publishedAddress) throw new CloudError("cleanup_not_authorized", false);
   currentCapability(args, current, args.phase === "post_publish_cleanup" ? args.publishedAddress! : args.slot.address);
   if (step.action === "linode.ipv4.release") {
@@ -152,7 +175,7 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
       return { ...base, ...candidate, status: "applied" };
     }
     if (args.phase === "post_publish_cleanup") assertCleanup(args);
-    const candidate = await verifyCandidate(args, adapter, current);
+    const candidate = args.phase === "post_publish_cleanup" ? await verifyPublished(args, adapter, current) : await verifyCandidate(args, adapter, current);
     if (args.phase === "post_publish_cleanup" && candidate.candidateAddress !== args.publishedAddress) return { ...base, status: "ambiguous" };
     currentCapability(args, current, args.phase === "post_publish_cleanup" ? args.publishedAddress! : args.slot.address, "read");
     if (step.action === "linode.ipv4.release") {

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { expect, it } from "vitest";
 import * as db from "@masterdns/db";
 import { fixture } from "./rotation-test-utils.js";
@@ -355,4 +355,141 @@ it.each(["pause", "revoke", "config"] as const)("observes an uncertain cleanup a
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: before!.cleanupStepId });
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
   expect(await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ id: f.incident.currentSegmentId, attemptsUsed: 0 }]);
+});
+
+async function chainFixture() {
+  const f = await cleanupFixture();
+  await f.d.update(db.instanceAuthorizations).set({ allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  const originalPlan = (f.cleanup as any).plan;
+  (f.cleanup as any).plan = async (...args: any[]) => {
+    const first = await originalPlan.apply(f.cleanup, args);
+    const release = Array.isArray(first) ? first[0] : first;
+    return [release, { ...release, id: `${release.id}:reboot`, action: "linode.instance.reboot" }];
+  };
+  return f;
+}
+it("persists the entire cleanup chain before DELETE, advances only on observation, and resumes the original reboot after pause", async () => {
+  const f = await chainFixture();
+  f.state.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  const steps = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId));
+  expect(steps).toHaveLength(2);
+  expect(f.state.writes).toBe(1);
+  const release = steps.find(s => s.plan.action !== "linode.instance.reboot")!;
+  const reboot = steps.find(s => s.plan.action === "linode.instance.reboot")!;
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "pending", cleanupStepId: reboot.id });
+  await changeAdmission(f, "pause");
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  await f.d.transaction(async tx => db.resumeRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), f.incident.id, f.account.ownerUserId));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(2);
+  await (f.cleanup as any).receipt(f.resource, release.id, { status: "applied", allocationId: f.resource.allocationId }, true);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStepId: reboot.id, cleanupStatus: "failed" });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(reboot.id);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(2);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: reboot.id });
+});
+it("rechecks current reboot permission after the release observation", async () => {
+  const f = await chainFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.d.update(db.instanceAuthorizations).set({ allowStopStart: false }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).not.toBe("released");
+});
+
+import { ProbeHealthService } from "../probes/probe-health.service.js";
+import { HealthResultService } from "../health/health-result.service.js";
+it("requires newly qualified external health after cleanup reboot and supersedes queued pre-reboot successes", async () => {
+  const f = await chainFixture();
+  await f.d.update(db.rotationPublications).set({ incidentId: f.incident.id }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  const [probe] = await f.d.insert(db.probeAgents).values({ ownerUserId: f.account.ownerUserId, name: "external", capabilities: { ipv4: true, ipv6: false } }).returning();
+  const health = new ProbeHealthService({ db: f.d } as never, new HealthResultService({ db: f.d } as never));
+  async function round(sequence: number, outcome: "success" | "failure") {
+    const now = new Date();
+    const [r] = await f.d.insert(db.probeRounds).values({ slotId: f.slot.id, configId: f.policy.configId, groupId: f.policy.groupId, groupRevision: 1, policyId: f.policy.id, policyRevision: 1, sequence, addressVersion: 1, configVersion: 1, address: f.address.address, family: "4", config: { type: "tcp", port: 443, timeoutMs: 1000 }, memberIds: [probe!.id], consensus: { mode: "majority", minimumValid: 1 }, deadline: new Date(now.getTime() - 500), resultExpiresAt: new Date(now.getTime() + 60000) }).returning();
+    const [task] = await f.d.insert(db.probeTasks).values({ roundId: r!.id, probeId: probe!.id, status: "accepted" }).returning();
+    await f.d.insert(db.probeObservations).values({ taskId: task!.id, roundId: r!.id, probeId: probe!.id, leaseId: randomUUID(), addressVersion: 1, configVersion: 1, status: "accepted", outcome, latencyMs: 1, measuredAt: new Date(now.getTime() - 1000), receivedAt: new Date(now.getTime() - 1000) });
+    await f.d.insert(db.probeRoundSequences).values({ slotId: f.slot.id, family: "4", lastSequence: sequence }).onConflictDoUpdate({ target: db.probeRoundSequences.slotId, targetWhere: sql`${db.probeRoundSequences.slotId} is not null`, set: { lastSequence: sequence } });
+    return r!.id;
+  }
+  const stale = await round(10, "success");
+  for (let n = 0; n < 4; n++) await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource!.snapshot.cleanupHealthCutoff).toBe(10);
+  await f.cleanup.complete(f.incident.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup", errorCode: "probe_insufficient" });
+  expect(await health.closeRound(stale)).toBe("unknown");
+  expect((await f.d.select().from(db.probeRounds).where(eq(db.probeRounds.id, stale)))[0]!.status).toBe("superseded");
+  for (let n = 11; n <= 13; n++) await health.closeRound(await round(n, "failure"));
+  await f.cleanup.complete(f.incident.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup", errorCode: "cleanup_health_failed" });
+  for (let n = 14; n <= 16; n++) {
+    await health.closeRound(await round(n, "success"));
+    await f.cleanup.complete(f.incident.id);
+    expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.status).toBe(n < 16 ? "active" : "complete");
+  }
+  expect(f.state.writes).toBe(2);
+  expect(await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ attemptsUsed: 0 }]);
+});
+
+it("treats a cleanup chain collision as ambiguous without dispatching its next write", async () => {
+  const f = await chainFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  await f.d.update(db.rotationSteps).set({ plan: { action: "linode.instance.reboot", id: resource!.cleanupStepId!, resourceKey: "foreign", destructive: true, arguments: { phase: "post_publish_cleanup", cleanupResourceId: randomUUID() } } }).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "failed", cleanupError: "cleanup_plan_ambiguous", cleanupStepId: resource!.cleanupStepId });
+});
+it("retains legacy one-step cleanup IDs and receipts without rewriting the plan", async () => {
+  const f = await cleanupFixture();
+  f.state.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  const [step] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+  const { cleanupResourceId: _, ...arguments_ } = step!.plan.arguments;
+  await f.d.update(db.rotationSteps).set({ plan: { ...step!.plan, arguments: arguments_ } }).where(eq(db.rotationSteps.id, step!.id));
+  await f.d.update(db.rotationResources).set({ snapshot: f.resource.snapshot }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: step!.id, snapshot: f.resource.snapshot });
+});
+
+it("finishes a started resource chain before releasing another address on the same guest", async () => {
+  const f = await chainFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  const secondAttempt = randomUUID();
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.insert(db.rotationAttempts).values({ ...attempt!, id: secondAttempt, sequence: 2 });
+  const [second] = await f.d.insert(db.rotationResources).values({ ...f.resource, id: randomUUID(), attemptId: secondAttempt, address: "192.0.2.2" }).returning();
+  await f.cleanup.run(second!.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect(await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, secondAttempt))).toEqual([]);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(2);
+});
+
+it("still records an admitted reboot observation after a contradictory late release receipt, without completing ambiguous cleanup", async () => {
+  const f = await chainFixture();
+  await f.cleanup.run(f.resource.id, new Date()); await f.cleanup.run(f.resource.id, new Date());
+  const steps = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId));
+  const release = steps.find(step => step.plan.action !== "linode.instance.reboot")!;
+  const reboot = steps.find(step => step.plan.action === "linode.instance.reboot")!;
+  f.state.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  await (f.cleanup as any).receipt(f.resource, release.id, { status: "applied", allocationId: "foreign-allocation" }, true);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(2);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, reboot.id)))[0]!.status).toBe("applied");
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "failed", cleanupStepId: reboot.id, cleanupError: "cleanup_ownership_ambiguous" });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
 });
