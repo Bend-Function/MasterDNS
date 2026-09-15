@@ -5,6 +5,7 @@ import {
   GetStaticIpsCommand,
   LightsailClient,
 } from "@aws-sdk/client-lightsail";
+import type { StaticIp } from "@aws-sdk/client-lightsail";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
@@ -15,21 +16,43 @@ import { CloudError, normalizeAwsError } from "./errors.js";
 import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage } from "./provider.js";
 
 export class LightsailCloudAdapter implements CloudAdapter {
+  private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
+  private readonly stsClient: STSClient;
+  private readonly lightsailClients = new Map<string, LightsailClient>();
+
   constructor(
     private readonly accountId: string,
-    private readonly credentials: AwsCredentials,
+    credentials: AwsCredentials,
     private readonly dependencies: AwsAdapterDependencies = {},
-  ) {}
+  ) {
+    this.credentialSource = createAwsCredentialSource(credentials);
+    this.stsClient = new STSClient({ region: "us-east-1", credentials: this.credentialSource });
+  }
 
   private stsSend(command: GetCallerIdentityCommand) {
     return this.dependencies.stsSend?.(command)
-      ?? new STSClient({ region: "us-east-1", credentials: createAwsCredentialSource(this.credentials) }).send(command);
+      ?? this.stsClient.send(command);
   }
 
   private lightsailSend(region: string, command: GetRegionsCommand | GetInstancesCommand | GetInstanceCommand | GetStaticIpsCommand) {
     if (this.dependencies.lightsailSend !== undefined) return this.dependencies.lightsailSend(command);
-    const client = new LightsailClient({ region, credentials: createAwsCredentialSource(this.credentials) });
+    let client = this.lightsailClients.get(region);
+    if (client === undefined) {
+      client = new LightsailClient({ region, credentials: this.credentialSource });
+      this.lightsailClients.set(region, client);
+    }
     return (client.send.bind(client) as AwsSend)(command);
+  }
+
+  private async listStaticIps(region: string): Promise<StaticIp[]> {
+    const staticIps: StaticIp[] = [];
+    let pageToken: string | undefined;
+    do {
+      const response = await this.lightsailSend(region, new GetStaticIpsCommand({ pageToken }));
+      staticIps.push(...response.staticIps ?? []);
+      pageToken = response.nextPageToken;
+    } while (pageToken !== undefined);
+    return staticIps;
   }
 
   async verifyIdentity(): Promise<{ externalAccountId: string }> {
@@ -61,10 +84,10 @@ export class LightsailCloudAdapter implements CloudAdapter {
     try {
       const [instances, staticIps] = await Promise.all([
         this.lightsailSend(region, new GetInstancesCommand({ pageToken })),
-        this.lightsailSend(region, new GetStaticIpsCommand({})),
+        this.listStaticIps(region),
       ]);
       const items = (instances.instances ?? []).flatMap((instance: any) => {
-        const mapped = mapLightsailInstance(this.accountId, region, instance, staticIps.staticIps ?? []);
+        const mapped = mapLightsailInstance(this.accountId, region, instance, staticIps);
         return mapped === undefined ? [] : [mapped];
       });
       const result: CloudPage = { items };
@@ -93,10 +116,10 @@ export class LightsailCloudAdapter implements CloudAdapter {
       const nativeName = await this.findNameByArn(ref.region, ref.instanceId);
       const [instanceResponse, staticIpResponse] = await Promise.all([
         this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName: nativeName })),
-        this.lightsailSend(ref.region, new GetStaticIpsCommand({})),
+        this.listStaticIps(ref.region),
       ]);
       if (instanceResponse.instance?.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
-      const inventory = mapLightsailInstance(this.accountId, ref.region, instanceResponse.instance, staticIpResponse.staticIps ?? []);
+      const inventory = mapLightsailInstance(this.accountId, ref.region, instanceResponse.instance, staticIpResponse);
       if (inventory === undefined) throw new CloudError("resource_not_found", false);
       return inventory;
     } catch (error) {

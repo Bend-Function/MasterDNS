@@ -14,20 +14,32 @@ import { CloudError, normalizeAwsError } from "./errors.js";
 import type { AwsAdapterDependencies, AwsCredentials, Capability, CloudAdapter, CloudInventory, CloudPage } from "./provider.js";
 
 export class Ec2CloudAdapter implements CloudAdapter {
+  private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
+  private readonly stsClient: STSClient;
+  private readonly ec2Clients = new Map<string, EC2Client>();
+
   constructor(
     private readonly accountId: string,
-    private readonly credentials: AwsCredentials,
+    credentials: AwsCredentials,
     private readonly dependencies: AwsAdapterDependencies = {},
-  ) {}
+  ) {
+    this.credentialSource = createAwsCredentialSource(credentials);
+    this.stsClient = new STSClient({ region: "us-east-1", credentials: this.credentialSource });
+  }
 
   private stsSend(command: GetCallerIdentityCommand) {
     return this.dependencies.stsSend?.(command)
-      ?? new STSClient({ region: "us-east-1", credentials: createAwsCredentialSource(this.credentials) }).send(command);
+      ?? this.stsClient.send(command);
   }
 
   private ec2Send(region: string, command: DescribeRegionsCommand | DescribeInstancesCommand | DescribeNetworkInterfacesCommand) {
-    return this.dependencies.ec2Send?.(command)
-      ?? new EC2Client({ region, credentials: createAwsCredentialSource(this.credentials) }).send(command);
+    if (this.dependencies.ec2Send !== undefined) return this.dependencies.ec2Send(command);
+    let client = this.ec2Clients.get(region);
+    if (client === undefined) {
+      client = new EC2Client({ region, credentials: this.credentialSource });
+      this.ec2Clients.set(region, client);
+    }
+    return client.send(command);
   }
 
   async verifyIdentity(): Promise<{ externalAccountId: string }> {

@@ -55,6 +55,19 @@ describe("AWS identity and scope discovery", () => {
 });
 
 describe("EC2 read adapter", () => {
+  it("passes a resumed EC2 cursor to the SDK", async () => {
+    const adapter = new Ec2CloudAdapter("local-account", credentials, {
+      stsSend: async () => ({}),
+      ec2Send: async (command) => {
+        expect(command).toBeInstanceOf(DescribeInstancesCommand);
+        expect(command.input).toEqual({ NextToken: "resume-token" });
+        return { Reservations: [] };
+      },
+    });
+
+    await expect(adapter.discover("us-east-1", "ec2:resume-token")).resolves.toEqual({ items: [] });
+  });
+
   it("paginates instances and maps EC2 instance and interface identities", async () => {
     const adapter = new Ec2CloudAdapter("local-account", credentials, {
       stsSend: async () => ({ Account: "123456789012" }),
@@ -139,6 +152,66 @@ describe("EC2 read adapter", () => {
 });
 
 describe("Lightsail read adapter", () => {
+  it("passes a resumed Lightsail cursor to the SDK", async () => {
+    const adapter = new LightsailCloudAdapter("local-account", credentials, {
+      stsSend: async () => ({}),
+      lightsailSend: async (command) => {
+        if (command instanceof GetInstancesCommand) {
+          expect(command.input).toEqual({ pageToken: "resume-token" });
+          return { instances: [] };
+        }
+        return { staticIps: [] };
+      },
+    });
+
+    await expect(adapter.discover("us-east-1", "lightsail:resume-token")).resolves.toEqual({ items: [] });
+  });
+
+  it("finds an attached static IP on the second static-IP page during discovery", async () => {
+    const adapter = new LightsailCloudAdapter("local-account", credentials, {
+      stsSend: async () => ({}),
+      lightsailSend: async (command) => {
+        if (command instanceof GetInstancesCommand) {
+          return { instances: [{
+            name: "web-one",
+            arn: "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid",
+            publicIpAddress: "203.0.113.4",
+          }] };
+        }
+        if (command instanceof GetStaticIpsCommand) {
+          if (command.input.pageToken === undefined) return { staticIps: [], nextPageToken: "static-page-2" };
+          expect(command.input.pageToken).toBe("static-page-2");
+          return { staticIps: [{ name: "web-static", attachedTo: "web-one", ipAddress: "203.0.113.4" }] };
+        }
+        throw new Error("unexpected command");
+      },
+    });
+
+    const page = await adapter.discover("us-east-1");
+    expect(page.items[0]?.interfaces[0]?.addresses[0]).toMatchObject({ allocationId: "web-static" });
+  });
+
+  it("finds an attached static IP on the second static-IP page during inspection", async () => {
+    const stableArn = "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid";
+    const adapter = new LightsailCloudAdapter("local-account", credentials, {
+      stsSend: async () => ({}),
+      lightsailSend: async (command) => {
+        if (command instanceof GetInstancesCommand) return { instances: [{ name: "web-one", arn: stableArn }] };
+        if (command instanceof GetInstanceCommand) {
+          return { instance: { name: "web-one", arn: stableArn, publicIpAddress: "203.0.113.4" } };
+        }
+        if (command instanceof GetStaticIpsCommand) {
+          if (command.input.pageToken === undefined) return { staticIps: [], nextPageToken: "static-page-2" };
+          return { staticIps: [{ name: "web-static", attachedTo: "web-one", ipAddress: "203.0.113.4" }] };
+        }
+        throw new Error("unexpected command");
+      },
+    });
+
+    const inventory = await adapter.inspect({ accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn });
+    expect(inventory.interfaces[0]?.addresses[0]).toMatchObject({ allocationId: "web-static" });
+  });
+
   it("lists enabled regions and paginates instances with ARN identity and native name", async () => {
     const adapter = new LightsailCloudAdapter("local-account", credentials, {
       stsSend: async () => ({ Account: "123456789012" }),
