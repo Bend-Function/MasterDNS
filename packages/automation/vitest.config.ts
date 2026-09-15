@@ -4,7 +4,7 @@ export default defineConfig({
   test: {
     coverage: {
       provider: "v8",
-      include: ["src/health-state.ts", "src/strategy.ts"],
+      include: ["src/health-state.ts", "src/probe-consensus.ts", "src/strategy.ts"],
       reporter: ["text", "json-summary"],
       thresholds: {
         branches: 90,
