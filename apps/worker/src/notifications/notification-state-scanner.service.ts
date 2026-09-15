@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import type { NotificationEvent } from "@masterdns/contracts";
 import {
+  addressHealthPolicies,
   addressHealthStates,
   cloudAccounts,
   cloudEndpointLinks,
@@ -59,9 +60,11 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
   private async scanHealth(batchSize: number) {
     const rows = await this.database.db.select({
       state: addressHealthStates,
+      policy: addressHealthPolicies,
       endpointPool: endpointPools,
       account: cloudAccounts,
     }).from(addressHealthStates)
+      .leftJoin(addressHealthPolicies, eq(addressHealthStates.policyId, addressHealthPolicies.id))
       .leftJoin(endpoints, eq(addressHealthStates.endpointId, endpoints.id))
       .leftJoin(endpointPools, eq(endpoints.poolId, endpointPools.id))
       .leftJoin(managedAddressSlots, eq(addressHealthStates.slotId, managedAddressSlots.id))
@@ -76,13 +79,14 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
       return;
     }
     const poolIdsBySlot = await this.poolIdsBySlot(rows.flatMap(({ state }) => state.slotId ? [state.slotId] : []));
-    const events = rows.flatMap(({ state, endpointPool, account }) => {
+    const events = rows.flatMap(({ state, policy, endpointPool, account }) => {
       const ownerUserId = endpointPool?.ownerUserId ?? account?.ownerUserId;
       if (!ownerUserId) return [];
       const poolIds = state.slotId
         ? (poolIdsBySlot.get(state.slotId) ?? []).filter((pool) => pool.ownerUserId === ownerUserId).map((pool) => pool.poolId)
         : endpointPool ? [endpointPool.id] : [];
-      return [healthEvent(state, ownerUserId, poolIds)];
+      const event = healthEvent(state, policy, ownerUserId, poolIds);
+      return event ? [event] : [];
     });
     await Promise.all(events.map((event) => this.enqueue(event)));
     this.healthCursor = rows.length === batchSize ? rows.at(-1)!.state.id : undefined;
@@ -146,7 +150,7 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
 
   private async enqueue(event: NotificationEvent) {
     await this.queues.notifications.add("fanout-event", { kind: "fanout", event }, {
-      jobId: `fanout-${event.eventId}`,
+      jobId: `fanout-${event.eventId.replaceAll(":", "-")}`,
       attempts: 3,
       backoff: { type: "exponential", delay: 1_000 },
       removeOnComplete: 5_000,
@@ -157,12 +161,23 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
 
 function healthEvent(
   state: typeof addressHealthStates.$inferSelect,
+  policy: typeof addressHealthPolicies.$inferSelect | null,
   ownerUserId: string,
   poolIds: string[],
-): NotificationEvent {
-  const eventType = state.latestDecision === "failure"
+): NotificationEvent | undefined {
+  const currentPolicy = !!policy
+    && policy.revision === state.policyRevision
+    && policy.configId === state.configId
+    && policy.family === state.family
+    && (state.slotId ? policy.slotId === state.slotId : policy.endpointId === state.endpointId);
+  const confirmedFailure = state.latestDecision === "failure" && currentPolicy
+    && state.healthState === "unhealthy" && state.consecutiveFailures >= policy.failureThreshold;
+  const confirmedRecovery = state.latestDecision === "success" && currentPolicy
+    && state.healthState === "healthy" && state.consecutiveSuccesses >= policy.successThreshold;
+  if (state.latestDecision !== "unknown" && !confirmedFailure && !confirmedRecovery) return undefined;
+  const eventType = confirmedFailure
     ? "health.target_failed"
-    : state.latestDecision === "success"
+    : confirmedRecovery
       ? "health.target_recovered"
       : "health.insufficient_probes";
   const targetId = state.slotId ?? state.endpointId!;
@@ -185,6 +200,8 @@ function healthEvent(
       family: state.family,
       decision: state.latestDecision,
       healthState: state.healthState,
+      consecutiveResults: confirmedFailure ? state.consecutiveFailures : confirmedRecovery ? state.consecutiveSuccesses : 0,
+      threshold: confirmedFailure ? policy.failureThreshold : confirmedRecovery ? policy.successThreshold : null,
     },
   };
 }

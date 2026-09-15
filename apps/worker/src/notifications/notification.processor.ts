@@ -72,9 +72,10 @@ export class NotificationProcessor implements OnModuleInit, OnModuleDestroy {
         ))
       : [];
     const matchingLinks = linked.filter(({ link }) => link.eventFilter.length === 0 || link.eventFilter.includes(event.eventType));
-    const overrideDefaults = matchingLinks.some(({ link }) => link.overridesDefaults);
+    const includeDefaults = poolIds.length === 0 || poolIds.some((poolId) =>
+      !matchingLinks.some(({ link }) => link.poolId === poolId && link.overridesDefaults));
     const selected = new Map<string, typeof notificationChannels.$inferSelect>();
-    if (!overrideDefaults) for (const channel of defaults) selected.set(channel.id, channel);
+    if (includeDefaults) for (const channel of defaults) selected.set(channel.id, channel);
     for (const { channel } of matchingLinks) selected.set(channel.id, channel);
 
     const deliveryRows: Array<{ id: string; attempts: number; status: string }> = [];

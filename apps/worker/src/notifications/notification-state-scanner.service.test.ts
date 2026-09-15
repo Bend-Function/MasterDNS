@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  addressHealthPolicies,
   addressHealthStates,
   cloudAccounts,
   cloudEndpointLinks,
@@ -10,6 +11,7 @@ import {
   createDatabase,
   endpoints,
   endpointPools,
+  healthCheckConfigs,
   managedAddressSlots,
   notificationChannels,
   notificationDeliveries,
@@ -24,6 +26,7 @@ import {
 } from "@masterdns/db";
 import { eq } from "drizzle-orm";
 import type { NotificationEvent } from "@masterdns/contracts";
+import { Queue } from "bullmq";
 
 vi.mock("../env.js", () => ({
   env: {
@@ -63,8 +66,8 @@ beforeEach(async () => {
 });
 
 describe("durable notification state scanning", () => {
-  it("rebuilds the same health event after a lost wake and persists one delivery per channel", async () => {
-    const fixture = await healthFixture("failure");
+  it("keeps a confirmed after-threshold event stable across a lost wake and persists one delivery per channel", async () => {
+    const fixture = await healthFixture({ decision: "failure", healthState: "unhealthy", consecutiveFailures: 4, failureThreshold: 3 });
     await insertChannel(fixture.ownerId, { isDefault: true });
     const firstWake = fakeQueues();
     const secondWake = fakeQueues();
@@ -80,6 +83,54 @@ describe("durable notification state scanning", () => {
     await processor.fanout(first);
     await processor.fanout(second);
     expect(await connection.db.select().from(notificationDeliveries)).toHaveLength(1);
+  });
+
+  it("does not emit target failure or recovery before the current policy threshold", async () => {
+    await healthFixture({ decision: "failure", healthState: "degraded", consecutiveFailures: 1, failureThreshold: 3 });
+    await healthFixture({ decision: "success", healthState: "recovering", consecutiveSuccesses: 1, successThreshold: 3 });
+    const queues = fakeQueues();
+
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+
+    expect(queues.events).toEqual([]);
+  });
+
+  it("emits failure and recovery only after the current policy threshold is confirmed", async () => {
+    await healthFixture({ decision: "failure", healthState: "unhealthy", consecutiveFailures: 3, failureThreshold: 3 });
+    await healthFixture({ decision: "success", healthState: "healthy", consecutiveSuccesses: 3, successThreshold: 3 });
+    const queues = fakeQueues();
+
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+
+    expect(queues.events.map((event) => event.eventType).sort()).toEqual(["health.target_failed", "health.target_recovered"]);
+  });
+
+  it("keeps expired or insufficient evidence separate even when the historical state was unhealthy", async () => {
+    await healthFixture({ decision: "unknown", healthState: "unhealthy", consecutiveFailures: 0 });
+    const queues = fakeQueues();
+
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+
+    expect(queues.events).toMatchObject([{ eventType: "health.insufficient_probes", payload: { decision: "unknown", healthState: "unhealthy" } }]);
+  });
+
+  it("enqueues a durable state event through actual BullMQ with a colon-free producer ID", async () => {
+    const redisUrl = process.env.MASTERDNS_TEST_REDIS_URL;
+    if (!redisUrl) throw new Error("MASTERDNS_TEST_REDIS_URL is required");
+    await healthFixture({ decision: "failure", healthState: "unhealthy", consecutiveFailures: 3, failureThreshold: 3 });
+    const url = new URL(redisUrl);
+    const queue = new Queue(`p11c-notification-${randomUUID()}`, { connection: { host: url.hostname, port: Number(url.port) } });
+    try {
+      await new NotificationStateScannerService({ db: connection.db } as never, { notifications: queue } as never).scanOnce();
+      const jobs = await queue.getJobs(["waiting", "delayed"]);
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]!.id).toMatch(/^fanout-state-/);
+      expect(jobs[0]!.id).not.toContain(":");
+      expect((jobs[0]!.data as { event: NotificationEvent }).event.eventId).toMatch(/^state:/);
+    } finally {
+      await queue.obliterate({ force: true });
+      await queue.close();
+    }
   });
 
   it("fans a shared-slot event out to owner defaults and all same-owner Pool channels only", async () => {
@@ -110,6 +161,32 @@ describe("durable notification state scanning", () => {
     const deliveries = await connection.db.select().from(notificationDeliveries);
     expect(deliveries.map((row) => row.channelId).sort()).toEqual([ownerDefault.id, linkedA.id, linkedB.id].sort());
     expect(deliveries.some((row) => row.channelId === foreign.id)).toBe(false);
+  });
+
+  it("applies default override per Pool before unioning shared-slot channels", async () => {
+    const owner = await insertUser();
+    const poolA = await insertPool(owner.id, "override-pool");
+    const poolB = await insertPool(owner.id, "default-pool");
+    const ownerDefault = await insertChannel(owner.id, { isDefault: true });
+    const overriding = await insertChannel(owner.id);
+    const linkedB = await insertChannel(owner.id);
+    await connection.db.insert(poolNotificationChannels).values([
+      { poolId: poolA.id, channelId: overriding.id, overridesDefaults: true },
+      { poolId: poolB.id, channelId: linkedB.id },
+    ]);
+    const event: NotificationEvent = {
+      eventId: "mixed-pool-override",
+      eventType: "health.target_failed",
+      ownerUserId: owner.id,
+      poolIds: [poolA.id, poolB.id],
+      occurredAt: new Date().toISOString(),
+      payload: { summary: "Confirmed target failure." },
+    };
+
+    await new NotificationProcessor({ db: connection.db } as never, fakeQueues() as never).fanout(event);
+
+    expect((await connection.db.select().from(notificationDeliveries)).map((row) => row.channelId).sort())
+      .toEqual([ownerDefault.id, overriding.id, linkedB.id].sort());
   });
 
   it("emits whitelisted rotation state without cloud plans, headers, credentials, or snapshots", async () => {
@@ -149,7 +226,7 @@ describe("durable notification state scanning", () => {
 
   it("advances through a full page so later health rows are eventually considered", async () => {
     const targetIds = [];
-    for (let index = 0; index < 3; index += 1) targetIds.push((await healthFixture("unknown")).stateId);
+    for (let index = 0; index < 3; index += 1) targetIds.push((await healthFixture({ decision: "unknown", healthState: "unknown" })).stateId);
     const queues = fakeQueues();
     const scanner = new NotificationStateScannerService({ db: connection.db } as never, queues as never);
 
@@ -185,16 +262,41 @@ describe("durable notification state scanning", () => {
   });
 });
 
-async function healthFixture(decision: "failure" | "unknown") {
+async function healthFixture(input: {
+  decision: "success" | "failure" | "unknown";
+  healthState: "unknown" | "healthy" | "unhealthy" | "degraded" | "recovering";
+  consecutiveSuccesses?: number;
+  consecutiveFailures?: number;
+  successThreshold?: number;
+  failureThreshold?: number;
+}) {
   const owner = await insertUser();
   const pool = await insertPool(owner.id, randomUUID());
   const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool.id, name: "target" }).returning();
+  const [config] = await connection.db.insert(healthCheckConfigs).values({
+    endpointId: endpoint!.id,
+    checkerType: "tcp",
+    config: { type: "tcp", port: 443, timeoutMs: 3000 },
+  }).returning();
+  const [policy] = await connection.db.insert(addressHealthPolicies).values({
+    endpointId: endpoint!.id,
+    family: "4",
+    configId: config!.id,
+    successThreshold: input.successThreshold ?? 3,
+    failureThreshold: input.failureThreshold ?? 3,
+  }).returning();
   const changedAt = new Date("2026-09-15T01:02:03.000Z");
   const [state] = await connection.db.insert(addressHealthStates).values({
     endpointId: endpoint!.id,
     family: "4",
-    latestDecision: decision,
-    healthState: decision === "failure" ? "unhealthy" : "unknown",
+    configId: config!.id,
+    configVersion: config!.revision,
+    policyId: policy!.id,
+    policyRevision: policy!.revision,
+    latestDecision: input.decision,
+    healthState: input.healthState,
+    consecutiveSuccesses: input.consecutiveSuccesses ?? 0,
+    consecutiveFailures: input.consecutiveFailures ?? 0,
     stateChangedAt: changedAt,
   }).returning();
   return { ownerId: owner.id, poolId: pool.id, stateId: state!.id };
