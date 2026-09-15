@@ -7,8 +7,11 @@ export const queueNames = {
   health: "masterdns-health",
   reconcile: "masterdns-reconcile",
   sync: "masterdns-sync",
+  cloudSync: "masterdns-cloud-sync",
   notifications: "masterdns-notifications",
 } as const;
+
+export type CloudSyncJob = { accountId: string };
 
 export type OperationJob = { operationId: string };
 export type HealthCheckJob = {

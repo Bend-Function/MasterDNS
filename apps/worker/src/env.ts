@@ -13,6 +13,7 @@ export const env = z.object({
   LOG_LEVEL: z.enum(["error", "warn", "info", "debug"]).default("info"),
   HEALTH_RAW_RETENTION_DAYS: z.coerce.number().int().min(1).max(365).default(30),
   HEALTH_STATS_RETENTION_DAYS: z.coerce.number().int().min(30).max(3650).default(365),
+  CLOUD_SYNC_INTERVAL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(300),
   PROVIDER_SYNC_INTERVAL_SECONDS: z.coerce.number().int().min(60).max(86_400).default(300),
   PROVIDER_SYNC_SCAN_SECONDS: z.coerce.number().int().min(5).max(300).default(30),
   ALLOW_PRIVATE_HEALTH_TARGETS: z.enum(["true", "false"]).default("false").transform((value) => value === "true"),

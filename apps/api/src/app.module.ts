@@ -8,6 +8,7 @@ import { RateLimitGuard } from "./auth/rate-limit.guard.js";
 import { SseConcurrencyGuard } from "./auth/sse-concurrency.guard.js";
 import { DatabaseModule } from "./infrastructure/database.module.js";
 import { QueueModule } from "./infrastructure/queue.module.js";
+import { CloudModule } from "./modules/cloud/cloud.module.js";
 import { DdnsModule } from "./modules/ddns/ddns.module.js";
 import { DnsModule } from "./modules/dns/dns.module.js";
 import { EventsController } from "./modules/events/events.controller.js";
@@ -19,7 +20,7 @@ import { PoolsModule } from "./modules/pools/pools.module.js";
 import { UsersModule } from "./modules/users/users.module.js";
 
 @Module({
-  imports: [DatabaseModule, QueueModule, AuthModule, UsersModule, ProviderAccountsModule, OperationsModule, DnsModule, PoolsModule, DdnsModule, NotificationsModule],
+  imports: [DatabaseModule, QueueModule, AuthModule, CloudModule, UsersModule, ProviderAccountsModule, OperationsModule, DnsModule, PoolsModule, DdnsModule, NotificationsModule],
   controllers: [HealthController, EventsController],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

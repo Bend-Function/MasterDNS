@@ -10,11 +10,12 @@ export class QueueRuntimeService implements OnModuleDestroy {
   readonly operations = new Queue(queueNames.operations, { connection: this.redis });
   readonly health = new Queue(queueNames.health, { connection: this.redis });
   readonly reconcile = new Queue(queueNames.reconcile, { connection: this.redis });
+  readonly cloudSync = new Queue(queueNames.cloudSync, { connection: this.redis });
   readonly sync = new Queue(queueNames.sync, { connection: this.redis });
   readonly notifications = new Queue(queueNames.notifications, { connection: this.redis });
 
   async onModuleDestroy() {
-    await Promise.all([this.operations.close(), this.health.close(), this.reconcile.close(), this.sync.close(), this.notifications.close()]);
+    await Promise.all([this.operations.close(), this.health.close(), this.reconcile.close(), this.sync.close(), this.cloudSync.close(), this.notifications.close()]);
     await this.redis.quit();
   }
 }

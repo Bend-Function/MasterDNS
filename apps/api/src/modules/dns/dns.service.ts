@@ -1,7 +1,7 @@
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, eq, isNull } from "drizzle-orm";
 import type { DnsRecordInput } from "@masterdns/contracts";
-import { dnsRecords, providerAccounts, zones } from "@masterdns/db";
+import { dnsRecords, domainBindings, providerAccounts, zones } from "@masterdns/db";
 import { randomUUID } from "node:crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
@@ -39,6 +39,8 @@ export class DnsService {
 
   async createRecord(actor: AuthUser, zoneId: string, record: DnsRecordInput, idempotencyKey?: string) {
     const owned = await this.findOwnedZone(actor, zoneId);
+    const normalized = normalizeRecordName(record, owned.nameAscii);
+    await this.assertUnboundName(zoneId, normalized);
     return this.operations.createDnsOperation({
       ownerUserId: owned.ownerUserId,
       actorUserId: actor.id,
@@ -48,7 +50,7 @@ export class DnsService {
       zoneId,
       zoneExternalId: owned.externalId,
       action: "create",
-      record: normalizeRecordName(record, owned.nameAscii),
+      record: normalized,
     });
   }
 
@@ -56,6 +58,8 @@ export class DnsService {
     const owned = await this.findOwnedZone(actor, zoneId);
     const current = await this.findRecord(zoneId, recordId);
     if (current.management === "managed") throw new ConflictException("该记录由 IP Pool 管理，请修改对应策略");
+    const normalized = normalizeRecordName(record, owned.nameAscii);
+    await this.assertUnboundName(zoneId, normalized);
     return this.operations.createDnsOperation({
       ownerUserId: owned.ownerUserId,
       actorUserId: actor.id,
@@ -67,7 +71,7 @@ export class DnsService {
       action: "update",
       dnsRecordId: current.id,
       recordExternalId: current.externalId,
-      record: normalizeRecordName(record, owned.nameAscii),
+      record: normalized,
       beforeSnapshot: current,
     });
   }
@@ -89,6 +93,12 @@ export class DnsService {
       recordExternalId: current.externalId,
       beforeSnapshot: current,
     });
+  }
+
+  private async assertUnboundName(zoneId: string, record: DnsRecordInput) {
+    const [binding] = await this.database.db.select({ id: domainBindings.id }).from(domainBindings)
+      .where(and(eq(domainBindings.zoneId, zoneId), eq(domainBindings.fqdn, record.name), eq(domainBindings.recordType, record.type))).limit(1);
+    if (binding) throw new ConflictException("该记录由 IP Pool 管理，请修改对应策略");
   }
 
   private async findOwnedZone(actor: AuthUser, zoneId: string) {

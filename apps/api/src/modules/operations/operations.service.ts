@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { dnsRecordInputSchema, type DnsRecordInput, type OperationSource } from "@masterdns/contracts";
-import { and, desc, eq, inArray } from "drizzle-orm";
-import { dnsRecords, operationSteps, operations, providerAccounts, zones } from "@masterdns/db";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
+import { dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -34,6 +34,8 @@ export class OperationsService {
       ...(input.record ? { record: input.record } : {}),
     };
     const result = await this.database.db.transaction(async (tx) => {
+      // Serialize new manual writes with cloud RRset ownership changes.
+      await tx.select({ id: zones.id }).from(zones).where(eq(zones.id, input.zoneId)).for("update");
       const [operation] = await tx.insert(operations).values({
         ownerUserId: input.ownerUserId,
         actorUserId: input.actorUserId,
@@ -62,6 +64,16 @@ export class OperationsService {
           throw new ConflictException("幂等键已用于不同的 DNS 请求");
         }
         return { operation: existing, created: false };
+      }
+      const [current] = input.dnsRecordId ? await tx.select().from(dnsRecords).where(eq(dnsRecords.id, input.dnsRecordId)).limit(1) : [];
+      if (current?.management === "managed") throw new ConflictException("DNS record is managed by an IP Pool");
+      for (const record of [input.record, current]) {
+        if (!record) continue;
+        const [binding] = await tx.select({ id: domainBindings.id }).from(domainBindings).where(and(
+          eq(domainBindings.zoneId, input.zoneId), eq(domainBindings.recordType, record.type),
+          sql`lower(rtrim(${domainBindings.fqdn}, '.')) = ${record.name.toLowerCase().replace(/\.$/, "")}`,
+        )).limit(1);
+        if (binding) throw new ConflictException("DNS record is managed by an IP Pool");
       }
       await tx.insert(operationSteps).values({
         operationId: operation.id,

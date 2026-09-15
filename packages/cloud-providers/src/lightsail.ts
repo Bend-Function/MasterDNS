@@ -9,7 +9,7 @@ import type { StaticIp } from "@aws-sdk/client-lightsail";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
-import { createAwsCredentialSource } from "./aws-credentials.js";
+import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
@@ -26,7 +26,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
     private readonly dependencies: AwsAdapterDependencies = {},
   ) {
     this.credentialSource = createAwsCredentialSource(credentials);
-    this.stsClient = new STSClient({ region: "us-east-1", credentials: this.credentialSource });
+    this.stsClient = new STSClient({ ...awsClientOptions, region: "us-east-1", credentials: this.credentialSource });
   }
 
   private stsSend(command: GetCallerIdentityCommand) {
@@ -38,7 +38,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
     if (this.dependencies.lightsailSend !== undefined) return this.dependencies.lightsailSend(command);
     let client = this.lightsailClients.get(region);
     if (client === undefined) {
-      client = new LightsailClient({ region, credentials: this.credentialSource });
+      client = new LightsailClient({ ...awsClientOptions, region, credentials: this.credentialSource });
       this.lightsailClients.set(region, client);
     }
     return (client.send.bind(client) as AwsSend)(command);

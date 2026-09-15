@@ -39,6 +39,8 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
     provider: cloudProviderEnum("provider").notNull(),
     name: varchar("name", { length: 120 }).notNull(),
+    regions: jsonb("regions").$type<string[] | null>(),
+    externalAccountId: varchar("external_account_id", { length: 32 }),
     credentialCiphertext: text("credential_ciphertext").notNull(),
     credentialIv: varchar("credential_iv", { length: 64 }).notNull(),
     credentialTag: varchar("credential_tag", { length: 64 }).notNull(),
@@ -151,6 +153,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
   const instanceAuthorizations = pgTable("instance_authorizations", {
     instanceId: uuid("instance_id").primaryKey().references(() => cloudInstances.id, { onDelete: "cascade" }),
     revision: integer("revision").notNull().default(1),
+    managed: boolean("managed").notNull().default(false),
     allowIpv4Rotation: boolean("allow_ipv4_rotation").notNull().default(false),
     allowIpv6Rotation: boolean("allow_ipv6_rotation").notNull().default(false),
     allowStopStart: boolean("allow_stop_start").notNull().default(false),

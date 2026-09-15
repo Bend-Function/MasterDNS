@@ -460,6 +460,7 @@ export class PoolsService {
         await disableDdnsAgent(tx, endpointId, now);
         addressChanged = true;
       } else if (ipv4 !== undefined || ipv6 !== undefined) {
+        if (lockedEndpoint.addressMode === "cloud") throw new ConflictException("Cloud 节点地址只能通过托管槽位更新");
         if (lockedEndpoint.addressMode !== "static") throw new ConflictException("DDNS 节点地址只能由 Agent 上报；请显式切换为静态节点");
         if (ipv4 !== undefined) addressChanged = await replaceStaticAddress(tx, endpointId, "4", ipv4) || addressChanged;
         if (ipv6 !== undefined) addressChanged = await replaceStaticAddress(tx, endpointId, "6", ipv6) || addressChanged;

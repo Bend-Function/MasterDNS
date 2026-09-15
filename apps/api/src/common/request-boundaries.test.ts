@@ -1,3 +1,5 @@
+import { ApiExceptionFilter } from "./api-exception.filter.js";
+import { CloudError } from "@masterdns/cloud-providers";
 import { describe, expect, it } from "vitest";
 import { publicDatabaseError } from "./database-error.js";
 import { parseIdempotencyKey } from "./idempotency.js";
@@ -30,5 +32,15 @@ describe("database error redaction", () => {
   it("maps serialization and deadlock retries to public conflicts", () => {
     expect(publicDatabaseError({ code: "40001" })).toEqual({ status: 409, code: "conflict", message: "配置正在被其他操作修改，请刷新后重试" });
     expect(publicDatabaseError({ code: "40P01" })?.status).toBe(409);
+  });
+});
+
+
+describe("cloud API error responses", () => {
+  it("preserves safe AWS error codes for credential verification failures", () => {
+    const sent: { status?: number; body?: unknown } = {};
+    const response = { status(value: number) { sent.status = value; return this; }, send(body: unknown) { sent.body = body; } };
+    new ApiExceptionFilter().catch(new CloudError("invalid_credentials", false), { switchToHttp: () => ({ getResponse: () => response, getRequest: () => ({ id: "test", log: { warn() {}, error() {} } }) }) } as never);
+    expect(sent).toMatchObject({ status: 401, body: { error: { code: "invalid_credentials" } } });
   });
 });

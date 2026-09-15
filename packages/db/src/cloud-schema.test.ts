@@ -60,16 +60,18 @@ describe("cloud schema constraints", () => {
     const [instance] = await sql<{ id: string }[]>`insert into cloud_instances (account_id, service, region, external_id, scan_generation) values (${accountId}, 'lightsail', 'ap-southeast-2', 'ls-1', 1) returning id`;
     expect(await sql`select * from instance_authorizations where instance_id = ${instance!.id}`).toHaveLength(0);
     const [authorization] = await sql<{
+      managed: boolean;
       allowIpv4Rotation: boolean;
       allowIpv6Rotation: boolean;
       allowStopStart: boolean;
       allowReleaseAddress: boolean;
     }[]>`insert into instance_authorizations (instance_id) values (${instance!.id}) returning
-      allow_ipv4_rotation as "allowIpv4Rotation",
+      managed, allow_ipv4_rotation as "allowIpv4Rotation",
       allow_ipv6_rotation as "allowIpv6Rotation",
       allow_stop_start as "allowStopStart",
       allow_release_address as "allowReleaseAddress"`;
     expect(authorization).toEqual({
+      managed: false,
       allowIpv4Rotation: false,
       allowIpv6Rotation: false,
       allowStopStart: false,

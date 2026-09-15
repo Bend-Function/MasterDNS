@@ -1,5 +1,6 @@
 import { ArgumentsHost, Catch, HttpException, HttpStatus, type ExceptionFilter } from "@nestjs/common";
 import type { FastifyReply, FastifyRequest } from "fastify";
+import { CloudError } from "@masterdns/cloud-providers";
 import { ProviderError } from "@masterdns/contracts";
 import { ZodError } from "zod";
 import { publicDatabaseError } from "./database-error.js";
@@ -27,6 +28,15 @@ export class ApiExceptionFilter implements ExceptionFilter {
         error: { code: httpCode(exception.getStatus()), message },
         requestId: request.id,
       });
+    }
+    if (exception instanceof CloudError) {
+      const status = exception.code === "invalid_credentials" || exception.code === "credentials_expired" ? HttpStatus.UNAUTHORIZED
+        : exception.code === "permission_denied" ? HttpStatus.FORBIDDEN
+        : exception.code === "rate_limited" ? HttpStatus.TOO_MANY_REQUESTS
+        : exception.code === "remote_identity_changed" ? HttpStatus.CONFLICT
+        : HttpStatus.BAD_GATEWAY;
+      request.log.warn({ provider: "aws", code: exception.code }, "Cloud request failed");
+      return response.status(status).send({ error: { code: exception.code, message: exception.code }, requestId: request.id });
     }
     if (exception instanceof ProviderError) {
       const status = providerErrorStatus(exception.code);

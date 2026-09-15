@@ -209,6 +209,25 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         }
       }
       lease.assertOwned();
+      // Manual operations may have been queued before the RRset acquired a manager.
+      // The caller holds the same zone lease used by cloud binding claims.
+      if (operation.resourceType === "dns_record") {
+        const [current] = step.dnsRecordId ? await tx.select().from(dnsRecords).where(eq(dnsRecords.id, step.dnsRecordId)).limit(1) : [];
+        let managed = current?.management === "managed";
+        for (const record of [input.record, current]) {
+          if (!record || managed) continue;
+          const [binding] = await tx.select({ id: domainBindings.id }).from(domainBindings).where(and(
+            eq(domainBindings.zoneId, step.zoneId), eq(domainBindings.recordType, record.type),
+            sql`lower(rtrim(${domainBindings.fqdn}, '.')) = ${record.name.toLowerCase().replace(/\.$/, "")}`,
+          )).limit(1);
+          managed = Boolean(binding);
+        }
+        if (managed) {
+          await tx.update(operationSteps).set({ status: "skipped", errorCode: "rrset_now_managed", finishedAt: new Date(), updatedAt: new Date() }).where(eq(operationSteps.id, step.id));
+          return false;
+        }
+      }
+      lease.assertOwned();
       let remote: ProviderRecord | null = null;
       if (step.action === "create") {
         if (!input.record) throw new ProviderError("Create step is missing record input", "validation_failed", adapter.provider);

@@ -7,7 +7,7 @@ import {
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
-import { createAwsCredentialSource } from "./aws-credentials.js";
+import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapEc2Instance } from "./discovery.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
@@ -24,7 +24,7 @@ export class Ec2CloudAdapter implements CloudAdapter {
     private readonly dependencies: AwsAdapterDependencies = {},
   ) {
     this.credentialSource = createAwsCredentialSource(credentials);
-    this.stsClient = new STSClient({ region: "us-east-1", credentials: this.credentialSource });
+    this.stsClient = new STSClient({ ...awsClientOptions, region: "us-east-1", credentials: this.credentialSource });
   }
 
   private stsSend(command: GetCallerIdentityCommand) {
@@ -36,7 +36,7 @@ export class Ec2CloudAdapter implements CloudAdapter {
     if (this.dependencies.ec2Send !== undefined) return this.dependencies.ec2Send(command);
     let client = this.ec2Clients.get(region);
     if (client === undefined) {
-      client = new EC2Client({ region, credentials: this.credentialSource });
+      client = new EC2Client({ ...awsClientOptions, region, credentials: this.credentialSource });
       this.ec2Clients.set(region, client);
     }
     return client.send(command);

@@ -1,4 +1,5 @@
 import { Global, Injectable, Module, type OnModuleDestroy } from "@nestjs/common";
+import { withDnsZoneLock, type DnsZoneLease } from "@masterdns/automation";
 import { queueNames } from "@masterdns/contracts";
 import { Queue } from "bullmq";
 import { Redis } from "ioredis";
@@ -10,8 +11,13 @@ export class QueueService implements OnModuleDestroy {
   readonly operations = new Queue(queueNames.operations, { connection: this.redis });
   readonly health = new Queue(queueNames.health, { connection: this.redis });
   readonly reconcile = new Queue(queueNames.reconcile, { connection: this.redis });
+  readonly cloudSync = new Queue(queueNames.cloudSync, { connection: this.redis });
   readonly sync = new Queue(queueNames.sync, { connection: this.redis });
   readonly notifications = new Queue(queueNames.notifications, { connection: this.redis });
+
+  withDnsZoneLock<T>(zoneId: string, action: (lease: DnsZoneLease) => Promise<T>): Promise<T> {
+    return withDnsZoneLock(this.redis, zoneId, action);
+  }
 
   async incrementRateLimit(key: string, windowMs: number): Promise<number> {
     const result = await this.redis.eval(
@@ -61,7 +67,7 @@ export class QueueService implements OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    await Promise.all([this.operations.close(), this.health.close(), this.reconcile.close(), this.sync.close(), this.notifications.close()]);
+    await Promise.all([this.operations.close(), this.health.close(), this.reconcile.close(), this.sync.close(), this.cloudSync.close(), this.notifications.close()]);
     await this.redis.quit();
   }
 }
