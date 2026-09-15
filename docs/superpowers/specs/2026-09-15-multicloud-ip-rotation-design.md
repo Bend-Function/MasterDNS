@@ -2,11 +2,13 @@
 
 日期：2026-09-15
 
-状态：整体方向与主要交互已确认，本文待用户审阅。本文仅为设计，不表示功能已经实现。
+状态：2026-09-15 用户已批准设计，并指定 Go Agent 在独立 MasterDNS-Agent 项目开发；进入实施计划阶段。本文仅为设计，不表示功能已经实现。
 
 ## 1. 目标与范围
 
-在现有 MasterDNS 中增加云实例发现、显式管理授权、IPv4/IPv6 地址绑定、外部健康探测和自动换址闭环。现有 TypeScript Web、API、Worker、PostgreSQL、Redis 继续使用；新增独立 Go 探测 Agent，代码放在同一仓库。
+在现有 MasterDNS 中增加云实例发现、显式管理授权、IPv4/IPv6 地址绑定、外部健康探测和自动换址闭环。现有 TypeScript Web、API、Worker、PostgreSQL、Redis 继续使用；新增独立 Go 探测 Agent，代码放在独立 MasterDNS-Agent 仓库。
+
+平台仓库：`/Users/funcma/Project/MasterDNS`，开发分支 `codex/multicloud-ip-rotation`。Agent 仓库：`/Users/funcma/Project/MasterDNS-Agent`，开发分支 `codex/external-health-agent`。两边独立提交、构建和发布，通过版本化 HTTPS 协议与共享契约样例联调，不要求共享文件系统。
 
 第一期实现 AWS EC2 与 Lightsail。内部定义多云接口，为 GCP、Azure、Vultr 后续接入预留边界，但本期不实现或宣称支持这些厂商的具体轮换能力。DNS 厂商继续使用现有 Cloudflare、阿里云适配器，云计算账号与 DNS 账号分开建模。
 
@@ -36,7 +38,7 @@
 | 现有自动化模块 | Pool 策略计算、候选地址提升、DNS 期望状态 | 标准化健康状态 |
 | Go Agent | 拉取任务、按指定地址族探测、上报与有限重试 | HTTPS 管理 API；不依赖云 SDK |
 
-新增包建议为 `packages/cloud-providers`，现有 `packages/providers` 保持 DNS 职责。API/Worker 新增 cloud、probes、rotation 模块；Go 程序放在 `agent/probe`，与现有 DDNS 脚本共存。
+新增包建议为 `packages/cloud-providers`，现有 `packages/providers` 保持 DNS 职责。API/Worker 新增 cloud、probes、rotation 模块；Go 程序在 MasterDNS-Agent 仓库的 `cmd/masterdns-agent` 与 `internal` 中开发。现有 DDNS 脚本保留在 MasterDNS，外部探测 Agent 独立安装、升级。
 
 PostgreSQL 持久保存任务、租约、决策、尝试次数、步骤和资源归属。Redis 用于唤醒与短期协调，清空 Redis 后可从数据库恢复。
 
