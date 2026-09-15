@@ -12,6 +12,8 @@
 
 ## Global Constraints
 
+- 用户补充：不做无谓的哈希验证；协议兼容依靠解析和行为测试。保持代码风格简洁、高效，复用现有模式，避免过度抽象。
+
 - 仓库 `/Users/funcma/Project/MasterDNS`；分支 `codex/multicloud-ip-rotation`。禁止在 master 上开发、自动合并或推送。
 - 外部 Agent 在 `/Users/funcma/Project/MasterDNS-Agent` 的 `codex/external-health-agent` 分支，不能把 Go 源码加进本仓库。
 - 第一阶段只实现 AWS EC2 与 Lightsail，GCP/Azure/Vultr 仅预留接口；DNS 厂商与云计算厂商分开。
@@ -37,7 +39,7 @@ API 新建 `modules/cloud`、`modules/probes`、`modules/rotation`；Worker 新�
 
 任务依赖：P1 → P2/P3；P2+P3 → P4；P1 → P5 → P6 → P7；P3+P4+P7 → P8 → P9 → P10；P4+P7+P9 → P11；全部 → P12。跨仓库 Agent 任务依赖 P1 冻结的协议，P7 与 Agent A6 完成后做联调。
 
-## P1：冻结跨仓库探测契约与云地址身份
+## Task 1: P1 — 冻结跨仓库探测契约与云地址身份
 
 **Files:**
 - Create: `packages/contracts/src/probes.ts`, `cloud.ts`, `rotation.ts`, `probes.test.ts`
@@ -87,10 +89,10 @@ expect(probeResultSchema.parse(resultFixture).outcome).toBe('success');
 - [ ] 用 Zod strict object 实现上述 schema，UUID/ISO 时间戳/地址族/配置版本/长度边界校验；建立 `probeTaskSchema`、`probeResultSchema`、`leaseResponseSchema`、`resultAckSchema` 导出。批量结果最多 100 个，每个响应包含 taskId 与 accepted/duplicate/stale/rejected。networkPolicy 缺失或列表为空时不允许私网；列表仅由管理员授权的探测配置生成，禁止客户端领取请求自行扩张范围。
 - [ ] 协议文档定义 POST `/api/v1/probe-agent/exchange`、`heartbeat`、`tasks/lease`、`results`。安装输入 `{installToken}`，返回 `{probeId,runtimeToken,protocol}`；心跳 `{protocol,agentVersion,capabilities:{ipv4,ipv6},maxConcurrency}`；租约请求 `{protocol,capacity}`，响应 `{serverTime,tasks,retryAfterMs}`；结果 `{protocol,results}`。401 吊销，409 版本/租约冲突，429 带 Retry-After。
 - [ ] 创建可直接解析的 fixture：taskId/roundId/probeId/leaseId 使用固定测试 UUID；地址 `192.0.2.10`；family=4；TCP port=443、timeoutMs=3000；version=1；deadline 固定 ISO 时间。成功结果与任务 ID/版本一致。固定样例时间只能用于注入时钟的测试。
-- [ ] 执行 contracts test/typecheck；将 schema、fixture 和文档复制为 Agent 仓库的 `protocol/v1` 版本快照，在两个仓库记录同一个 SHA-256 契约清单；禁止构建时读取兄弟目录。
+- [ ] 执行 contracts test/typecheck；将 schema、fixture 和文档复制为 Agent 仓库的 `protocol/v1` 版本快照，用两个仓库各自的解析测试验证兼容性，不增加契约哈希清单；禁止构建时读取兄弟目录。
 - [ ] 提交：`git add packages/contracts docs/contracts`，`git commit -m 'feat: define cloud identity and external probe protocol v1'`。
 
-## P2：持久云资源、地址槽位与授权
+## Task 2: P2 — 持久云资源、地址槽位与授权
 
 **Files:**
 - Create: `packages/db/src/schema/cloud.ts`, `packages/db/src/cloud-schema.test.ts`
@@ -112,7 +114,7 @@ expect(() => assertCloudAccess({ id: 'admin', role: 'admin' } as AuthUser, 'u2')
 - [ ] 生成迁移 `pnpm db:generate`，在隔离空库和 0010 基线库运行迁移，检查旧 endpoint/current/candidate 唯一约束仍成立。
 - [ ] db/API test 与 typecheck 通过后，仅提交本任务 schema、生成迁移和权限函数。
 
-## P3：AWS 只读适配与能力评估
+## Task 3: P3 — AWS 只读适配与能力评估
 
 **Files:**
 - Create: `packages/cloud-providers/package.json`, `tsconfig.json`
@@ -160,7 +162,7 @@ expect(ec2Adapter.capabilities(ipv6Slot, primaryIpv6Inventory)).toMatchObject({
 - [ ] 此阶段 `execute` 返回明确的 `cloud_writes_not_enabled`，不能假装成功；P8 才解锁已测试 action。实现与 SDK 分离的 capability 纯函数，Lightsail IPv6-only 套餐转换标记不可用。
 - [ ] 测试/构建/类型检查通过后提交包、依赖与 lockfile。
 
-## P4：账号 API、清单同步与 DNS 地址来源
+## Task 4: P4 — 账号 API、清单同步与 DNS 地址来源
 
 **Files:**
 - Create: `apps/api/src/modules/cloud/{cloud.module,cloud.controller,cloud.service,cloud.schemas,cloud-access,cloud-bindings.service}.ts`
@@ -184,7 +186,7 @@ expect(await syncFixture({ regionFailure: 'AccessDenied' })).toMatchObject({
 - [ ] 直接绑定创建单节点 primary_backup Pool 或引用显式选定的既有 Pool；同 `(zoneId,fqdn,type)` 不允许第二个管理者。现有 Pool 服务对 cloud 来源不允许手工改 IP/DDNS 覆盖。
 - [ ] API/worker tests、类型检查通过后提交本任务文件。
 
-## P5：探测点身份、轮次、租约与结果存储
+## Task 5: P5 — 探测点身份、轮次、租约与结果存储
 
 **Files:**
 - Create: `packages/db/src/schema/probes.ts`
@@ -208,7 +210,7 @@ expect(await observationsFor(result.taskId)).toHaveLength(1);
 - [ ] 结果落库与 task 终态在一个事务中完成，鉴权后再比对 lease、revision、deadline；duplicate 返回原确认，已过期结果仅记历史 stale，不触发聚合。错误长度、批量大小受 P1 schema 限制。
 - [ ] 增加迁移并通过事务/重放/权限测试后提交。
 
-## P6：按轮次聚合健康状态
+## Task 6: P6 — 按轮次聚合健康状态
 
 **Files:**
 - Create: `packages/automation/src/probe-consensus.ts`, `probe-consensus.test.ts`
@@ -243,7 +245,7 @@ expect(evaluateProbeRound({memberIds:['a','b','c'],outcomes:{a:'failure',b:'fail
 - [ ] probe-policy schema 校验 `1<=minimumValid<=memberCount`、N 范围、specified 存在、执行窗口<=检查间隔、候选窗口足够覆盖成功轮数。
 - [ ] 执行 `pnpm --filter @masterdns/automation test`、`pnpm test:coverage`、contracts tests 后提交。
 
-## P7：外部调度与本地结果共用应用入口
+## Task 7: P7 — 外部调度与本地结果共用应用入口
 
 **Files:**
 - Create: `apps/worker/src/probes/{probe-scheduler.service,probe-rounds.service,probe-health.service}.ts`
@@ -268,7 +270,7 @@ expect(await currentSlotHealth(slot.id)).toBe('unknown');
 - [ ] unknown 导致轮换等待和通知，不产生目标 failure；新地址重置轮次和阈值，Worker 重启按 deadline 结算未完成轮次。统计和保留任务按探测点/地址族存储，避免不可执行任务污染失败率。
 - [ ] 运行 worker tests、原有 DDNS tests 与一次使用 Agent A6 的本地租约/上报联调后提交。
 
-## P8：AWS 可观察换址步骤
+## Task 8: P8 — AWS 可观察换址步骤
 
 **Files:**
 - Create: `packages/cloud-providers/src/{rotation-plan,ec2-rotation,lightsail-rotation,resource-ownership}.ts`
@@ -292,7 +294,7 @@ expect(recordedCommands.some(c => c.name === 'StopInstancesCommand')).toBe(false
 - [ ] 显式 allowStop 只启用符合配置的 EC2 动态 IPv4 stop/wait/start/wait 计划；不得为 EIP/IPv6、API 错误兜底自动调用 stop。
 - [ ] 契约测试通过后提交。真实 AWS 行为验收在 P12，不在此阶段操作用户实例。
 
-## P9：持久轮换事件、预算与实例串行化
+## Task 9: P9 — 持久轮换事件、预算与实例串行化
 
 **Files:**
 - Create: `packages/db/src/schema/rotation.ts`
@@ -319,7 +321,7 @@ expect(await activeIncidentsFor(slot.id, 4)).toHaveLength(1);
 - [ ] 添加 API 查询、策略修改、暂停/继续和审计。全链路错误码区分 AWS permission/quota/throttle、probe_insufficient、candidate_failed、dns_partial、cleanup_failed。
 - [ ] 迁移、状态机、重复/重启测试通过后提交。
 
-## P10：DNS 发布、资源保留与清理
+## Task 10: P10 — DNS 发布、资源保留与清理
 
 **Files:**
 - Create: `apps/worker/src/rotation/{rotation-publication.service,rotation-cleanup.service}.ts`
@@ -343,7 +345,7 @@ expect(await rotationStatus(incident.id)).toBe('dns_partial');
 - [ ] rollback 对 cloud 类型采用当前资源实际状态与重新复测，不把历史 IP 字符串直接写回。清理失败独立重试/告警。
 - [ ] 原有 operations/reconcile tests 与新增集成通过后提交。
 
-## P11：控制台、通知和部署交付
+## Task 11: P11 — 控制台、通知和部署交付
 
 **Files:**
 - Create: `apps/web/src/app/cloud-accounts/page.tsx`, `cloud-instances/page.tsx`, `cloud-instances/[instanceId]/page.tsx`, `probes/page.tsx`, `rotations/page.tsx`, `rotations/[rotationId]/page.tsx`
@@ -369,7 +371,7 @@ expect(validateRotationPolicy({managed:true,ipv6Enabled:false})).not.toContain('
 - [ ] 配置 Agent 发布源、协议版本、最大并发和任务大小，更新部署/升级/回退文档。数据库回退通过备份恢复，不能宣称 down migration 可撤销已执行 AWS 变更。
 - [ ] 执行 web test/lint/typecheck，桌面/移动浏览器检查权限、暂停、复测和强制操作；只为真实风险补交互测试，不测试 CSS 细节。通过后提交。
 
-## P12：隔离联调、发布验证与交接
+## Task 12: P12 — 隔离联调、发布验证与交接
 
 **Files:**
 - Create: `tests/integration/probe-rotation.test.ts`, `tests/integration/rotation-recovery.test.ts`
@@ -388,9 +390,9 @@ expect(trace.cloudWritesToUnmanagedInstances).toBe(0);
 ```
 
 - [ ] 用 failpoint 在 allocate 后未记完成、attach 后、DNS 部分成功、清理前终止 Worker，重启验证没有重复分配、预算重置和重复 DNS 创建。
-- [ ] 协议 SHA-256 fixture 在两个仓库一致，运行 Go Agent A7 的二进制验收与平台 P1 schema 测试；核验 agent version/protocol mismatch 有可解释错误。
+- [ ] 协议 fixture 在两个仓库的解析与行为测试一致，运行 Go Agent A7 的二进制验收与平台 P1 schema 测试；核验 agent version/protocol mismatch 有可解释错误。
 - [ ] `aws-e2e.ts` 只从环境读取临时 AWS 身份和显式允许的 instance/ENI/resource IDs，默认只读。写模式要求显式测试范围，测试每个副作用后读取远端，清理仅本次创建且未被复用资源。无凭证/测试实例时报告 skipped 与原因，不报告 passed。
-- [ ] 执行 `pnpm build`、`pnpm typecheck`、`pnpm lint`、`pnpm test`、`pnpm test:coverage`、`pnpm test:probe-integration`。Go 构建与 race test 由 Agent 仓库执行，报告记录双方 commit 与产物哈希。
+- [ ] 执行 `pnpm build`、`pnpm typecheck`、`pnpm lint`、`pnpm test`、`pnpm test:coverage`、`pnpm test:probe-integration`。Go 构建与 race test 由 Agent 仓库执行，报告记录双方 commit 与产物版本。
 - [ ] 验证日志没有密钥/Token/header，迁移同时覆盖空库和旧库；记录实际通过、失败和未执行项目。保留真实云资源残留 ID 供人工处理，不静默丢弃。
 - [ ] 提交测试与验证文档；提交前 `git diff --check`。完成后报告两个分支、验证结果、真实云未验收项，不自动合并/推送/部署。
 
