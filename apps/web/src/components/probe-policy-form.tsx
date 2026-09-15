@@ -2,7 +2,7 @@
 
 import type { ConsensusPolicy, HealthCheckConfig } from "@masterdns/contracts";
 import { useMemo, useState, type FormEvent } from "react";
-import { consensusPreview, defaultMinimumValid, validateProbePolicyDraft } from "../lib/probe-policy";
+import { consensusPreview, defaultMinimumValid, isSpecifiedProbeAllowed, validateProbePolicyDraft } from "../lib/probe-policy";
 import type { AddressHealthPolicy, HealthConfigRow, HealthPolicyInput, ProbeAgent, ProbeGroup } from "../lib/probe-types";
 import { Field, Switch } from "./ui";
 
@@ -68,7 +68,7 @@ export function ProbePolicyForm({ formId, targetKind, targetId, family, policy, 
     setError(null);
     const errors = validateProbePolicyDraft({ cohortSize, mode, targetKind, consensus, checkIntervalSeconds, executionWindowSeconds, resultExpirySeconds, timeoutMs });
     if (mode !== "local" && !groupId) errors.push("group_required");
-    if (consensusMode === "specified" && !(group?.memberIds.includes(specifiedProbeId) ?? false)) errors.push("specified_probe_required");
+    if (consensusMode === "specified" && !isSpecifiedProbeAllowed(targetKind, mode, group?.memberIds ?? [], specifiedProbeId)) errors.push("specified_probe_required");
     if (errors.length) { setError(policyError(errors[0]!)); return; }
 
     try {
@@ -106,7 +106,7 @@ export function ProbePolicyForm({ formId, targetKind, targetId, family, policy, 
       <Field label="投票规则"><select value={consensusMode} onChange={(event) => setConsensusMode(event.target.value as ConsensusMode)}><option value="majority">多数失败</option><option value="any">任一失败</option><option value="all">全部失败</option><option value="at_least">至少 K 票失败</option><option value="specified">指定探测点</option></select></Field>
       <Field label="最少有效结果 Q"><input type="number" min={1} max={Math.max(1, cohortSize)} value={minimumValid} onChange={(event) => setMinimumValid(Number(event.target.value))} required /></Field>
       {consensusMode === "at_least" && <Field label="失败票数 K"><input type="number" min={1} max={Math.max(1, cohortSize)} value={failureVotes} onChange={(event) => setFailureVotes(Number(event.target.value))} required /></Field>}
-      {consensusMode === "specified" && <Field label="指定探测点"><select value={specifiedProbeId} onChange={(event) => setSpecifiedProbeId(event.target.value)} required><option value="">选择探测点</option>{groupMembers.map((probe) => <option key={probe.id} value={probe.id}>{probe.name}</option>)}</select></Field>}
+      {consensusMode === "specified" && <Field label="指定探测点"><select value={specifiedProbeId} onChange={(event) => setSpecifiedProbeId(event.target.value)} required><option value="">选择探测点</option>{groupMembers.map((probe) => <option key={probe.id} value={probe.id}>{probe.name}</option>)}{targetKind === "endpoint" && mode === "mixed" && <option value="local">本地检查</option>}</select></Field>}
     </div><div className="vote-preview"><strong>固定 Cohort：{cohortSize} 票</strong><span>有效结果不足 {minimumValid} 票时为未知；unknown / unavailable 不计失败。</span><span>{preview.failureVotesRequired === null ? "由指定探测点结果决定" : `失败需 F >= ${preview.failureVotesRequired}；成功需 S > ${cohortSize} - ${preview.failureVotesRequired}，即至少 ${preview.successVotesRequired} 票。`}</span></div></fieldset>
     <fieldset><legend>轮次与状态</legend><div className="field-grid"><Field label="检查间隔（秒）"><input type="number" min={1} max={86400} value={checkIntervalSeconds} onChange={(event) => setCheckIntervalSeconds(Number(event.target.value))} required /></Field><Field label="轮次截止（秒）"><input type="number" min={1} max={300} value={executionWindowSeconds} onChange={(event) => setExecutionWindowSeconds(Number(event.target.value))} required /></Field><Field label="结果有效期（秒）"><input type="number" min={1} max={86400} value={resultExpirySeconds} onChange={(event) => setResultExpirySeconds(Number(event.target.value))} required /></Field><Field label="连续成功轮数"><input type="number" min={1} max={100} value={successThreshold} onChange={(event) => setSuccessThreshold(Number(event.target.value))} required /></Field><Field label="连续失败轮数"><input type="number" min={1} max={100} value={failureThreshold} onChange={(event) => setFailureThreshold(Number(event.target.value))} required /></Field>{isAdmin && <Field label="允许的私网 CIDR" hint="每行一个，仅管理员可配置"><textarea value={privateCidrs} onChange={(event) => setPrivateCidrs(event.target.value)} /></Field>}</div></fieldset>
   </form>;

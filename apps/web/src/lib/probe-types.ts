@@ -105,6 +105,7 @@ export type ProbeRound = {
   family: "4" | "6";
   memberIds: string[];
   localOutcome: "success" | "failure" | "unavailable" | null;
+  localReceivedAt: string | null;
   consensus: ConsensusPolicy;
   status: "pending" | "completed" | "superseded";
   consensusResult: "success" | "failure" | "unknown" | null;

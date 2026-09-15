@@ -11,7 +11,7 @@ import { Button, Dialog, EmptyState, Field, IconButton, LoadingState, MetricStri
 import { api, ApiError, jsonBody, UI_PREVIEW } from "../../lib/api";
 import { demoCloudAccounts, demoCloudInstances, demoCloudSlots } from "../../lib/cloud-demo";
 import type { AddressSlot, CloudAccount, CloudInstanceRow } from "../../lib/cloud-types";
-import { createIntentKey } from "../../lib/intent-key";
+import { createRotationIntent } from "../../lib/rotation-action";
 import { demoRotationPolicy, demoRotations } from "../../lib/rotation-demo";
 import type { RotationIncident, RotationPolicy } from "../../lib/rotation-types";
 import { createRequestGeneration } from "../../lib/session-state";
@@ -28,7 +28,7 @@ export default function RotationsPage() {
   const [error, setError] = useState<string | null>(null);
   const loads = useRef(createRequestGeneration());
   const mutations = useRef(createRequestGeneration());
-  const startIntent = useRef(createIntentKey());
+  const startIntent = useRef(createRotationIntent());
 
   const load = useCallback(async () => {
     const generation = loads.current.invalidate(); setError(null);
@@ -38,7 +38,7 @@ export default function RotationsPage() {
   }, []);
   useEffect(() => { if (UI_PREVIEW) return; const loadState = loads.current; const mutationState = mutations.current; let active = true; Promise.resolve().then(() => { if (active) void load(); }); return () => { active = false; loadState.invalidate(); mutationState.invalidate(); }; }, [load]);
 
-  const close = () => { mutations.current.invalidate(); startIntent.current.reset(); setSelection(null); setPickerOpen(false); setConfirmStart(false); setSaving(false); };
+  const close = () => { mutations.current.invalidate(); startIntent.current.cancel(); setSelection(null); setPickerOpen(false); setConfirmStart(false); setSaving(false); };
   const savePolicy = async (input: RotationPolicyInput) => {
     if (!selection) return; const generation = mutations.current.current(); setSaving(true); setError(null);
     try {
@@ -56,12 +56,12 @@ export default function RotationsPage() {
     }
   };
   const start = async () => {
-    if (!selection) return; const generation = mutations.current.current(); setSaving(true); setError(null);
+    if (!selection) return; const intent = startIntent.current.begin({ slotId: selection.slot.slot.id }); setSaving(true); setError(null);
     try {
-      if (!UI_PREVIEW) await api("/v1/rotations", { method: "POST", headers: { "idempotency-key": startIntent.current.current() }, ...jsonBody({ slotId: selection.slot.slot.id }) });
-      if (!mutations.current.isCurrent(generation)) return;
-      startIntent.current.reset(); close(); await load();
-    } catch (value) { if (mutations.current.isCurrent(generation)) { setSaving(false); setError(message(value, "手动轮换启动失败")); } }
+      if (!UI_PREVIEW) await api("/v1/rotations", { method: "POST", headers: { "idempotency-key": intent.key }, ...jsonBody(intent.payload) });
+      if (!startIntent.current.complete(intent)) return;
+      close(); await load();
+    } catch (value) { if (startIntent.current.isCurrent(intent)) { setSaving(false); setError(message(value, "手动轮换启动失败")); } }
   };
   const active = incidents?.filter((incident) => incident.status === "active").length ?? 0;
   const paused = incidents?.filter((incident) => incident.status === "paused").length ?? 0;
@@ -71,7 +71,7 @@ export default function RotationsPage() {
     {error && <div className="inline-error" role="alert">{error}</div>}
     {incidents === null ? <div className="surface"><LoadingState /></div> : incidents.length === 0 ? <div className="surface"><EmptyState title="暂无轮换记录" action={<Button icon={<Plus size={14} />} onClick={() => setPickerOpen(true)}>配置第一个槽位</Button>} /></div> : <div className="table-wrap"><table><thead><tr><th>轮换事件</th><th>地址族</th><th>状态</th><th>阶段 / 等待原因</th><th>地址版本</th><th>下次处理</th><th>创建时间</th><th aria-label="操作" /></tr></thead><tbody>{incidents.map((incident) => <tr key={incident.id}><td><Link className="table-primary" href={`/rotations/${incident.id}`}><strong className="mono">{shortId(incident.id)}</strong><small className="mono">{shortId(incident.slotId)}</small></Link></td><td>IPv{incident.family}</td><td><StatusBadge value={incident.status} /></td><td><div className="table-primary"><strong>{phaseLabel(incident.phase)}</strong><small>{waitingLabel(incident)}</small></div></td><td>Version {incident.addressVersion}</td><td><RelativeTime value={incident.nextRunAt} future /></td><td><RelativeTime value={incident.createdAt} /></td><td><Link className="icon-button" href={`/rotations/${incident.id}`} aria-label="查看轮换详情"><ExternalLink size={15} /></Link></td></tr>)}</tbody></table></div>}
     <RotationTargetPicker open={pickerOpen} accounts={accounts} onClose={() => setPickerOpen(false)} onSelected={(value) => { setSelection(value); setPickerOpen(false); }} />
-    <Dialog open={selection !== null} title={confirmStart ? "确认手动启动轮换" : selection ? `${selection.slot.slot.name} / IPv${selection.slot.slot.family}` : "轮换策略"} size="large" onClose={close} footer={confirmStart ? <><Button variant="secondary" disabled={saving} onClick={() => { startIntent.current.reset(); setConfirmStart(false); }}>返回</Button><Button variant="danger" icon={<RotateCw size={14} />} disabled={saving} onClick={() => void start()}>{saving ? "提交中" : "确认启动"}</Button></> : <><Button variant="secondary" onClick={close}>关闭</Button><Button variant="secondary" icon={<RotateCw size={14} />} disabled={saving || !selection?.policy.enabled} onClick={() => { startIntent.current.reset(); setConfirmStart(true); }}>手动启动</Button><Button type="submit" form="rotation-policy-form" disabled={saving}>{saving ? "保存中" : "保存策略"}</Button></>}>
+    <Dialog open={selection !== null} title={confirmStart ? "确认手动启动轮换" : selection ? `${selection.slot.slot.name} / IPv${selection.slot.slot.family}` : "轮换策略"} size="large" onClose={close} footer={confirmStart ? <><Button variant="secondary" disabled={saving} onClick={() => { startIntent.current.cancel(); setConfirmStart(false); }}>返回</Button><Button variant="danger" icon={<RotateCw size={14} />} disabled={saving} onClick={() => void start()}>{saving ? "提交中" : "确认启动"}</Button></> : <><Button variant="secondary" onClick={close}>关闭</Button><Button variant="secondary" icon={<RotateCw size={14} />} disabled={saving || !selection?.policy.enabled} onClick={() => { startIntent.current.cancel(); setConfirmStart(true); }}>手动启动</Button><Button type="submit" form="rotation-policy-form" disabled={saving}>{saving ? "保存中" : "保存策略"}</Button></>}>
       {selection && (confirmStart ? <div className="danger-summary"><strong>本次操作可能修改真实云地址</strong><p>系统将复核当前管理授权、IPv{selection.slot.slot.family} 独立授权、外部健康证据和区域范围。新地址通过复测前不会发布 DNS；每次实际换址会消耗本次故障预算。</p><dl><dt>当前实际地址</dt><dd className="mono">{selection.slot.currentAddress?.address ?? "暂无观测数据"}</dd><dt>最大尝试</dt><dd>{selection.policy.maxAttempts} 次</dd><dt>旧地址释放</dt><dd>{selection.row.authorization?.allowReleaseAddress ? "已授权" : "未授权"}</dd><dt>允许停止启动</dt><dd>{selection.row.authorization?.allowStopStart ? "已授权" : "未授权"}</dd></dl></div> : <RotationPolicyForm key={`${selection.slot.slot.id}:${selection.policy.revision}`} formId="rotation-policy-form" slot={selection.slot} authorization={selection.row.authorization} policy={selection.policy} onSubmit={savePolicy} />)}
     </Dialog>
   </ConsoleLayout>;

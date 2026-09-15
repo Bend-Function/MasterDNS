@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { consensusPreview, defaultMinimumValid, validateProbePolicyDraft } from "./probe-policy";
+import { consensusPreview, defaultMinimumValid, isSpecifiedProbeAllowed, roundVoteRows, validateProbePolicyDraft } from "./probe-policy";
 
 describe("consensusPreview", () => {
   it("uses the fixed cohort for majority failure and success semantics", () => {
@@ -24,6 +24,39 @@ describe("defaultMinimumValid", () => {
     expect(defaultMinimumValid("external", 3)).toBe(3);
     expect(defaultMinimumValid("mixed", 3)).toBe(4);
     expect(defaultMinimumValid("local", 3)).toBe(1);
+  });
+});
+
+describe("roundVoteRows", () => {
+  it("uses the round member snapshot and keeps absent, unavailable, and local votes distinct", () => {
+    const rows = roundVoteRows({
+      memberIds: ["probe-a", "probe-b", "probe-c"],
+      localOutcome: "success",
+      localReceivedAt: "2026-09-15T03:00:00.000Z",
+      observations: [
+        { probeId: "probe-a", status: "accepted", outcome: "success", latencyMs: 10, statusCode: 200, receivedAt: "2026-09-15T03:00:01.000Z" },
+        { probeId: "probe-b", status: "accepted", outcome: "unavailable", latencyMs: 0, statusCode: null, receivedAt: "2026-09-15T03:00:02.000Z" },
+        { probeId: "probe-c", status: "stale", outcome: "failure", latencyMs: 20, statusCode: null, receivedAt: "2026-09-15T03:00:03.000Z" },
+        { probeId: "not-in-snapshot", status: "accepted", outcome: "failure", latencyMs: 30, statusCode: null, receivedAt: "2026-09-15T03:00:04.000Z" },
+      ],
+    });
+
+    expect(rows.map((row) => [row.id, row.outcome])).toEqual([
+      ["probe-a", "success"],
+      ["probe-b", "unavailable"],
+      ["probe-c", "unknown"],
+      ["local", "success"],
+    ]);
+    expect(rows.at(-1)?.receivedAt).toBe("2026-09-15T03:00:00.000Z");
+  });
+});
+
+describe("isSpecifiedProbeAllowed", () => {
+  it("allows local authority only for mixed ordinary endpoints", () => {
+    expect(isSpecifiedProbeAllowed("endpoint", "mixed", ["probe-a"], "local")).toBe(true);
+    expect(isSpecifiedProbeAllowed("slot", "mixed", ["probe-a"], "local")).toBe(false);
+    expect(isSpecifiedProbeAllowed("endpoint", "external", ["probe-a"], "local")).toBe(false);
+    expect(isSpecifiedProbeAllowed("slot", "mixed", ["probe-a"], "probe-a")).toBe(true);
   });
 });
 

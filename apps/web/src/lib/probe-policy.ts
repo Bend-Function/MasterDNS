@@ -11,6 +11,10 @@ export function defaultMinimumValid(mode: "local" | "external" | "mixed", extern
   return Math.max(1, externalMemberCount + (mode === "mixed" ? 1 : 0));
 }
 
+export function isSpecifiedProbeAllowed(targetKind: "slot" | "endpoint", mode: "local" | "external" | "mixed", memberIds: string[], probeId: string): boolean {
+  return memberIds.includes(probeId) || (targetKind === "endpoint" && mode === "mixed" && probeId === "local");
+}
+
 export function consensusPreview(consensus: ConsensusPolicy, cohortSize: number): ConsensusPreview {
   const size = Math.max(0, cohortSize);
   const failureVotesRequired = consensus.mode === "any" ? 1
@@ -46,4 +50,31 @@ export function validateProbePolicyDraft(input: ProbePolicyDraft): string[] {
   if (input.consensus.mode === "at_least" && (input.consensus.failureVotes ?? 1) > input.cohortSize) errors.push("failure_votes_exceed_cohort");
   if (input.targetKind === "slot" && input.mode === "mixed" && (input.cohortSize < 2 || input.consensus.minimumValid < 2)) errors.push("slot_requires_external_vote");
   return errors;
+}
+
+type RoundVoteInput = {
+  memberIds: string[];
+  localOutcome: "success" | "failure" | "unavailable" | null;
+  localReceivedAt?: string | null;
+  observations: Array<{ probeId: string; status: "accepted" | "stale"; outcome: "success" | "failure" | "unavailable"; latencyMs: number; statusCode: number | null; receivedAt: string }>;
+};
+
+export type RoundVoteRow = {
+  id: string;
+  source: "probe" | "local";
+  outcome: "success" | "failure" | "unavailable" | "unknown";
+  latencyMs: number | null;
+  statusCode: number | null;
+  receivedAt: string | null;
+};
+
+export function roundVoteRows(round: RoundVoteInput): RoundVoteRow[] {
+  const rows = round.memberIds.map((id): RoundVoteRow => {
+    const observation = round.observations.find((item) => item.probeId === id && item.status === "accepted");
+    return observation
+      ? { id, source: "probe", outcome: observation.outcome, latencyMs: observation.latencyMs, statusCode: observation.statusCode, receivedAt: observation.receivedAt }
+      : { id, source: "probe", outcome: "unknown", latencyMs: null, statusCode: null, receivedAt: null };
+  });
+  if (round.localOutcome) rows.push({ id: "local", source: "local", outcome: round.localOutcome, latencyMs: null, statusCode: null, receivedAt: round.localReceivedAt ?? null });
+  return rows;
 }
