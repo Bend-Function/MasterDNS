@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fixture, vmId, nicId, configId, pipId } from './azure-fixtures.js';
+import { fixture, credentials, vmId, nicId, configId, pipId } from './azure-fixtures.js';
 import { planAzureRotation, planAzureCleanup } from './azure-rotation.js';
+import { AzureCloudAdapter } from './azure.js';
 import type { CloudStepResult } from './provider.js';
 const prepare = async (f = fixture()) => { const before = await f.adapter.inspect(f.slot); const steps = planAzureRotation(f.slot, before, { attemptId: 'attempt-1', allowStop: false }); return { ...f, before, steps }; };
 const withCandidate = (step: any, receipt: CloudStepResult) => ({ ...step, arguments: { ...step.arguments, candidateReceipt: receipt } });
@@ -144,6 +145,25 @@ describe('Azure exact-resource rotation', () => {
         expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: 'pending' });
         delete f.resources[pipId];
         expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: 'applied' });
+        expect(f.writes).toHaveLength(3);
+    });
+    it.each(['location', 'azure-asyncoperation'] as const)('handles empty HTTP 204 polling for %s while checking actual deletion', async operationKind => {
+        const raw = fixture();
+        const operation = 'https://management.azure.com/subscriptions/subscription-1/providers/Microsoft.Network/locations/eastus/operationResults/delete-204';
+        const adapter = new AzureCloudAdapter('account', credentials, {
+            fetch: async (input, init) => String(input) === operation ? new Response(null, { status: 204 }) : raw.fetcher(input, init),
+        });
+        const f = await prepare({ ...raw, adapter });
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        await f.adapter.execute(withCandidate(f.steps[1], candidate));
+        f.setMutation((_url, method) => method === 'DELETE' ? new Response('{}', { status: 202, headers: { [operationKind]: operation } }) : undefined);
+        const cleanup = planAzureCleanup(f.slot, f.before, { attemptId: 'attempt-1', releaseAuthorized: true, publishedAddress: candidate.candidateAddress!, ownershipSnapshot: { accountId: 'account', instanceId: vmId, interfaceId: configId, allocationId: pipId, address: f.slot.address } })[0]!;
+        const step = withCandidate(cleanup, candidate);
+        const receipt = await f.adapter.execute(step);
+        const observing = { ...step, arguments: { ...step.arguments, receipt, previousExecution: true } };
+        expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: 'pending' });
+        delete f.resources[pipId];
+        expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: operationKind === 'location' ? 'applied' : 'pending' });
         expect(f.writes).toHaveLength(3);
     });
     it('requires trusted snapshot, publication and explicit cleanup authorization', async () => {

@@ -196,7 +196,7 @@ async function poll(adapter: AzureCloudAdapter, a: RotationStepArguments): Promi
         throw new CloudError('cloud_operation_failed', false);
     if (status === 'Succeeded')
         return { status: 'ready' };
-    if (a.receipt.after?.operationKind === 'location' && response.status === 200 && status === '')
+    if (a.receipt.after?.operationKind === 'location' && (response.status === 200 || response.status === 204) && status === '')
         return { status: 'ready' };
     return { status: 'pending', after };
 }
