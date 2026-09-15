@@ -41,6 +41,19 @@ export function defineProbeSchema(dependencies: Dependencies) {
     groupId: uuid("group_id").notNull().references(() => probeGroups.id, { onDelete: "cascade" }),
     probeId: uuid("probe_id").notNull().references(() => probeAgents.id, { onDelete: "cascade" }),
   }, t => [primaryKey({ columns: [t.groupId, t.probeId] })]);
+  // Survives config deletion and round retention; only the actual target owns its lifetime.
+  const probeRoundSequences = pgTable("probe_round_sequences", {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slotId: uuid("slot_id").references(dependencies.slotId, { onDelete: "cascade" }),
+    endpointId: uuid("endpoint_id").references(dependencies.endpointId, { onDelete: "cascade" }),
+    family: addressFamilyEnum("family").notNull(),
+    lastSequence: integer("last_sequence").notNull(),
+  }, t => [
+    check("probe_round_sequences_target", sql`num_nonnulls(${t.slotId}, ${t.endpointId}) = 1`),
+    check("probe_round_sequences_positive", sql`${t.lastSequence} > 0`),
+    uniqueIndex("probe_round_sequences_slot_unique").on(t.slotId).where(sql`${t.slotId} is not null`),
+    uniqueIndex("probe_round_sequences_endpoint_family_unique").on(t.endpointId, t.family).where(sql`${t.endpointId} is not null`),
+  ]);
   const probeRounds = pgTable("probe_rounds", {
     id: uuid("id").primaryKey().defaultRandom(),
     slotId: uuid("slot_id").references(dependencies.slotId, { onDelete: "cascade" }),
@@ -102,5 +115,5 @@ export function defineProbeSchema(dependencies: Dependencies) {
     measuredAt: time("measured_at").notNull(),
     receivedAt: time("received_at").notNull().defaultNow(),
   }, t => [index("probe_observations_round_idx").on(t.roundId), check("probe_observations_status", sql`${t.status} in ('accepted', 'stale')`), check("probe_observations_outcome", sql`${t.outcome} in ('success', 'failure', 'unavailable')`)]);
-  return { probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRounds, probeTasks, probeObservations };
+  return { probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRoundSequences, probeRounds, probeTasks, probeObservations };
 }

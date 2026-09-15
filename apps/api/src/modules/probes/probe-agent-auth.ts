@@ -6,8 +6,9 @@ import { DatabaseService } from "../../infrastructure/database.module.js";
 
 export type ProbeTransaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
 // Serialize runtime writes with revoke/re-enrollment, including requests authenticated earlier.
+// No key changes: allow task/member/token FK KEY SHARE checks to proceed.
 export async function lockActiveProbe(tx: ProbeTransaction, probeId: string, now: Date, tokenHash?: string) {
-  const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, probeId)).for("update");
+  const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, probeId)).for("no key update");
   if (!agent || !agent.enabled || agent.revokedAt) throw new UnauthorizedException("Probe is disabled or revoked");
   const [owner] = await tx.select().from(users).where(eq(users.id, agent.ownerUserId)).for("share");
   if (!owner || owner.status !== "active") throw new UnauthorizedException("Probe owner is disabled");

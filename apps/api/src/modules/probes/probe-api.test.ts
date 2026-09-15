@@ -10,7 +10,7 @@ import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
-import { eq } from 'drizzle-orm';
+import { eq, sql } from 'drizzle-orm';
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, managedAddressSlots, createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeTasks, probeObservations, probeTokens, probeGroups } from '@masterdns/db';
 import { hashToken } from '@masterdns/crypto';
 import { probeTaskSchema, type ProbeTask, type ProbeResult } from '@masterdns/contracts';
@@ -232,6 +232,12 @@ it('probes shared slots without anchor endpoints and rejects version zero, wrong
   const [replacement] = await leases.lease(f.probe.id, 1, now);
   expect(replacement).toMatchObject({ address: '192.0.2.12', addressVersion: 2 });
   expect(await results.accept(f.probe.id, result(replacement!), now)).toBe('accepted');
+  await connection.db.delete(healthCheckConfigs).where(eq(healthCheckConfigs.id, config!.id));
+  const [newConfig] = await connection.db.insert(healthCheckConfigs).values({ slotId: slot!.id, checkerType: 'tcp', config: f.config }).returning();
+  const third = await rounds.create(f.actor, { ...input, configId: newConfig!.id, addressVersion: 2 }, now);
+  expect(third.sequence).toBe(3);
+  await connection.db.delete(probeRounds).where(eq(probeRounds.id, third.id));
+  expect((await rounds.create(f.actor, { ...input, configId: newConfig!.id, addressVersion: 2 }, now)).sequence).toBe(4);
 });
 
 it('rolls back observation insertion when the terminal task write fails', async () => {
@@ -265,4 +271,76 @@ it('does not revive the fixed cohort after its group is deleted', async () => {
   const [task] = await leases.lease(f.probe.id, 1, now);
   await connection.db.delete(probeGroups).where(eq(probeGroups.id, group.id));
   expect(await results.accept(f.probe.id, result(task!), now)).toBe('stale');
+});
+
+async function waitForBlockedQuery(table: string, advisory: boolean) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const rows = await connection.client`select pid from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid() and wait_event_type = 'Lock' and query like ${`%"${table}"%`} and (${advisory} = false or wait_event = 'advisory')`;
+    if (rows.length) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`No blocked ${table} query observed`);
+}
+
+async function raceWithForeignKeyInsert(table: 'probe_tasks' | 'probe_group_members', probeId: string, waitingTable: string, writer: () => Promise<unknown>, runtime: () => Promise<unknown>) {
+  const gate = 897133;
+  await connection.client.unsafe(`create function probe_fk_gate() returns trigger language plpgsql as $$ begin if new.probe_id = '${probeId}'::uuid then perform pg_advisory_xact_lock(${gate}); end if; return new; end $$`);
+  await connection.client.unsafe(`create trigger probe_fk_gate before insert on ${table} for each row execute function probe_fk_gate()`);
+  const work: Promise<PromiseSettledResult<unknown>>[] = [];
+  const settle = (run: () => Promise<unknown>) => run().then(value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }));
+  try {
+    await connection.db.transaction(async tx => {
+      await tx.execute(sql`select pg_advisory_xact_lock(${gate})`);
+      work.push(settle(writer));
+      await waitForBlockedQuery(table, true);
+      work.push(settle(runtime));
+      await waitForBlockedQuery(waitingTable, false);
+    });
+    return await Promise.all(work);
+  } finally {
+    await Promise.all(work);
+    await connection.client.unsafe(`drop trigger probe_fk_gate on ${table}`);
+    await connection.client.unsafe('drop function probe_fk_gate()');
+  }
+}
+
+it.each(['lease', 'result'] as const)('round creation and %s do not deadlock on agent FK locks', async operation => {
+  const f = await fixture(); const group = await management.createGroup(f.actor, { name: 'Concurrent rounds' });
+  await management.setMembers(f.actor, group.id, [f.probe.id]);
+  const rounds = new ProbeRoundsService({ db: connection.db } as never);
+  const input = { endpointAddressId: f.address.id, configId: f.check.id, groupId: group.id, addressVersion: 1, consensus: { mode: 'all' as const, minimumValid: 1 }, deadline: new Date(now.getTime()+10000), resultExpiresAt: new Date(now.getTime()+60000) };
+  await rounds.create(f.actor, input, now);
+  const [task] = operation === 'result' ? await leases.lease(f.probe.id, 1, now) : [];
+  const attempts = await raceWithForeignKeyInsert('probe_tasks', f.probe.id, 'endpoint_addresses', () => rounds.create(f.actor, input, now), () => operation === 'lease' ? leases.lease(f.probe.id, 1, now) : results.accept(f.probe.id, result(task!), now));
+  expect(attempts.map(a => a.status)).toEqual(['fulfilled', 'fulfilled']);
+});
+
+it.each(['lease', 'result'] as const)('member replacement and %s do not deadlock on agent FK locks', async operation => {
+  const f = await fixture(); const group = await management.createGroup(f.actor, { name: 'Concurrent members' });
+  await management.setMembers(f.actor, group.id, [f.probe.id]);
+  const rounds = new ProbeRoundsService({ db: connection.db } as never);
+  await rounds.create(f.actor, { endpointAddressId: f.address.id, configId: f.check.id, groupId: group.id, addressVersion: 1, consensus: { mode: 'all', minimumValid: 1 }, deadline: new Date(now.getTime()+10000), resultExpiresAt: new Date(now.getTime()+60000) }, now);
+  const [task] = operation === 'result' ? await leases.lease(f.probe.id, 1, now) : [];
+  const attempts = await raceWithForeignKeyInsert('probe_group_members', f.probe.id, 'probe_groups', () => management.setMembers(f.actor, group.id, [f.probe.id, f.other.id]), () => operation === 'lease' ? leases.lease(f.probe.id, 1, now) : results.accept(f.probe.id, result(task!), now));
+  expect(attempts.map(a => a.status)).toEqual(['fulfilled', 'fulfilled']);
+});
+
+it('keeps endpoint/family sequences after config cascade deletion, round pruning, and address replacement', async () => {
+  const f = await fixture(); const group = await management.createGroup(f.actor, { name: 'Durable sequence' });
+  await management.setMembers(f.actor, group.id, [f.probe.id]);
+  const rounds = new ProbeRoundsService({ db: connection.db } as never);
+  const input = { endpointAddressId: f.address.id, configId: f.check.id, groupId: group.id, addressVersion: 1, consensus: { mode: 'all' as const, minimumValid: 1 }, deadline: new Date(now.getTime()+10000), resultExpiresAt: new Date(now.getTime()+60000) };
+  expect((await rounds.create(f.actor, input, now)).sequence).toBe(1);
+  await connection.db.delete(healthCheckConfigs).where(eq(healthCheckConfigs.id, f.check.id));
+  const [config] = await connection.db.insert(healthCheckConfigs).values({ endpointId: f.endpoint.id, checkerType: 'tcp', config: f.config }).returning();
+  const second = await rounds.create(f.actor, { ...input, configId: config!.id }, now);
+  expect(second.sequence).toBe(2);
+  await connection.db.delete(probeRounds).where(eq(probeRounds.id, second.id));
+  await connection.db.update(endpointAddresses).set({ state: 'previous' }).where(eq(endpointAddresses.id, f.address.id));
+  const [nextAddress] = await connection.db.insert(endpointAddresses).values({ endpointId: f.endpoint.id, family: '4', address: '192.0.2.99', state: 'current', source: 'static' }).returning();
+  const third = await rounds.create(f.actor, { ...input, configId: config!.id, endpointAddressId: nextAddress!.id, addressVersion: 2 }, now);
+  expect(third.sequence).toBe(3);
+  const [v6] = await connection.db.insert(endpointAddresses).values({ endpointId: f.endpoint.id, family: '6', address: '2001:db8::1', state: 'current', source: 'static' }).returning();
+  expect((await rounds.create(f.actor, { ...input, configId: config!.id, endpointAddressId: v6!.id }, now)).sequence).toBe(1);
 });

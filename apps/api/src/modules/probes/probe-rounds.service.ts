@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { BadRequestException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { consensusPolicySchema, probeTaskSchema, type ConsensusPolicy, type ProbeTask } from "@masterdns/contracts";
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeRounds, probeTasks } from "@masterdns/db";
-import { and, eq, max } from "drizzle-orm";
+import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeRoundSequences, probeRounds, probeTasks } from "@masterdns/db";
+import { and, eq } from "drizzle-orm";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 
@@ -69,8 +69,12 @@ export class ProbeRoundsService {
       const memberIds = members.map(m => m.probeId).sort();
       if (consensus.minimumValid > memberIds.length || (consensus.mode === "at_least" && consensus.failureVotes! > memberIds.length) || (consensus.mode === "specified" && !memberIds.includes(consensus.specifiedProbeId!))) throw new BadRequestException("Invalid consensus for cohort");
       const payload = probeTaskSchema.parse({ protocol: "probe-agent/v1", taskId: randomUUID(), roundId: randomUUID(), probeId: memberIds[0], leaseId: randomUUID(), addressVersion: input.addressVersion, configVersion: config.revision, address, family: Number(family), config: config.config, deadline: input.deadline.toISOString(), ...(input.hostname ? { hostname: input.hostname } : {}), ...(input.networkPolicy ? { networkPolicy: input.networkPolicy } : {}) });
-      const [previous] = await tx.select({ sequence: max(probeRounds.sequence) }).from(probeRounds).where(input.slotId ? eq(probeRounds.slotId, input.slotId) : and(eq(probeRounds.endpointId, endpointId!), eq(probeRounds.family, family)));
-      const [round] = await tx.insert(probeRounds).values({ slotId: input.slotId, endpointId, endpointAddressId: input.endpointAddressId, configId: config.id, groupId: group.id, groupRevision: group.revision, sequence: (previous?.sequence ?? 0) + 1, addressVersion: input.addressVersion, configVersion: config.revision, address, family, hostname: payload.hostname, config: payload.config, networkPolicy: payload.networkPolicy, memberIds, consensus, deadline: input.deadline, resultExpiresAt: input.resultExpiresAt, createdAt: now }).returning();
+      const [counter] = await tx.select().from(probeRoundSequences).where(input.slotId ? eq(probeRoundSequences.slotId, input.slotId) : and(eq(probeRoundSequences.endpointId, endpointId!), eq(probeRoundSequences.family, family)));
+      const sequence = (counter?.lastSequence ?? 0) + 1;
+      // The target row is already locked, so allocation and round creation are one transaction.
+      if (counter) await tx.update(probeRoundSequences).set({ lastSequence: sequence }).where(eq(probeRoundSequences.id, counter.id));
+      else await tx.insert(probeRoundSequences).values({ slotId: input.slotId, endpointId, family, lastSequence: sequence });
+      const [round] = await tx.insert(probeRounds).values({ slotId: input.slotId, endpointId, endpointAddressId: input.endpointAddressId, configId: config.id, groupId: group.id, groupRevision: group.revision, sequence, addressVersion: input.addressVersion, configVersion: config.revision, address, family, hostname: payload.hostname, config: payload.config, networkPolicy: payload.networkPolicy, memberIds, consensus, deadline: input.deadline, resultExpiresAt: input.resultExpiresAt, createdAt: now }).returning();
       await tx.insert(probeTasks).values(memberIds.map(probeId => ({ roundId: round!.id, probeId, createdAt: now })));
       return round!;
     });

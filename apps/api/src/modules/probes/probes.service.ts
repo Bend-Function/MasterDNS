@@ -20,7 +20,7 @@ export class ProbesService {
   }
   async update(actor: AuthUser, id: string, input: { name?: string | undefined; maxConcurrency?: number | undefined; enabled?: boolean | undefined }) {
     return this.database.db.transaction(async tx => {
-      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("update");
+      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("no key update");
       if (!agent || (actor.role !== "admin" && agent.ownerUserId !== actor.id)) throw new NotFoundException("Probe not found");
       const [updated] = await tx.update(probeAgents).set({ ...input, updatedAt: new Date() }).where(eq(probeAgents.id, id)).returning();
       return updated!;
@@ -30,7 +30,7 @@ export class ProbesService {
     const installToken = createOpaqueToken(32);
     const expiresAt = new Date(now.getTime() + 15 * 60_000);
     await this.database.db.transaction(async tx => {
-      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("update");
+      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("no key update");
       if (!agent || (actor.role !== "admin" && agent.ownerUserId !== actor.id)) throw new NotFoundException("Probe not found");
       await tx.update(probeTokens).set({ revokedAt: now }).where(and(eq(probeTokens.probeId, id), eq(probeTokens.kind, "install"), isNull(probeTokens.revokedAt)));
       await tx.update(probeAgents).set({ enabled: true, revokedAt: null, updatedAt: now }).where(eq(probeAgents.id, id));
@@ -41,7 +41,7 @@ export class ProbesService {
   }
   async revoke(actor: AuthUser, id: string, now = new Date()) {
     return this.database.db.transaction(async tx => {
-      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("update");
+      const [agent] = await tx.select().from(probeAgents).where(eq(probeAgents.id, id)).for("no key update");
       if (!agent || (actor.role !== "admin" && agent.ownerUserId !== actor.id)) throw new NotFoundException("Probe not found");
       await tx.update(probeTokens).set({ revokedAt: now }).where(and(eq(probeTokens.probeId, id), isNull(probeTokens.revokedAt)));
       const [revoked] = await tx.update(probeAgents).set({ enabled: false, revokedAt: now, updatedAt: now }).where(eq(probeAgents.id, id)).returning();
