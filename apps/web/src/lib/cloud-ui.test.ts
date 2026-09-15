@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AddressSlot, CloudAuthorization } from "./cloud-types";
-import { authorizationPayload, selectableCloudSlots, submitCloudIntent } from "./cloud-ui";
+import { authorizationPayload, loadCloudScopes, loadVisibleInstanceAddresses, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
 import { createIntentKey } from "./intent-key";
 
 const slot = (overrides: Partial<AddressSlot> = {}): AddressSlot => ({
@@ -45,13 +45,57 @@ describe("cloud source selection", () => {
     expect(selectableCloudSlots("AAAA", [slot(), v6]).map((entry) => entry.slot.id)).toEqual(["slot-v6"]);
   });
 
-  it("does not offer slots that are out of scope, absent, disabled, unmanaged, or technically unavailable", () => {
-    const unavailable = slot({ capability: { available: false, reason: "primary_ipv6_immutable", permission: "unverified", requiresStop: false, releasesOldAddress: false, canRestoreOldAddress: false } });
-
-    expect(selectableCloudSlots("A", [slot(), slot({ inScope: false }), unavailable], { accountEnabled: true, instancePresent: true, managed: true })).toHaveLength(1);
+  it("does not offer slots that are out of scope, absent, disabled, or unmanaged", () => {
+    expect(selectableCloudSlots("A", [slot(), slot({ inScope: false })], { accountEnabled: true, instancePresent: true, managed: true })).toHaveLength(1);
     expect(selectableCloudSlots("A", [slot()], { accountEnabled: false, instancePresent: true, managed: true })).toEqual([]);
     expect(selectableCloudSlots("A", [slot()], { accountEnabled: true, instancePresent: false, managed: true })).toEqual([]);
     expect(selectableCloudSlots("A", [slot()], { accountEnabled: true, instancePresent: true, managed: false })).toEqual([]);
+  });
+
+  it("allows an immutable primary IPv6 slot to be bound for monitoring without granting rotation", () => {
+    const immutable = slot({
+      slot: { id: "slot-v6", interfaceId: "interface-1", family: "6", name: "primary-v6", currentAddressId: "address-2", currentVersion: 1 },
+      currentAddress: { id: "address-2", address: "2001:db8::10", family: "6" },
+      capability: { available: false, reason: "primary_ipv6_immutable", permission: "unverified", requiresStop: false, releasesOldAddress: false, canRestoreOldAddress: false },
+    });
+
+    expect(selectableCloudSlots("AAAA", [immutable]).map((entry) => entry.slot.id)).toEqual(["slot-v6"]);
+  });
+
+  it("limits takeover to a slot whose canonical address matches the existing record", () => {
+    const compressed = slot({
+      slot: { id: "slot-v6", interfaceId: "interface-1", family: "6", name: "public-v6", currentAddressId: "address-2", currentVersion: 1 },
+      currentAddress: { id: "address-2", address: "2001:db8::1", family: "6" },
+    });
+
+    expect(slotsMatchingExistingRecord("AAAA", "2001:0db8:0:0:0:0:0:1", [compressed]).map((entry) => entry.slot.id)).toEqual(["slot-v6"]);
+    expect(slotsMatchingExistingRecord("AAAA", "2001:db8::2", [compressed])).toEqual([]);
+  });
+});
+
+describe("cloud inventory loading", () => {
+  it("preserves successful account scopes and reports failures by account", async () => {
+    const result = await loadCloudScopes([{ id: "account-1" }, { id: "account-2" }], async (id) => {
+      if (id === "account-2") throw new Error("scope unavailable");
+      return [{ id: "scope-1" }] as never[];
+    });
+
+    expect(result.scopes).toEqual({ "account-1": [{ id: "scope-1" }] });
+    expect(result.errors).toEqual({ "account-2": "scope unavailable" });
+  });
+
+  it("loads addresses only for the bounded visible rows and keeps row errors", async () => {
+    const requested: string[] = [];
+    const rows = Array.from({ length: 9 }, (_, index) => ({ instance: { id: `instance-${index}` } })) as never[];
+    const result = await loadVisibleInstanceAddresses(rows, 3, async (id) => {
+      requested.push(id);
+      if (id === "instance-1") throw new Error("detail unavailable");
+      return [{ id: `address-${id}` }] as never[];
+    });
+
+    expect(requested).toEqual(["instance-0", "instance-1", "instance-2"]);
+    expect(result.errors).toEqual({ "instance-1": "detail unavailable" });
+    expect(Object.keys(result.addresses)).toEqual(["instance-0", "instance-2"]);
   });
 });
 

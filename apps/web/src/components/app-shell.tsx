@@ -23,9 +23,8 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { API_URL, api, UI_PREVIEW } from "../lib/api";
-import { demoUser } from "../lib/demo";
-import type { User } from "../lib/types";
 import { getFocusWrapIndex, IconButton } from "./ui";
+import { useSession } from "./session-context";
 
 const MOBILE_NAV_QUERY = "(max-width: 760px)";
 const MOBILE_NAV_FOCUSABLE = "a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])";
@@ -50,16 +49,12 @@ const navigation = [
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const [user, setUser] = useState<User | null>(UI_PREVIEW ? demoUser : null);
-  const [checking, setChecking] = useState(!UI_PREVIEW);
+  const { user, checking } = useSession();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(false);
   const sidebarRef = useRef<HTMLElement>(null);
 
-  useEffect(() => {
-    if (UI_PREVIEW) return;
-    api<User>("/v1/auth/me").then(setUser).catch(() => router.replace("/login")).finally(() => setChecking(false));
-  }, [router]);
+  useEffect(() => { if (!checking && !user) router.replace("/login"); }, [checking, router, user]);
 
   useEffect(() => {
     if (UI_PREVIEW || !user) return;

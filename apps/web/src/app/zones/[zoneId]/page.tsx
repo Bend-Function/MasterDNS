@@ -59,6 +59,7 @@ export default function ZoneRecordsPage() {
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [source, setSource] = useState<"manual" | "cloud">("manual");
   const [cloudSlotId, setCloudSlotId] = useState("");
+  const [takeoverConfirmed, setTakeoverConfirmed] = useState(false);
   const saveIntentKey = useRef(createIntentKey());
   const deleteIntentKey = useRef(createIntentKey());
   const records = useMemo(() => (data ?? []).filter((record) => `${record.name} ${record.type} ${record.content}`.toLowerCase().includes(search.toLowerCase())), [data, search]);
@@ -70,6 +71,7 @@ export default function ZoneRecordsPage() {
     setActionNotice(null);
     setSource("manual");
     setCloudSlotId("");
+    setTakeoverConfirmed(false);
     setEditing(record ?? "new");
     setDraft(record ? {
       type: record.type,
@@ -91,6 +93,7 @@ export default function ZoneRecordsPage() {
     try {
       if (source === "cloud") {
         if (!cloudSlotId || !["A", "AAAA"].includes(draft.type)) throw new Error("请选择匹配地址族的云地址槽位");
+        if (editing !== "new" && !takeoverConfirmed) throw new Error("请确认将现有记录转换为 Pool 受管记录");
         if (!UI_PREVIEW) {
           const result = await submitCloudIntent(saveIntentKey.current, (key) => api<{ awaitingExternalVerification: boolean }>(`/v1/address-slots/${cloudSlotId}/bindings`, {
             method: "POST",
@@ -209,13 +212,14 @@ export default function ZoneRecordsPage() {
       </tr>)}</tbody>
     </table></div>}
 
-    <Dialog open={editing !== null} title={editing === "new" ? "添加 DNS 记录" : "编辑 DNS 记录"} onClose={() => setEditing(null)} footer={<><Button variant="secondary" onClick={() => setEditing(null)}>取消</Button><Button type="submit" form="record-form" disabled={saving}>{saving ? "提交中" : "提交变更"}</Button></>}>
+    <Dialog open={editing !== null} title={editing === "new" ? "添加 DNS 记录" : "编辑 DNS 记录"} onClose={() => setEditing(null)} footer={<><Button variant="secondary" onClick={() => setEditing(null)}>取消</Button><Button type="submit" form="record-form" disabled={saving || (source === "cloud" && editing !== "new" && !takeoverConfirmed)}>{saving ? "提交中" : "提交变更"}</Button></>}>
       <form id="record-form" className="field-grid" onSubmit={save}>
-        <Field label="记录类型"><select value={draft.type} onChange={(event) => { setDraft({ ...draft, type: event.target.value }); setCloudSlotId(""); if (!["A", "AAAA"].includes(event.target.value)) setSource("manual"); }}>{["A", "AAAA", "CNAME", "TXT", "MX", "CAA", "SRV", "NS"].map((type) => <option key={type}>{type}</option>)}</select></Field>
+        <Field label="记录类型"><select value={draft.type} disabled={source === "cloud" && editing !== "new"} onChange={(event) => { setDraft({ ...draft, type: event.target.value }); setCloudSlotId(""); if (!["A", "AAAA"].includes(event.target.value)) setSource("manual"); }}>{["A", "AAAA", "CNAME", "TXT", "MX", "CAA", "SRV", "NS"].map((type) => <option key={type}>{type}</option>)}</select></Field>
         <Field label={source === "cloud" ? "TTL（由绑定策略管理）" : "TTL"}><input type="number" min={1} max={86400} value={draft.ttl} disabled={source === "cloud"} onChange={(event) => setDraft({ ...draft, ttl: Number(event.target.value) })} /></Field>
-        <Field label="名称"><input placeholder="api 或完整域名" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></Field>
-        {["A", "AAAA"].includes(draft.type) && <Field label="地址来源"><select value={source} onChange={(event) => { setSource(event.target.value as "manual" | "cloud"); setCloudSlotId(""); }}><option value="manual">手工地址</option><option value="cloud">云实例地址槽位</option></select></Field>}
-        {source === "cloud" && ["A", "AAAA"].includes(draft.type) ? <CloudSourcePicker recordType={draft.type as "A" | "AAAA"} {...(zone?.ownerUserId ? { ownerUserId: zone.ownerUserId } : {})} value={cloudSlotId} onChange={setCloudSlotId} /> : <Field label="内容"><input className="mono" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required /></Field>}
+        <Field label="名称"><input placeholder="api 或完整域名" value={draft.name} disabled={source === "cloud" && editing !== "new"} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></Field>
+        {["A", "AAAA"].includes(draft.type) && <Field label="地址来源"><select value={source} onChange={(event) => { setSource(event.target.value as "manual" | "cloud"); setCloudSlotId(""); setTakeoverConfirmed(false); }}><option value="manual">手工地址</option><option value="cloud">云实例地址槽位</option></select></Field>}
+        {source === "cloud" && ["A", "AAAA"].includes(draft.type) ? <CloudSourcePicker recordType={draft.type as "A" | "AAAA"} {...(zone?.ownerUserId ? { ownerUserId: zone.ownerUserId } : {})} {...(editing && editing !== "new" ? { existingAddress: editing.content } : {})} value={cloudSlotId} onChange={setCloudSlotId} /> : <Field label="内容"><input className="mono" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required /></Field>}
+        {source === "cloud" && editing && editing !== "new" && <label className="check-row span-2"><input type="checkbox" checked={takeoverConfirmed} onChange={(event) => setTakeoverConfirmed(event.target.checked)} /><span><strong>确认接管现有记录</strong><small>记录名称和类型保持不变；地址必须与所选槽位一致。接管后该记录转换为 Pool 受管，后续需在 IP Pool 中修改。</small></span></label>}
         {["MX", "SRV"].includes(draft.type) && <Field label="优先级"><input type="number" min={0} max={65535} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} /></Field>}
         {source === "manual" && provider === "cloudflare" && ["A", "AAAA", "CNAME"].includes(draft.type) && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={draft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setDraft({ ...draft, proxied })} /></div>}
         {source === "manual" && provider === "aliyun" && <><Field label="解析线路"><input value={draft.aliLine} onChange={(event) => setDraft({ ...draft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={draft.aliWeight} onChange={(event) => setDraft({ ...draft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={draft.aliStatus} onChange={(event) => setDraft({ ...draft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
