@@ -9,6 +9,7 @@ import type { AuthUser } from "../../auth/auth.types.js";
 import { env } from "../../config/env.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
+import { cloudRequestKey, withCloudRequest } from "./cloud-idempotency.js";
 import type { CloudAuthorizationInput, CloudCredentialsUpdateInput, CreateCloudAccountInput } from "./cloud.schemas.js";
 
 type Account = typeof cloudAccounts.$inferSelect;
@@ -26,19 +27,28 @@ export class CloudService {
     return accounts.map(publicCloudAccount);
   }
 
-  async create(actor: AuthUser, input: CreateCloudAccountInput) {
+  async create(actor: AuthUser, input: CreateCloudAccountInput, idempotencyKey: string) {
+    const key = cloudRequestKey(idempotencyKey);
     const ownerUserId = input.ownerUserId ?? actor.id;
     if (actor.role !== "admin" && ownerUserId !== actor.id) throw new ForbiddenException("Cannot create an account for another user");
     this.assertCredentials(actor, input.credentials);
     const [owner] = await this.database.db.select({ id: users.id }).from(users).where(eq(users.id, ownerUserId)).limit(1);
     if (!owner) throw new NotFoundException("Account owner not found");
-    const id = randomUUID();
-    const { externalAccountId } = await createCloudAdapter({ accountId: id, service: "ec2", credentials: input.credentials as AwsCredentials }).verifyIdentity();
     return this.database.db.transaction(async (tx) => {
-      const [account] = await tx.insert(cloudAccounts).values({ id, ownerUserId, externalAccountId, name: input.name, provider: input.provider, regions: input.regions ?? null, ...this.encryptedCredentials(input.credentials) }).returning();
-      if (!account) throw new Error("Cloud account insert returned no row");
-      await tx.insert(auditLogs).values({ ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_account.create", resourceType: "cloud_account", resourceId: account.id, afterSnapshot: publicCloudAccount(account) });
-      return publicCloudAccount(account);
+      const result = await withCloudRequest(tx, {
+        key, actorUserId: actor.id, ownerUserId, action: "account.create",
+        request: { ...input, ownerUserId, regions: input.regions ? [...input.regions].sort() : null },
+      }, async () => {
+        const id = randomUUID();
+        const { externalAccountId } = await createCloudAdapter({ accountId: id, service: "ec2", credentials: input.credentials as AwsCredentials }).verifyIdentity();
+        const [account] = await tx.insert(cloudAccounts).values({ id, ownerUserId, externalAccountId, name: input.name, provider: input.provider, regions: input.regions ?? null, ...this.encryptedCredentials(input.credentials) }).returning();
+        if (!account) throw new Error("Cloud account insert returned no row");
+        await tx.insert(auditLogs).values({ ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_account.create", resourceType: "cloud_account", resourceId: account.id, afterSnapshot: publicCloudAccount(account) });
+        return publicCloudAccount(account);
+      });
+      const [accessible] = await tx.select({ id: cloudAccounts.id }).from(cloudAccounts).where(and(eq(cloudAccounts.id, result.id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).limit(1);
+      if (!accessible) throw new NotFoundException("Cloud account not found");
+      return result;
     });
   }
 
@@ -163,6 +173,7 @@ export class CloudService {
       const [before] = await tx.select().from(cloudAccounts).where(and(eq(cloudAccounts.id, id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).for("update");
       if (!before) throw new NotFoundException("Cloud account not found");
       if (expectedCredentialCiphertext !== undefined && before.credentialCiphertext !== expectedCredentialCiphertext) throw new ConflictException("Cloud credentials changed; retry verification");
+      if (fields.externalAccountId !== undefined && before.externalAccountId !== null && before.externalAccountId !== fields.externalAccountId) throw new ConflictException("AWS account identity changed during credential verification");
       const [after] = await tx.update(cloudAccounts).set({ ...fields, updatedAt: new Date() }).where(eq(cloudAccounts.id, id)).returning();
       await tx.insert(auditLogs).values({ ownerUserId: before.ownerUserId, actorUserId: actor.id, source: "user", action, resourceType: "cloud_account", resourceId: id, beforeSnapshot: publicCloudAccount(before), afterSnapshot: publicCloudAccount(after!) });
       return publicCloudAccount(after!);

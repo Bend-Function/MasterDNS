@@ -34,6 +34,16 @@ type CloudSchemaDependencies = {
 };
 
 export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
+  const cloudApiRequests = pgTable("cloud_api_requests", {
+    key: varchar("key", { length: 255 }).primaryKey(),
+    actorUserId: uuid("actor_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
+    ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
+    action: varchar("action", { length: 40 }).notNull(),
+    requestHash: varchar("request_hash", { length: 64 }).notNull(),
+    response: jsonb("response").$type<unknown>(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  });
+
   const cloudAccounts = pgTable("cloud_accounts", {
     id: uuid("id").primaryKey().defaultRandom(),
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
@@ -174,5 +184,5 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     check("cloud_endpoint_links_family_valid", sql`${table.family} in ('4', '6')`),
   ]);
 
-  return { cloudAccounts, cloudScanScopes, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, instanceAuthorizations, cloudEndpointLinks };
+  return { cloudApiRequests, cloudAccounts, cloudScanScopes, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, instanceAuthorizations, cloudEndpointLinks };
 }

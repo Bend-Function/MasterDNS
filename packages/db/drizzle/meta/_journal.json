@@ -92,6 +92,13 @@
       "when": 1789439434356,
       "tag": "0012_short_crystal",
       "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1789440468219,
+      "tag": "0013_strong_thundra",
+      "breakpoints": true
     }
   ]
 }

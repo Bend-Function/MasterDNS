@@ -154,6 +154,7 @@ export const endpoints = pgTable("endpoints", {
 ]);
 
 export const {
+  cloudApiRequests,
   cloudAccounts,
   cloudScanScopes,
   cloudInstances,

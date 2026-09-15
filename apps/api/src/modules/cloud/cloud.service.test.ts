@@ -7,12 +7,17 @@ import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, users, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 
+const identityHook = vi.hoisted(() => ({ run: undefined as (() => Promise<void>) | undefined }));
 vi.mock("@masterdns/cloud-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("@masterdns/cloud-providers")>(),
-  createCloudAdapter: ({ credentials }: { credentials: { accessKeyId?: string } }) => ({ verifyIdentity: async () => ({ externalAccountId: credentials.accessKeyId?.startsWith("other-") ? "999999999999" : "123456789012" }) }),
+  createCloudAdapter: ({ credentials }: { credentials: { accessKeyId?: string } }) => ({ verifyIdentity: async () => {
+    if (credentials.accessKeyId === "rotated-access-key" || credentials.accessKeyId === "request-access-key") await identityHook.run?.();
+    return { externalAccountId: credentials.accessKeyId?.startsWith("other-") ? "999999999999" : "123456789012" };
+  } }),
 }));
 vi.mock("../../config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { CloudService } from "./cloud.service.js";
+import { CloudController } from "./cloud.controller.js";
 import { CloudBindingsService } from "./cloud-bindings.service.js";
 import { DnsService } from "../dns/dns.service.js";
 import { OperationsService } from "../operations/operations.service.js";
@@ -23,6 +28,8 @@ let connection: ReturnType<typeof createDatabase>;
 let service: CloudService;
 let bindings: CloudBindingsService;
 let redis: Redis;
+const create = (actor: AuthUser, input: Parameters<CloudService["create"]>[1], key = randomUUID()) => service.create(actor, input, key);
+const bind = (actor: AuthUser, input: Parameters<CloudBindingsService["bind"]>[1], key = randomUUID()) => bindings.bind(actor, input, key);
 const queue = { cloudSync: { add: vi.fn().mockResolvedValue({}) } };
 
 beforeAll(async () => {
@@ -48,7 +55,7 @@ afterAll(async () => {
 async function fixture() {
   const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
   const actor = { id: owner!.id, role: "user" } as AuthUser;
-  const account = await service.create(actor, { name: "AWS", provider: "aws", credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } });
+  const account = await create(actor, { name: "AWS", provider: "aws", credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } });
   const [scope] = await connection.db.insert(cloudScanScopes).values({ accountId: account.id, service: "ec2", region: "us-east-1", generation: 1 }).returning();
   const [instance] = await connection.db.insert(cloudInstances).values({ accountId: account.id, service: "ec2", region: "us-east-1", externalId: "i-test", scanGeneration: 1 }).returning();
   const [iface] = await connection.db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: "eni-test", scanGeneration: 1 }).returning();
@@ -71,7 +78,7 @@ describe("cloud account and authorization API", () => {
     expect(account).not.toHaveProperty("credentialCiphertext");
     const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, account.id));
     expect(stored!.credentialCiphertext).not.toContain("test-secret-access-key");
-    await expect(service.create(actor, { name: "ambient", provider: "aws", credentials: { kind: "role" } })).rejects.toMatchObject({ status: 403 });
+    await expect(create(actor, { name: "ambient", provider: "aws", credentials: { kind: "role" } })).rejects.toMatchObject({ status: 403 });
     await expect(service.rotateCredentials(actor, account.id, { credentials: { kind: "role", roleArn: "arn:aws:iam::123456789012:role/test" } })).rejects.toMatchObject({ status: 403 });
   });
   it("pins AWS account identity and rejects credentials for a different AWS account", async () => {
@@ -80,6 +87,22 @@ describe("cloud account and authorization API", () => {
     await expect(service.rotateCredentials(f.actor, f.account.id, { credentials: { kind: "access_key", accessKeyId: "other-access-key", secretAccessKey: "other-secret-access-key" } })).rejects.toMatchObject({ status: 409 });
     const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
     expect(stored!.externalAccountId).toBe("123456789012");
+  });
+  it("rejects a concurrent first runtime identity pin during credential verification", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudAccounts).set({ externalAccountId: null }).where(eq(cloudAccounts.id, f.account.id));
+    const [before] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+    identityHook.run = async () => {
+      await connection.db.transaction(async (tx) => {
+        await tx.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id)).for("update");
+        await tx.update(cloudAccounts).set({ externalAccountId: "999999999999" }).where(eq(cloudAccounts.id, f.account.id));
+      });
+    };
+    try {
+      await expect(service.rotateCredentials(f.actor, f.account.id, { credentials: { kind: "access_key", accessKeyId: "rotated-access-key", secretAccessKey: "rotated-secret-access-key" } })).rejects.toMatchObject({ status: 409 });
+      const [after] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+      expect(after).toMatchObject({ externalAccountId: "999999999999", credentialCiphertext: before!.credentialCiphertext });
+    } finally { identityHook.run = undefined; }
   });
   it("reports capabilities for the exact selected address and keeps IAM permission unverified", async () => {
     const f = await fixture();
@@ -95,7 +118,7 @@ describe("cloud account and authorization API", () => {
     expect(account.regions).toEqual(["ap-southeast-2"]);
     expect((await service.instances(f.actor, f.account.id))[0]).toMatchObject({ inScope: false });
     await expect(service.authorize(f.actor, f.instance.id, { managed: true, revision: 0 })).rejects.toMatchObject({ status: 409 });
-    await expect(bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
   });
   it("allows management with all automatic actions disabled", async () => {
     const { actor, instance } = await fixture();
@@ -122,28 +145,28 @@ describe("cloud account and authorization API", () => {
 describe("cloud DNS binding", () => {
   it("creates a fresh linked cloud endpoint without publishing scanned addresses", async () => {
     const f = await fixture();
-    const result = await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
+    const result = await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
     expect(result.binding.fqdn).toBe("www.example.com");
     expect(result.endpoint.addressMode).toBe("cloud");
     expect(await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId, result.endpoint.id))).toEqual([]);
-    await expect(bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www.example.com.", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "www.example.com.", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
     expect(await connection.db.select().from(endpointPools).where(eq(endpointPools.ownerUserId, f.actor.id))).toHaveLength(1);
   });
   it("rejects binding while an earlier DNS write for the same RRset is pending", async () => {
     const f = await fixture();
     const operations = new OperationsService({ db: connection.db } as never, { operations: { add: async () => ({}) } } as never);
     await operations.createDnsOperation({ ownerUserId: f.actor.id, actorUserId: f.actor.id, source: "user", idempotencyKey: randomUUID(), providerAccountId: f.zone.providerAccountId, zoneId: f.zone.id, zoneExternalId: f.zone.externalId, action: "create", record: { name: "www.example.com", type: "A", content: f.address.address, ttl: 60, providerMetadata: {} } });
-    await expect(bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 409 });
   });
   it("blocks generic DNS creation while an unverified cloud binding owns the name", async () => {
     const f = await fixture();
-    await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
+    await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
     const dns = new DnsService({ db: connection.db } as never, {} as never, { createDnsOperation: async () => ({ created: true }) } as never);
     await expect(dns.createRecord(f.actor, f.zone.id, { name: "www", type: "A", content: "192.0.2.99", ttl: 60, providerMetadata: {} })).rejects.toMatchObject({ status: 409 });
   });
   it("rejects a new operation enqueued after the cloud claim", async () => {
     const f = await fixture();
-    await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
+    await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
     const operations = new OperationsService({ db: connection.db } as never, { operations: { add: async () => ({}) } } as never);
     await expect(operations.createDnsOperation({ ownerUserId: f.actor.id, actorUserId: f.actor.id, source: "user", idempotencyKey: randomUUID(), providerAccountId: f.zone.providerAccountId, zoneId: f.zone.id, zoneExternalId: f.zone.externalId, action: "create", record: { name: "www.example.com", type: "A", content: f.address.address, ttl: 60, providerMetadata: {} } })).rejects.toMatchObject({ status: 409 });
   });
@@ -151,7 +174,7 @@ describe("cloud DNS binding", () => {
     const f = await fixture();
     const operations = new OperationsService({ db: connection.db } as never, { operations: { add: async () => ({}) } } as never);
     const results = await Promise.allSettled([
-      bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false }),
+      bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false }),
       operations.createDnsOperation({ ownerUserId: f.actor.id, actorUserId: f.actor.id, source: "user", idempotencyKey: randomUUID(), providerAccountId: f.zone.providerAccountId, zoneId: f.zone.id, zoneExternalId: f.zone.externalId, action: "create", record: { name: "www.example.com", type: "A", content: f.address.address, ttl: 60, providerMetadata: {} } }),
     ]);
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
@@ -159,25 +182,102 @@ describe("cloud DNS binding", () => {
   });
   it("reuses an explicitly selected pool endpoint for the same slot", async () => {
     const f = await fixture();
-    const first = await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
-    const second = await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "other", recordType: "A", slotId: f.slot.id, poolId: first.pool.id, takeoverExisting: false });
+    const first = await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false });
+    const second = await bind(f.actor, { zoneId: f.zone.id, fqdn: "other", recordType: "A", slotId: f.slot.id, poolId: first.pool.id, takeoverExisting: false });
     expect(second.endpoint.id).toBe(first.endpoint.id);
     expect(second.pool.id).toBe(first.pool.id);
   });
   it("keeps same-address takeover visible without declaring it externally verified", async () => {
     const f = await fixture();
     const [record] = await connection.db.insert(dnsRecords).values({ zoneId: f.zone.id, externalId: "record", type: "A", name: "www.example.com", content: f.address.address, ttl: 300, remoteHash: "existing" }).returning();
-    const result = await bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: true });
+    const result = await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: true });
     expect(result.binding.ttl).toBe(300);
     const [claimed] = await connection.db.select().from(dnsRecords).where(eq(dnsRecords.id, record!.id));
     expect(claimed).toMatchObject({ content: f.address.address, management: "managed", managedByPoolId: result.pool.id });
     expect(await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId, result.endpoint.id))).toEqual([]);
   });
+  it("takes over equivalent expanded IPv6 notation without changing existing DNS content", async () => {
+    const f = await fixture();
+    const [address] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "6", address: "2001:db8::abcd", origin: "user", scanGeneration: 1 }).returning();
+    const [slot] = await connection.db.insert(managedAddressSlots).values({ interfaceId: f.iface.id, family: "6", name: "v6", currentAddressId: address!.id }).returning();
+    const content = "2001:0DB8:0000:0000:0000:0000:0000:ABCD";
+    const [record] = await connection.db.insert(dnsRecords).values({ zoneId: f.zone.id, externalId: "v6-record", type: "AAAA", name: "www.example.com", content, ttl: 300, remoteHash: "existing" }).returning();
+    const result = await bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "AAAA", slotId: slot!.id, takeoverExisting: true });
+    expect(result.binding.recordType).toBe("AAAA");
+    const [claimed] = await connection.db.select().from(dnsRecords).where(eq(dnsRecords.id, record!.id));
+    expect(claimed).toMatchObject({ content, management: "managed", managedByPoolId: result.pool.id });
+    expect(await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId, result.endpoint.id))).toEqual([]);
+  });
   it("rejects takeover of a different address and cross-owner slots", async () => {
     const f = await fixture(); const other = await fixture();
     await connection.db.insert(dnsRecords).values({ zoneId: f.zone.id, externalId: "record", type: "A", name: "www.example.com", content: "192.0.2.99", ttl: 60, remoteHash: "existing" });
-    await expect(bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: true })).rejects.toMatchObject({ status: 409 });
-    await expect(bindings.bind(f.actor, { zoneId: f.zone.id, fqdn: "other", recordType: "A", slotId: other.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 404 });
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: true })).rejects.toMatchObject({ status: 409 });
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "other", recordType: "A", slotId: other.slot.id, takeoverExisting: false })).rejects.toMatchObject({ status: 404 });
     expect(await connection.db.select().from(domainBindings).where(eq(domainBindings.zoneId, f.zone.id))).toEqual([]);
+  });
+});
+
+
+describe("cloud request idempotency", () => {
+  it("requires a client Idempotency-Key on both creation routes", () => {
+    const controller = new CloudController({} as never, {} as never);
+    expect(() => controller.create({} as never, {} as never, undefined)).toThrow("Idempotency-Key is required");
+    expect(() => controller.bind({} as never, randomUUID(), {} as never, undefined)).toThrow("Idempotency-Key is required");
+  });
+  it("replays concurrent account creation and rejects a changed request without persisting credentials", async () => {
+    const f = await fixture();
+    const key = randomUUID();
+    const input = { name: "Idempotent", provider: "aws" as const, regions: ["us-east-1", "ap-southeast-2"], credentials: { kind: "access_key" as const, accessKeyId: "request-access-key", secretAccessKey: "request-secret-access-key" } };
+    let verifications = 0;
+    identityHook.run = async () => { verifications++; };
+    const [first, replay] = await Promise.all([create(f.actor, input, key), create(f.actor, { ...input, regions: [...input.regions].reverse() }, key)]);
+    expect(verifications).toBe(1);
+    identityHook.run = undefined;
+    expect(replay).toEqual(first);
+    await connection.db.update(cloudAccounts).set({ name: "Edited after creation" }).where(eq(cloudAccounts.id, first.id));
+    const restartedService = new CloudService({ db: connection.db } as never, queue as never);
+    expect(await restartedService.create(f.actor, input, key)).toEqual(first);
+    expect(await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.ownerUserId, f.actor.id))).toHaveLength(2);
+    await expect(create(f.actor, { ...input, credentials: { ...input.credentials, secretAccessKey: "changed-secret-access-key" } }, key)).rejects.toMatchObject({ status: 409 });
+    const receipts = await connection.client.unsafe("select row_to_json(r)::text as payload from cloud_api_requests r where key = $1", [key]);
+    expect(receipts).toHaveLength(1);
+    expect(receipts[0]!.payload).not.toContain(input.credentials.secretAccessKey);
+    expect(receipts[0]!.payload).not.toContain(input.credentials.accessKeyId);
+  });
+  it("replays a committed binding response and conflicts on a different canonical request", async () => {
+    const f = await fixture(); const key = randomUUID();
+    const input = { zoneId: f.zone.id, fqdn: "www", recordType: "A" as const, slotId: f.slot.id, takeoverExisting: false };
+    const first = await bind(f.actor, input, key);
+    await connection.db.update(managedAddressSlots).set({ currentAddressId: null }).where(eq(managedAddressSlots.id, f.slot.id));
+    const replay = await bind(f.actor, { ...input, fqdn: "WWW.EXAMPLE.COM." }, key);
+    expect(replay).toEqual(first);
+    await expect(bind(f.actor, { ...input, fqdn: "different" }, key)).rejects.toMatchObject({ status: 409 });
+    expect(await connection.db.select().from(endpointPools).where(eq(endpointPools.ownerUserId, f.actor.id))).toHaveLength(1);
+    expect(await connection.db.select().from(domainBindings).where(eq(domainBindings.zoneId, f.zone.id))).toHaveLength(1);
+  });
+  it("rolls back the receipt when binding fails so a later retry can complete", async () => {
+    const f = await fixture(); const key = randomUUID();
+    const input = { zoneId: f.zone.id, fqdn: "www", recordType: "A" as const, slotId: f.slot.id, takeoverExisting: false };
+    await connection.db.update(cloudAccounts).set({ enabled: false }).where(eq(cloudAccounts.id, f.account.id));
+    await expect(bind(f.actor, input, key)).rejects.toMatchObject({ status: 409 });
+    expect(await connection.client.unsafe("select key from cloud_api_requests where key = $1", [key])).toHaveLength(0);
+    await connection.db.update(cloudAccounts).set({ enabled: true }).where(eq(cloudAccounts.id, f.account.id));
+    expect(await bind(f.actor, input, key)).toMatchObject({ binding: { fqdn: "www.example.com" } });
+  });
+  it("checks ownership and actor identity before replaying an account creation", async () => {
+    const f = await fixture(); const other = await fixture(); const key = randomUUID();
+    const input = { name: "Replay", provider: "aws" as const, credentials: { kind: "access_key" as const, accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } };
+    const account = await create(f.actor, input, key);
+    await expect(create(other.actor, input, key)).rejects.toMatchObject({ status: 409 });
+    await connection.db.update(cloudAccounts).set({ ownerUserId: other.actor.id }).where(eq(cloudAccounts.id, account.id));
+    await expect(create(f.actor, input, key)).rejects.toMatchObject({ status: 404 });
+  });
+  it("checks current ownership before returning a stored binding response", async () => {
+    const f = await fixture(); const other = await fixture(); const key = randomUUID();
+    const input = { zoneId: f.zone.id, fqdn: "www", recordType: "A" as const, slotId: f.slot.id, takeoverExisting: false };
+    await bind(f.actor, input, key);
+    await expect(bind(other.actor, input, key)).rejects.toMatchObject({ status: 404 });
+    await connection.db.update(cloudAccounts).set({ ownerUserId: other.actor.id }).where(eq(cloudAccounts.id, f.account.id));
+    await expect(bind(f.actor, input, key)).rejects.toMatchObject({ status: 404 });
   });
 });
