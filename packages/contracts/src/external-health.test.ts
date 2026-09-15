@@ -13,3 +13,10 @@ it("accepts useful shared groups, character classes and bounded repetition", () 
     expect(externalHealthCheckConfigSchema.safeParse({ type: "http", bodyPattern }).success).toBe(true);
   }
 });
+it("rejects leading-zero repeat bounds with different JavaScript and Go semantics", () => {
+  for (const bodyPattern of ["^a{01}$", "a{01,2}", "a{1,02}", "a{00,01}"]) {
+    expect(healthCheckConfigSchema.safeParse({ type: "http", bodyPattern }).success).toBe(true);
+    expect(externalHealthCheckConfigSchema.safeParse({ type: "http", bodyPattern }).success).toBe(false);
+  }
+  for (const bodyPattern of ["a{0}", "a{0,2}", "a{1,20}"]) expect(externalHealthCheckConfigSchema.safeParse({ type: "http", bodyPattern }).success).toBe(true);
+});

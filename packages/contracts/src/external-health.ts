@@ -16,7 +16,7 @@ export function isExternalBodyPattern(pattern: string): boolean {
       inClass = false;
     } else if (pattern[i] === "{" && !inClass) {
       const quantifier = /^\{(\d+)(?:,(\d*))?\}/u.exec(pattern.slice(i));
-      if (!quantifier) return false;
+      if (!quantifier || quantifier.slice(1).some(bound => bound && bound.length > 1 && bound.startsWith("0"))) return false;
       const maximum = Number(quantifier[2] || quantifier[1]);
       repetitionBudget *= Math.max(1, maximum);
       if (repetitionBudget > 1000) return false;
