@@ -138,7 +138,7 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
   const args = validate(step, adapter);
   const current = await adapter.inspect(args.slot);
   identity(args, current);
-  const base: CloudStepResult = { ...args.receipt, before: args.receipt?.before ?? snapshot(current), after: snapshot(current) };
+  const base: CloudStepResult = { ...args.receipt, before: args.receipt?.before ?? snapshot(current), after: { ...args.receipt?.after, ...snapshot(current) } };
   try {
     if (step.action === "linode.ipv4.allocate") {
       // Inventory differences have no exclusive attempt attribution; even no change cannot justify another POST.
@@ -173,7 +173,9 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
     if (event.status === "failed") throw new CloudError("cloud_operation_failed", false, undefined, "linode_reboot_failed");
     const result = { ...base, operationId: String(event.id), before: { ...base.before, eventWatermark: afterId }, after: { ...base.after, eventStatus: event.status } };
     if (!["finished", "completed"].includes(event.status ?? "") || current.state !== "running") return { ...result, status: "pending" };
-    return { ...result, candidateAddress: candidate.candidateAddress!, candidateRepeated: candidate.candidateRepeated ?? false, allocationId: candidate.allocationId!, resourceId: candidate.resourceId!, status: "applied" };
+    const address = current.interfaces.find(i => i.id === args.slot.interfaceId)!.addresses.find(ip => ip.family === 4 && ip.address === candidate.candidateAddress)!;
+    return { ...result, candidateAddress: candidate.candidateAddress!, candidateRepeated: candidate.candidateRepeated ?? false, allocationId: candidate.allocationId!, resourceId: candidate.resourceId!,
+      after: { ...result.after, attemptId: args.attemptId, addressMetadata: address.metadata ?? {}, ...(address.privateAddress === undefined ? {} : { privateAddress: address.privateAddress }) }, status: "applied" };
   } catch (error) {
     if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
     throw error;
