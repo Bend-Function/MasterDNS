@@ -2,6 +2,7 @@ import {
   GetInstanceCommand,
   GetInstancesCommand,
   GetRegionsCommand,
+  GetStaticIpCommand,
   GetStaticIpsCommand,
   LightsailClient,
 } from "@aws-sdk/client-lightsail";
@@ -15,6 +16,23 @@ import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js
 import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
 import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
+
+type ScopedOriginal =
+  | { kind: "dynamic"; address: string }
+  | { kind: "static"; name: string; address: string; resourceId?: string };
+
+export type LightsailInspectionScope = {
+  mode: "initial" | "transition";
+  instanceName: string;
+  selected: { family: 4 | 6; address: string };
+  ipv4: ScopedOriginal;
+  candidate?: { name: string; address: string; resourceId: string };
+  allowDetachedOriginal?: boolean;
+  allowCandidateAttached?: boolean;
+  allowIpv6Absent?: boolean;
+  allowIpv6Candidate?: boolean;
+  ipv6Candidate?: string;
+};
 
 export class LightsailCloudAdapter implements CloudAdapter {
   private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
@@ -128,6 +146,65 @@ export class LightsailCloudAdapter implements CloudAdapter {
     }
   }
 
+  async inspectScoped(ref: CloudRef, scope: LightsailInspectionScope): Promise<CloudInventory> {
+    if (ref.accountId !== this.accountId || ref.service !== "lightsail") throw new CloudError("resource_not_found", false);
+    try {
+      const instanceResponse = await this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName: scope.instanceName }));
+      const instance = instanceResponse.instance;
+      if (!instance || instance.name !== scope.instanceName || instance.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
+      let staticIps: StaticIp[] = [];
+      let originalStatic: StaticIp | undefined;
+      if (scope.ipv4.kind === "static") {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.ipv4.name }));
+        originalStatic = response.staticIp as StaticIp | undefined;
+        if (!originalStatic || !originalStatic.arn || !sameLightsailIdentity(instance.arn, originalStatic.arn, "StaticIp")
+          || originalStatic.name !== scope.ipv4.name || originalStatic.ipAddress !== scope.ipv4.address
+          || (scope.ipv4.resourceId !== undefined && originalStatic.arn !== scope.ipv4.resourceId)
+          || (originalStatic.attachedTo !== undefined && originalStatic.attachedTo !== scope.instanceName)) throw new CloudError("remote_identity_changed", false);
+        staticIps.push(originalStatic);
+      }
+      let candidateStatic: StaticIp | undefined;
+      if (scope.candidate !== undefined) {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.candidate.name }));
+        candidateStatic = response.staticIp as StaticIp | undefined;
+        if (!candidateStatic || !candidateStatic.arn || !sameLightsailIdentity(instance.arn, candidateStatic.arn, "StaticIp")
+          || candidateStatic.name !== scope.candidate.name || candidateStatic.arn !== scope.candidate.resourceId
+          || candidateStatic.ipAddress !== scope.candidate.address
+          || (candidateStatic.attachedTo !== undefined && candidateStatic.attachedTo !== scope.instanceName)) throw new CloudError("remote_identity_changed", false);
+        staticIps.push(candidateStatic);
+      }
+
+      const originalActive = scope.ipv4.kind === "static" && originalStatic?.attachedTo === scope.instanceName
+        && instance.isStaticIp === true && instance.publicIpAddress === scope.ipv4.address && candidateStatic?.attachedTo === undefined;
+      const originalDynamic = scope.ipv4.kind === "dynamic" && instance.isStaticIp === false
+        && instance.publicIpAddress === scope.ipv4.address && candidateStatic?.attachedTo === undefined;
+      const detachedOriginal = scope.mode === "transition" && scope.allowDetachedOriginal === true && scope.ipv4.kind === "static"
+        && originalStatic?.attachedTo === undefined && instance.isStaticIp === false && candidateStatic?.attachedTo === undefined;
+      const candidateActive = scope.mode === "transition" && scope.allowCandidateAttached === true && candidateStatic?.attachedTo === scope.instanceName
+        && instance.isStaticIp === true && instance.publicIpAddress === scope.candidate?.address
+        && (scope.ipv4.kind === "dynamic" || originalStatic?.attachedTo === undefined);
+      const ipv4Valid = originalActive || originalDynamic || detachedOriginal || candidateActive;
+      const addresses = instance.ipv6Addresses ?? [];
+      const originalIpv6 = scope.selected.family === 6 && scope.ipv6Candidate === undefined
+        && instance.ipAddressType === "dualstack" && addresses.includes(scope.selected.address);
+      const absentIpv6 = scope.selected.family === 6 && scope.mode === "transition" && scope.allowIpv6Absent === true
+        && instance.ipAddressType === "ipv4" && addresses.length === 0;
+      const newIpv6 = scope.selected.family === 6 && scope.mode === "transition" && scope.allowIpv6Candidate === true
+        && instance.ipAddressType === "dualstack" && addresses.length === 1
+        && (scope.ipv6Candidate === undefined || addresses[0] === scope.ipv6Candidate);
+      const selectedValid = scope.selected.family === 4
+        ? scope.selected.address === scope.ipv4.address
+        : originalIpv6 || absentIpv6 || newIpv6;
+      if (!ipv4Valid || !selectedValid) throw new CloudError("remote_identity_changed", false);
+
+      const inventory = mapLightsailInstance(this.accountId, ref.region, instance, staticIps);
+      if (inventory === undefined) throw new CloudError("resource_not_found", false);
+      return inventory;
+    } catch (error) {
+      throw normalizeAwsError(error);
+    }
+  }
+
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability {
     return evaluateCapabilities(slot, inventory);
   }
@@ -147,4 +224,11 @@ export class LightsailCloudAdapter implements CloudAdapter {
   async observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
     return (await this.observeDetails(step)).status;
   }
+}
+
+function sameLightsailIdentity(instanceArn: string, resourceArn: string, resourceType: string): boolean {
+  const instance = instanceArn.split(":");
+  const resource = resourceArn.split(":");
+  return instance.length === 6 && resource.length === 6 && instance.slice(0, 5).every((part, index) => part === resource[index])
+    && resource[5]?.startsWith(`${resourceType}/`) === true;
 }
