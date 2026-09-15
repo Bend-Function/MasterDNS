@@ -1,5 +1,6 @@
 "use client";
 
+import type { RotationPolicyInput } from "@masterdns/contracts/rotation";
 import { ExternalLink, Plus, RefreshCw, RotateCw, Settings2 } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -12,7 +13,7 @@ import { demoCloudAccounts, demoCloudInstances, demoCloudSlots } from "../../lib
 import type { AddressSlot, CloudAccount, CloudInstanceRow } from "../../lib/cloud-types";
 import { createIntentKey } from "../../lib/intent-key";
 import { demoRotationPolicy, demoRotations } from "../../lib/rotation-demo";
-import type { RotationIncident, RotationPolicy, RotationPolicyInput } from "../../lib/rotation-types";
+import type { RotationIncident, RotationPolicy } from "../../lib/rotation-types";
 import { createRequestGeneration } from "../../lib/session-state";
 
 type Selection = { row: CloudInstanceRow; slot: AddressSlot; policy: RotationPolicy };

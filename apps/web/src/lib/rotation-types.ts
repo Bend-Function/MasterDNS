@@ -44,5 +44,3 @@ export type RotationDetail = {
   resources: Array<{ id: string; attemptId: string; addressId: string | null; address: string; role: "original" | "candidate"; origin: "user" | "system"; cleanupStatus: string; cleanupDueAt: string | null }>;
   publications: Array<{ id: string; addressId: string; addressVersion: number; status: string; operationId: string | null; errorCode: string | null; updatedAt: string }>;
 };
-
-export type RotationPolicyInput = Omit<RotationPolicy, "slotId" | "updatedAt">;

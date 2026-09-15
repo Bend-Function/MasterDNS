@@ -1,3 +1,5 @@
+import { rotationPolicySchema, type RotationPolicyInput } from "@masterdns/contracts/rotation";
+
 export type RotationAuthorizationCheck = {
   managed: boolean;
   ipv4Enabled?: boolean;
@@ -12,4 +14,8 @@ export function validateRotationPolicy(input: RotationAuthorizationCheck): strin
   if (input.ipv4Enabled && input.ipv4Authorized === false) errors.push("ipv4_not_authorized");
   if (input.ipv6Enabled && input.ipv6Authorized === false) errors.push("ipv6_not_authorized");
   return errors;
+}
+
+export function parseRotationPolicyInput(input: unknown): RotationPolicyInput {
+  return rotationPolicySchema.parse(input);
 }

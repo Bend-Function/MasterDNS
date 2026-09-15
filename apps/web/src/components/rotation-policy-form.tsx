@@ -1,9 +1,10 @@
 "use client";
 
+import type { RotationPolicyInput } from "@masterdns/contracts/rotation";
 import { useState, type FormEvent } from "react";
 import type { AddressSlot, CloudAuthorization } from "../lib/cloud-types";
-import { validateRotationPolicy } from "../lib/rotation-policy";
-import type { RotationPolicy, RotationPolicyInput } from "../lib/rotation-types";
+import { parseRotationPolicyInput, validateRotationPolicy } from "../lib/rotation-policy";
+import type { RotationPolicy } from "../lib/rotation-types";
 import { Field, Switch } from "./ui";
 
 export function RotationPolicyForm({ formId, slot, authorization, policy, onSubmit }: { formId: string; slot: AddressSlot; authorization: CloudAuthorization | null; policy: RotationPolicy; onSubmit: (input: RotationPolicyInput) => Promise<void> }) {
@@ -21,7 +22,7 @@ export function RotationPolicyForm({ formId, slot, authorization, policy, onSubm
     const errors = validateRotationPolicy({ managed: authorization?.managed === true, ipv4Enabled: slot.slot.family === "4" && enabled, ipv6Enabled: slot.slot.family === "6" && enabled, ipv4Authorized: authorization?.allowIpv4Rotation ?? false, ipv6Authorized: authorization?.allowIpv6Rotation ?? false });
     if (enabled && !capable) errors.push("capability_unavailable");
     if (errors.length) { setError(rotationError(errors[0]!, slot)); return; }
-    try { await onSubmit({ revision: policy.revision, enabled, maxAttempts, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds }); }
+    try { await onSubmit(parseRotationPolicyInput({ revision: policy.revision, enabled, maxAttempts, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds })); }
     catch (value) { setError(value instanceof Error ? value.message : "轮换策略保存失败"); }
   };
 
