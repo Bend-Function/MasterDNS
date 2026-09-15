@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { BadRequestException, ConflictException } from "@nestjs/common";
 import { cloudApiRequests, type MasterDnsDatabase } from "@masterdns/db";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { parseIdempotencyKey } from "../../common/idempotency.js";
 
 type Transaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
@@ -28,15 +28,15 @@ export async function withCloudRequest<T extends object>(
     return value;
   })).digest("hex");
   const { request: _request, ...fields } = identity;
-  const [claimed] = await tx.insert(cloudApiRequests).values({ ...fields, requestHash }).onConflictDoNothing({ target: cloudApiRequests.key }).returning({ key: cloudApiRequests.key });
+  const [claimed] = await tx.insert(cloudApiRequests).values({ ...fields, requestHash }).onConflictDoNothing({ target: [cloudApiRequests.actorUserId, cloudApiRequests.key] }).returning({ key: cloudApiRequests.key });
   if (!claimed) {
-    const [existing] = await tx.select().from(cloudApiRequests).where(eq(cloudApiRequests.key, identity.key)).limit(1);
+    const [existing] = await tx.select().from(cloudApiRequests).where(and(eq(cloudApiRequests.actorUserId, identity.actorUserId), eq(cloudApiRequests.key, identity.key))).limit(1);
     if (!existing || existing.actorUserId !== identity.actorUserId || existing.ownerUserId !== identity.ownerUserId || existing.action !== identity.action || existing.requestHash !== requestHash || existing.response === null) {
       throw new ConflictException("Idempotency-Key has already been used for another request");
     }
     return existing.response as JsonResult<T>;
   }
   const response = JSON.parse(JSON.stringify(await apply())) as JsonResult<T>;
-  await tx.update(cloudApiRequests).set({ response }).where(eq(cloudApiRequests.key, identity.key));
+  await tx.update(cloudApiRequests).set({ response }).where(and(eq(cloudApiRequests.actorUserId, identity.actorUserId), eq(cloudApiRequests.key, identity.key)));
   return response;
 }

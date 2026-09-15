@@ -268,9 +268,28 @@ describe("cloud request idempotency", () => {
     const f = await fixture(); const other = await fixture(); const key = randomUUID();
     const input = { name: "Replay", provider: "aws" as const, credentials: { kind: "access_key" as const, accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } };
     const account = await create(f.actor, input, key);
-    await expect(create(other.actor, input, key)).rejects.toMatchObject({ status: 409 });
+    const otherAccount = await create(other.actor, input, key);
+    expect(otherAccount.id).not.toBe(account.id);
+    expect(otherAccount.ownerUserId).toBe(other.actor.id);
     await connection.db.update(cloudAccounts).set({ ownerUserId: other.actor.id }).where(eq(cloudAccounts.id, account.id));
     await expect(create(f.actor, input, key)).rejects.toMatchObject({ status: 404 });
+  });
+  it("gives each actor an independent keyspace for binding and replay", async () => {
+    const firstOwner = await fixture(); const secondOwner = await fixture(); const key = randomUUID();
+    const firstInput = { zoneId: firstOwner.zone.id, fqdn: "www", recordType: "A" as const, slotId: firstOwner.slot.id, takeoverExisting: false };
+    const secondInput = { zoneId: secondOwner.zone.id, fqdn: "www", recordType: "A" as const, slotId: secondOwner.slot.id, takeoverExisting: false };
+    const [first, second] = await Promise.all([bind(firstOwner.actor, firstInput, key), bind(secondOwner.actor, secondInput, key)]);
+    expect(first.binding.id).not.toBe(second.binding.id);
+    expect(await bind(firstOwner.actor, firstInput, key)).toEqual(first);
+    expect(await bind(secondOwner.actor, secondInput, key)).toEqual(second);
+    await expect(bind(firstOwner.actor, { ...firstInput, fqdn: "different" }, key)).rejects.toMatchObject({ status: 409 });
+    const receipts = await connection.client.unsafe("select actor_user_id from cloud_api_requests where key = $1", [key]);
+    expect(receipts).toHaveLength(2);
+  });
+  it("rejects reuse of the same actor key for another action", async () => {
+    const f = await fixture(); const key = randomUUID();
+    await create(f.actor, { name: "Action key", provider: "aws", credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } }, key);
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "www", recordType: "A", slotId: f.slot.id, takeoverExisting: false }, key)).rejects.toMatchObject({ status: 409 });
   });
   it("checks current ownership before returning a stored binding response", async () => {
     const f = await fixture(); const other = await fixture(); const key = randomUUID();

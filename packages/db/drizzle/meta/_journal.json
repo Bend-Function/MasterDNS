@@ -99,6 +99,13 @@
       "when": 1789440468219,
       "tag": "0013_strong_thundra",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1789441044939,
+      "tag": "0014_regular_silhouette",
+      "breakpoints": true
     }
   ]
 }

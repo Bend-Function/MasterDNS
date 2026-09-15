@@ -8,6 +8,7 @@ import {
   jsonb,
   pgEnum,
   pgTable,
+  primaryKey,
   text,
   timestamp,
   uniqueIndex,
@@ -35,14 +36,14 @@ type CloudSchemaDependencies = {
 
 export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
   const cloudApiRequests = pgTable("cloud_api_requests", {
-    key: varchar("key", { length: 255 }).primaryKey(),
+    key: varchar("key", { length: 255 }).notNull(),
     actorUserId: uuid("actor_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
     action: varchar("action", { length: 40 }).notNull(),
     requestHash: varchar("request_hash", { length: 64 }).notNull(),
     response: jsonb("response").$type<unknown>(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  });
+  }, (table) => [primaryKey({ columns: [table.actorUserId, table.key] })]);
 
   const cloudAccounts = pgTable("cloud_accounts", {
     id: uuid("id").primaryKey().defaultRandom(),
