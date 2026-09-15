@@ -8,6 +8,7 @@ export const queueNames = {
   reconcile: "masterdns-reconcile",
   sync: "masterdns-sync",
   cloudSync: "masterdns-cloud-sync",
+  rotation: "masterdns-rotation",
   notifications: "masterdns-notifications",
 } as const;
 
@@ -44,3 +45,5 @@ export type NotificationEvent = {
 export type NotificationJob =
   | { kind: "fanout"; event: NotificationEvent }
   | { kind: "deliver"; deliveryId: string };
+
+export type RotationJob = { incidentId: string };

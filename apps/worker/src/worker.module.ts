@@ -1,3 +1,6 @@
+import { RotationProcessor } from "./rotation/rotation.processor.js";
+import { RotationRecoveryService } from "./rotation/rotation-recovery.service.js";
+import { RotationStore } from "./rotation/rotation-store.js";
 import { Module } from "@nestjs/common";
 import { ReconcileProcessor } from "./automation/reconcile.processor.js";
 import { ReconcileOutboxService } from "./automation/reconcile-outbox.service.js";
@@ -17,6 +20,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
 
 @Module({
   providers: [
+    RotationProcessor, RotationRecoveryService, RotationStore,
     DatabaseService,
     CloudRuntimeService,
     CloudSyncService,

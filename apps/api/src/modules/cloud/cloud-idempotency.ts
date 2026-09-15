@@ -17,7 +17,7 @@ export function cloudRequestKey(value: string | undefined): string {
 // Only a fingerprint and the public response are persisted; credentials never enter it.
 export async function withCloudRequest<T extends object>(
   tx: Transaction,
-  identity: { key: string; actorUserId: string; ownerUserId: string; action: "account.create" | "slot.bind"; request: unknown },
+  identity: { key: string; actorUserId: string; ownerUserId: string; action: "account.create" | "slot.bind" | "rotation.start" | "rotation.resume"; request: unknown },
   apply: () => Promise<T>,
 ): Promise<JsonResult<T>> {
   const requestHash = createHash("sha256").update(JSON.stringify(identity.request, (_key, value: unknown) => {
