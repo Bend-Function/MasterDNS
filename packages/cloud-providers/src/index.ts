@@ -1,4 +1,5 @@
 export * from "./aws-credentials.js";
+export * from "./aws-e2e-harness.js";
 export * from "./capabilities.js";
 export * from "./ec2.js";
 export * from "./errors.js";
