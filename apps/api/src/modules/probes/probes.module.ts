@@ -1,3 +1,5 @@
+import { HealthPoliciesController } from "./health-policies.controller.js";
+import { HealthPoliciesService } from "./health-policies.service.js";
 import { Module } from "@nestjs/common";
 import { ProbeAgentAuth } from "./probe-agent-auth.js";
 import { ProbeAgentController } from "./probe-agent.controller.js";
@@ -8,8 +10,8 @@ import { ProbesController } from "./probes.controller.js";
 import { ProbesService } from "./probes.service.js";
 
 @Module({
-  controllers: [ProbesController, ProbeAgentController],
-  providers: [ProbesService, ProbeAgentAuth, ProbeLeasesService, ProbeResultsService, ProbeRoundsService],
+  controllers: [HealthPoliciesController, ProbesController, ProbeAgentController],
+  providers: [HealthPoliciesService, ProbesService, ProbeAgentAuth, ProbeLeasesService, ProbeResultsService, ProbeRoundsService],
   exports: [ProbeRoundsService, ProbeLeasesService, ProbeResultsService],
 })
 export class ProbesModule {}

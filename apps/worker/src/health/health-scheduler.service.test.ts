@@ -31,3 +31,13 @@ describe("health scheduler address fan-out", () => {
     expect(jobs.filter((job) => job.configId === "a-check" || job.configId === "aaaa-check")).toHaveLength(2);
   });
 });
+it("suppresses external and mixed base jobs while retaining local family and binding checks", () => {
+  const targets = ["4", "6"].map(family => ({ endpointId: "e", poolId: "p", addressId: `a${family}`, family: family as "4" | "6", intervalSeconds: 15 }));
+  const configs = [{ id: "base", poolId: "p", endpointId: null, domainBindingId: null }, { id: "binding", poolId: null, endpointId: null, domainBindingId: "b" }];
+  const jobs = buildScheduledHealthJobs(targets, configs, [{ id: "b", poolId: "p", recordType: "A" }], [{ endpointId: "e", family: "4", mode: "mixed" }]);
+  expect(jobs.map(j => j.data.configId)).toEqual(["binding", "base"]);
+});
+it("uses the selected local policy config and interval", () => {
+  const jobs = buildScheduledHealthJobs([{ endpointId: "e", poolId: "p", addressId: "a", family: "4", intervalSeconds: 15 }], [{ id: "pool", poolId: "p", endpointId: null, domainBindingId: null }, { id: "endpoint", poolId: null, endpointId: "e", domainBindingId: null }], [], [{ endpointId: "e", family: "4", mode: "local", configId: "pool", checkIntervalSeconds: 30 }]);
+  expect(jobs).toEqual([{ data: { endpointId: "e", configId: "pool", addressId: "a" }, intervalSeconds: 30 }]);
+});

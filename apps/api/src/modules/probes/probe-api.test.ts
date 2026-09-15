@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { eq, sql } from 'drizzle-orm';
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, managedAddressSlots, createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeTasks, probeObservations, probeTokens, probeGroups } from '@masterdns/db';
+import { addressHealthPolicies, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, managedAddressSlots, createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeTasks, probeObservations, probeTokens, probeGroups } from '@masterdns/db';
 import { hashToken } from '@masterdns/crypto';
 import { probeTaskSchema, type ProbeTask, type ProbeResult } from '@masterdns/contracts';
 import { ProbeRoundsService } from './probe-rounds.service.js';
@@ -343,4 +343,16 @@ it('keeps endpoint/family sequences after config cascade deletion, round pruning
   expect(third.sequence).toBe(3);
   const [v6] = await connection.db.insert(endpointAddresses).values({ endpointId: f.endpoint.id, family: '6', address: '2001:db8::1', state: 'current', source: 'static' }).returning();
   expect((await rounds.create(f.actor, { ...input, configId: config!.id, endpointAddressId: v6!.id }, now)).sequence).toBe(1);
+});
+
+it('rejects observations after the target health policy revision changes', async () => {
+  const f = await fixture();
+  const group = await management.createGroup(f.actor, { name: 'policy group' });
+  await management.setMembers(f.actor, group.id, [f.probe.id]);
+  const [policy] = await connection.db.insert(addressHealthPolicies).values({ endpointId: f.endpoint.id, family: '4', configId: f.check.id, groupId: group.id, mode: 'external' }).returning();
+  const rounds = new ProbeRoundsService({ db: connection.db } as never);
+  await rounds.create(f.actor, { endpointAddressId: f.address.id, configId: f.check.id, groupId: group.id, addressVersion: 1, consensus: { mode: 'all', minimumValid: 1 }, deadline: new Date(now.getTime()+10000), resultExpiresAt: new Date(now.getTime()+60000), policyId: policy!.id, policyRevision: 1 }, now);
+  const [task] = await leases.lease(f.probe.id, 1, now);
+  await connection.db.update(addressHealthPolicies).set({ revision: 2 }).where(eq(addressHealthPolicies.id, policy!.id));
+  expect(await results.accept(f.probe.id, result(task!), now)).toBe('stale');
 });
