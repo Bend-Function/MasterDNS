@@ -6,8 +6,18 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
-    ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" },
-    "./rotation": { "types": "./dist/rotation.d.ts", "default": "./dist/rotation.js" }
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./rotation": {
+      "types": "./dist/rotation.d.ts",
+      "default": "./dist/rotation.js"
+    },
+    "./cloud": {
+      "types": "./dist/cloud.d.ts",
+      "default": "./dist/cloud.js"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -15,5 +25,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run src --passWithNoTests"
   },
-  "dependencies": { "zod": "^4.4.3" }
+  "dependencies": {
+    "zod": "^4.4.3"
+  }
 }

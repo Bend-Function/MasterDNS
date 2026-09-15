@@ -35,7 +35,7 @@ export class ApiExceptionFilter implements ExceptionFilter {
         : exception.code === "rate_limited" ? HttpStatus.TOO_MANY_REQUESTS
         : exception.code === "remote_identity_changed" ? HttpStatus.CONFLICT
         : HttpStatus.BAD_GATEWAY;
-      request.log.warn({ provider: "aws", code: exception.code }, "Cloud request failed");
+      request.log.warn({ code: exception.code }, "Cloud request failed");
       return response.status(status).send({ error: { code: exception.code, message: exception.code }, requestId: request.id });
     }
     if (exception instanceof ProviderError) {

@@ -17,8 +17,8 @@ import {
 } from "drizzle-orm/pg-core";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
 
-export const cloudProviderEnum = pgEnum("cloud_provider", ["aws"]);
-export const cloudServiceEnum = pgEnum("cloud_service", ["ec2", "lightsail"]);
+export const cloudProviderEnum = pgEnum("cloud_provider", ["aws", "azure", "linode"]);
+export const cloudServiceEnum = pgEnum("cloud_service", ["ec2", "lightsail", "azure_vm", "linode"]);
 export const cloudAddressKindEnum = pgEnum("cloud_address_kind", ["host", "prefix"]);
 export const cloudAddressOriginEnum = pgEnum("cloud_address_origin", ["user", "system"]);
 export const endpointAddressModeEnum = pgEnum("endpoint_address_mode", ["static", "ddns", "cloud"]);
@@ -51,7 +51,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     provider: cloudProviderEnum("provider").notNull(),
     name: varchar("name", { length: 120 }).notNull(),
     regions: jsonb("regions").$type<string[] | null>(),
-    externalAccountId: varchar("external_account_id", { length: 32 }),
+    externalAccountId: text("external_account_id"),
     credentialCiphertext: text("credential_ciphertext").notNull(),
     credentialIv: varchar("credential_iv", { length: 64 }).notNull(),
     credentialTag: varchar("credential_tag", { length: 64 }).notNull(),
@@ -81,7 +81,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     accountId: uuid("account_id").notNull().references(() => cloudAccounts.id, { onDelete: "cascade" }),
     service: cloudServiceEnum("service").notNull(),
     region: varchar("region", { length: 80 }).notNull(),
-    externalId: varchar("external_id", { length: 255 }).notNull(),
+    externalId: text("external_id").notNull(),
     name: varchar("name", { length: 255 }),
     state: varchar("state", { length: 80 }),
     metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
@@ -97,7 +97,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
   const cloudInterfaces = pgTable("cloud_interfaces", {
     id: uuid("id").primaryKey().defaultRandom(),
     instanceId: uuid("instance_id").notNull().references(() => cloudInstances.id, { onDelete: "cascade" }),
-    externalId: varchar("external_id", { length: 255 }).notNull(),
+    externalId: text("external_id").notNull(),
     name: varchar("name", { length: 255 }),
     metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
     scanGeneration: integer("scan_generation").notNull(),
@@ -115,7 +115,8 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     family: addressFamilyEnum("family").notNull(),
     address: varchar("address", { length: 45 }).notNull(),
     prefixLength: integer("prefix_length"),
-    remoteAllocationId: varchar("remote_allocation_id", { length: 255 }),
+    remoteAllocationId: text("remote_allocation_id"),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
     origin: cloudAddressOriginEnum("origin").notNull(),
     attemptId: uuid("attempt_id"),
     scanGeneration: integer("scan_generation").notNull(),

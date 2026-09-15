@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
-import { createCloudAdapter, evaluateCapabilities, type AwsCredentials, type CloudInventory } from "@masterdns/cloud-providers";
-import type { SlotRef } from "@masterdns/contracts";
+import { createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
+import { cloudProviderServices, validCloudRegion, type CloudProvider, type SlotRef } from "@masterdns/contracts";
 import { decryptJson, encryptJson, parseEncryptionKey } from "@masterdns/crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { env } from "../../config/env.js";
@@ -32,6 +32,8 @@ export class CloudService {
     const ownerUserId = input.ownerUserId ?? actor.id;
     if (actor.role !== "admin" && ownerUserId !== actor.id) throw new ForbiddenException("Cannot create an account for another user");
     this.assertCredentials(actor, input.credentials);
+    if (!credentialsMatchProvider(input.provider, input.credentials)) throw new BadRequestException("Credentials do not match provider");
+    this.assertRegions(input.provider, input.regions ?? null);
     const [owner] = await this.database.db.select({ id: users.id }).from(users).where(eq(users.id, ownerUserId)).limit(1);
     if (!owner) throw new NotFoundException("Account owner not found");
     return this.database.db.transaction(async (tx) => {
@@ -40,7 +42,7 @@ export class CloudService {
         request: { ...input, ownerUserId, regions: input.regions ? [...input.regions].sort() : null },
       }, async () => {
         const id = randomUUID();
-        const { externalAccountId } = await createCloudAdapter({ accountId: id, service: "ec2", credentials: input.credentials as AwsCredentials }).verifyIdentity();
+        const { externalAccountId } = await createCloudAdapter({ accountId: id, provider: input.provider, service: cloudProviderServices[input.provider][0]!, credentials: input.credentials as CloudCredentials }).verifyIdentity();
         const [account] = await tx.insert(cloudAccounts).values({ id, ownerUserId, externalAccountId, name: input.name, provider: input.provider, regions: input.regions ?? null, ...this.encryptedCredentials(input.credentials) }).returning();
         if (!account) throw new Error("Cloud account insert returned no row");
         await tx.insert(auditLogs).values({ ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_account.create", resourceType: "cloud_account", resourceId: account.id, afterSnapshot: publicCloudAccount(account) });
@@ -55,9 +57,11 @@ export class CloudService {
   async rotateCredentials(actor: AuthUser, id: string, input: CloudCredentialsUpdateInput) {
     this.assertCredentials(actor, input.credentials);
     const current = await this.findAccount(actor, id);
-    const expectedIdentity = current.externalAccountId ?? (await createCloudAdapter({ accountId: id, service: "ec2", credentials: decryptJson<AwsCredentials>({ ciphertext: current.credentialCiphertext, iv: current.credentialIv, tag: current.credentialTag, keyVersion: current.credentialKeyVersion }, this.encryptionKey) }).verifyIdentity()).externalAccountId;
-    const identity = await createCloudAdapter({ accountId: id, service: "ec2", credentials: input.credentials as AwsCredentials }).verifyIdentity();
-    if (identity.externalAccountId !== expectedIdentity) throw new ConflictException("Credentials belong to another AWS account; create a separate cloud account");
+    if (!credentialsMatchProvider(current.provider, input.credentials)) throw new BadRequestException("Credentials do not match provider");
+    const service = cloudProviderServices[current.provider][0]!;
+    const expectedIdentity = current.externalAccountId ?? (await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: decryptJson<CloudCredentials>({ ciphertext: current.credentialCiphertext, iv: current.credentialIv, tag: current.credentialTag, keyVersion: current.credentialKeyVersion }, this.encryptionKey) }).verifyIdentity()).externalAccountId;
+    const identity = await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: input.credentials as CloudCredentials }).verifyIdentity();
+    if (identity.externalAccountId !== expectedIdentity) throw new ConflictException("Credentials belong to another cloud account; create a separate cloud account");
     return this.updateAccount(actor, id, { ...this.encryptedCredentials(input.credentials), externalAccountId: expectedIdentity }, "cloud_account.credentials_rotate", current.credentialCiphertext);
   }
 
@@ -66,6 +70,8 @@ export class CloudService {
   }
 
   async setRegions(actor: AuthUser, id: string, regions: string[] | null) {
+    const account = await this.findAccount(actor, id);
+    this.assertRegions(account.provider, regions);
     return this.updateAccount(actor, id, { regions }, "cloud_account.regions");
   }
 
@@ -107,12 +113,16 @@ export class CloudService {
     const inventory: CloudInventory = {
       ref: { accountId: instance.accountId, service: instance.service, region: instance.region, instanceId: instance.externalId },
       name: instance.name ?? instance.externalId, state: instance.state ?? "unknown",
+      metadata: providerMetadata(instance.metadata),
       ...(typeof instance.metadata.nativeName === "string" ? { nativeName: instance.metadata.nativeName } : {}),
       ...(typeof instance.metadata.ipv6Only === "boolean" ? { ipv6Only: instance.metadata.ipv6Only } : {}),
       interfaces: instance.metadata.present === false ? [] : detail.interfaces.filter((iface) => iface.scanGeneration === instance.scanGeneration).map((iface) => ({
-        id: iface.externalId,
+        id: iface.externalId, metadata: providerMetadata(iface.metadata),
         ...(typeof iface.metadata.deviceIndex === "number" ? { deviceIndex: iface.metadata.deviceIndex } : {}),
         addresses: detail.addresses.filter((address) => address.interfaceId === iface.id && address.kind === "host" && address.scanGeneration === instance.scanGeneration).map((address) => ({
+          metadata: providerMetadata(address.metadata),
+          ...(typeof address.metadata.privateAddress === "string" ? { privateAddress: address.metadata.privateAddress } : {}),
+          ...(typeof address.metadata.resourceId === "string" ? { resourceId: address.metadata.resourceId } : {}),
           address: address.address, family: address.family === "4" ? 4 : 6,
           primary: Array.isArray(iface.metadata.primaryAddresses) && iface.metadata.primaryAddresses.includes(address.address),
           ...(address.remoteAllocationId ? { allocationId: address.remoteAllocationId } : {}),
@@ -163,9 +173,13 @@ export class CloudService {
     if (credentials.kind === "role" && actor.role !== "admin") throw new ForbiddenException("Only administrators may configure deployment identities");
   }
 
+  private assertRegions(provider: CloudProvider, regions: string[] | null) {
+    if (regions !== null && (regions.length < 1 || regions.length > 100 || new Set(regions).size !== regions.length || regions.some(region => !validCloudRegion(provider, region)))) throw new BadRequestException("Invalid provider region");
+  }
+
   private encryptedCredentials(credentials: CreateCloudAccountInput["credentials"]) {
     const encrypted = encryptJson(credentials, this.encryptionKey);
-    return { credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag, credentialKeyVersion: encrypted.keyVersion, credentialHint: credentials.kind === "role" ? "Deployment identity" : `AccessKey ...${credentials.accessKeyId.slice(-4)}` };
+    return { credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag, credentialKeyVersion: encrypted.keyVersion, credentialHint: credentials.kind === "role" ? "Deployment identity" : credentials.kind === "access_key" ? `AccessKey ...${credentials.accessKeyId.slice(-4)}` : credentials.kind === "azure_service_principal" ? `Service principal ...${credentials.clientId.slice(-4)}` : "Linode API token" };
   }
 
   private async updateAccount(actor: AuthUser, id: string, fields: Partial<typeof cloudAccounts.$inferInsert>, action: string, expectedCredentialCiphertext?: string) {
@@ -173,10 +187,15 @@ export class CloudService {
       const [before] = await tx.select().from(cloudAccounts).where(and(eq(cloudAccounts.id, id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).for("update");
       if (!before) throw new NotFoundException("Cloud account not found");
       if (expectedCredentialCiphertext !== undefined && before.credentialCiphertext !== expectedCredentialCiphertext) throw new ConflictException("Cloud credentials changed; retry verification");
-      if (fields.externalAccountId !== undefined && before.externalAccountId !== null && before.externalAccountId !== fields.externalAccountId) throw new ConflictException("AWS account identity changed during credential verification");
+      if (fields.externalAccountId !== undefined && before.externalAccountId !== null && before.externalAccountId !== fields.externalAccountId) throw new ConflictException("Cloud account identity changed during credential verification");
       const [after] = await tx.update(cloudAccounts).set({ ...fields, updatedAt: new Date() }).where(eq(cloudAccounts.id, id)).returning();
       await tx.insert(auditLogs).values({ ownerUserId: before.ownerUserId, actorUserId: actor.id, source: "user", action, resourceType: "cloud_account", resourceId: id, beforeSnapshot: publicCloudAccount(before), afterSnapshot: publicCloudAccount(after!) });
       return publicCloudAccount(after!);
     });
   }
+}
+
+function providerMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+  const value = metadata.providerMetadata;
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
 }

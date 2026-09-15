@@ -14,6 +14,7 @@ const unavailable = (reason: string): Capability => ({
 
 export function evaluateCapabilities(slot: SlotRef, inventory: CloudInventory): Capability {
   const ref = inventory.ref;
+  if (ref.service !== "ec2" && ref.service !== "lightsail") return unavailable("service_unavailable");
   if (slot.accountId !== ref.accountId || slot.service !== ref.service || slot.region !== ref.region || slot.instanceId !== ref.instanceId) {
     return unavailable("inventory_mismatch");
   }

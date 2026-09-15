@@ -57,7 +57,7 @@ const policySnapshotSchema = z.object({
   }),
   cloudLinks: z.array(z.object({
     endpointId: z.string().uuid(), family: z.enum(["4", "6"]), slotId: z.string().uuid(),
-    accountId: z.string().uuid(), externalAccountId: z.string().nullable(), service: z.enum(["ec2", "lightsail"]),
+    accountId: z.string().uuid(), externalAccountId: z.string().nullable(), service: z.enum(["ec2", "lightsail", "azure_vm", "linode"]),
     region: z.string(), instanceId: z.string(), interfaceId: z.string(),
   })).optional(),
   endpoints: z.array(z.object({

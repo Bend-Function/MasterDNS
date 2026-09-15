@@ -37,6 +37,34 @@ async function fixture() {
   return { account: account!, item, adapter, runtime, service };
 }
 describe("complete cloud scope sync", () => {
+  it("scans only saved provider services and persists exact provider metadata including long IDs", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudAccounts).set({ provider: "azure" }).where(eq(cloudAccounts.id, f.account.id));
+    const longId = "/subscriptions/22222222-2222-4222-8222-222222222222/resourceGroups/" + "r".repeat(90) + "/providers/Microsoft.Network/networkInterfaces/" + "n".repeat(90) + "/ipConfigurations/exact-config";
+    f.item.ref = { ...f.item.ref, service: "azure_vm", region: "australiaeast", instanceId: longId + "/vm" };
+    f.item.metadata = { azure: { supported: true } };
+    f.item.interfaces[0]!.id = longId;
+    f.item.interfaces[0]!.metadata = { nicId: longId.split("/ipConfigurations/")[0], ipConfigurationId: longId };
+    Object.assign(f.item.interfaces[0]!.addresses[0]!, { metadata: { sku: "Standard" }, allocationId: longId + "/allocation", resourceId: longId + "/resource", privateAddress: "10.0.0.4" });
+    f.adapter.listScopes.mockResolvedValue(["australiaeast"]);
+    expect(await f.service.sync(f.account.id)).toMatchObject([{ service: "azure_vm", region: "australiaeast", scopeStatus: "complete" }]);
+    expect(f.runtime.adapter).toHaveBeenCalledExactlyOnceWith(f.account.id, "azure_vm");
+    const [instance] = await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id));
+    const [iface] = await connection.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.instanceId, instance!.id));
+    const [address] = await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.interfaceId, iface!.id));
+    expect(instance).toMatchObject({ externalId: longId + "/vm", metadata: { present: true, providerMetadata: f.item.metadata } });
+    expect(iface).toMatchObject({ externalId: longId, metadata: { providerMetadata: f.item.interfaces[0]!.metadata } });
+    expect(address).toMatchObject({ remoteAllocationId: longId + "/allocation", metadata: { providerMetadata: { sku: "Standard" }, resourceId: longId + "/resource", privateAddress: "10.0.0.4" } });
+    expect(await connection.db.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, instance!.id))).toEqual([]);
+  });
+  it("rejects saved account/provider/service and credential mismatches before adapter creation", async () => {
+    const f = await fixture();
+    const encrypted = encryptJson({ kind: "linode_token", token: "test-token" }, Buffer.alloc(32, 1));
+    await connection.db.update(cloudAccounts).set({ credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag }).where(eq(cloudAccounts.id, f.account.id));
+    const runtime = new CloudRuntimeService({ db: connection.db } as never);
+    await expect(runtime.adapter(f.account.id, "ec2")).rejects.toMatchObject({ code: "invalid_credentials" });
+    await expect(runtime.adapter(f.account.id, "linode")).rejects.toMatchObject({ code: "invalid_credentials" });
+  });
   it("pins first runtime identity and rejects a later AWS account mismatch", async () => {
     const f = await fixture();
     const encrypted = encryptJson({ kind: "access_key", accessKeyId: "test-access", secretAccessKey: "test-secret" }, Buffer.alloc(32, 1));

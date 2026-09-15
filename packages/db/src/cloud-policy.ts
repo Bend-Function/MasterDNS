@@ -1,3 +1,4 @@
+import type { CloudService } from "@masterdns/contracts";
 import { and, eq, inArray, ne } from "drizzle-orm";
 import {
   addressHealthStates,
@@ -18,7 +19,7 @@ export type CloudPolicyLink = {
   slotId: string;
   accountId: string;
   externalAccountId: string | null;
-  service: "ec2" | "lightsail";
+  service: CloudService;
   region: string;
   instanceId: string;
   interfaceId: string;

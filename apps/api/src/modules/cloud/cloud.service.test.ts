@@ -10,12 +10,14 @@ import type { AuthUser } from "../../auth/auth.types.js";
 const identityHook = vi.hoisted(() => ({ run: undefined as (() => Promise<void>) | undefined }));
 vi.mock("@masterdns/cloud-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("@masterdns/cloud-providers")>(),
-  createCloudAdapter: ({ credentials }: { credentials: { accessKeyId?: string } }) => ({ verifyIdentity: async () => {
+  evaluateCapabilities: vi.fn((await importOriginal<typeof import("@masterdns/cloud-providers")>()).evaluateCapabilities),
+  createCloudAdapter: ({ credentials }: { credentials: { accessKeyId?: string; subscriptionId?: string; token?: string } }) => ({ verifyIdentity: async () => {
     if (credentials.accessKeyId === "rotated-access-key" || credentials.accessKeyId === "request-access-key") await identityHook.run?.();
-    return { externalAccountId: credentials.accessKeyId?.startsWith("other-") ? "999999999999" : "123456789012" };
+    return { externalAccountId: credentials.subscriptionId ?? (credentials.token ? (credentials.token.startsWith("other-") ? "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" : "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa") : credentials.accessKeyId?.startsWith("other-") ? "999999999999" : "123456789012") };
   } }),
 }));
 vi.mock("../../config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
+import { evaluateCapabilities } from "@masterdns/cloud-providers";
 import { CloudService } from "./cloud.service.js";
 import { CloudController } from "./cloud.controller.js";
 import { CloudBindingsService } from "./cloud-bindings.service.js";
@@ -68,6 +70,44 @@ async function fixture(managed = false) {
 }
 
 describe("cloud account and authorization API", () => {
+  it("encrypts provider credentials and keeps provider hints and audit payloads secret-free", async () => {
+    const f = await fixture();
+    const azure = { kind: "azure_service_principal" as const, tenantId: "11111111-1111-4111-8111-111111111111", subscriptionId: "22222222-2222-4222-8222-222222222222", clientId: "33333333-3333-4333-8333-333333333333", clientSecret: "azure-client-secret" };
+    const azureAccount = await create(f.actor, { name: "Azure", provider: "azure", regions: ["australiaeast"], credentials: azure });
+    const linodeAccount = await create(f.actor, { name: "Linode", provider: "linode", regions: ["ap-south"], credentials: { kind: "linode_token", token: "linode-secret-token" } });
+    expect(azureAccount).toMatchObject({ provider: "azure", externalAccountId: azure.subscriptionId, credentialHint: "Service principal ...3333" });
+    expect(linodeAccount).toMatchObject({ provider: "linode", externalAccountId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", credentialHint: "Linode API token" });
+    await expect(service.rotateCredentials(f.actor, azureAccount.id, { credentials: { ...azure, subscriptionId: "44444444-4444-4444-8444-444444444444" } })).rejects.toMatchObject({ status: 409 });
+    await expect(service.rotateCredentials(f.actor, linodeAccount.id, { credentials: { kind: "linode_token", token: "other-linode-secret-token" } })).rejects.toMatchObject({ status: 409 });
+    const stored = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.ownerUserId, f.actor.id));
+    const audit = await connection.db.select().from(auditLogs).where(eq(auditLogs.ownerUserId, f.actor.id));
+    const serialized = JSON.stringify({ public: await service.list(f.actor), stored, audit });
+    for (const secret of [azure.clientSecret, "linode-secret-token"]) expect(serialized).not.toContain(secret);
+    expect(azureAccount).not.toHaveProperty("credentialCiphertext");
+    expect(linodeAccount).not.toHaveProperty("credentialIv");
+  });
+  it("rejects cross-provider credential replacement and validates regions using saved provider", async () => {
+    const f = await fixture();
+    await expect(service.rotateCredentials(f.actor, f.account.id, { credentials: { kind: "linode_token", token: "secret-token" } })).rejects.toMatchObject({ status: 400 });
+    await expect(service.setRegions(f.actor, f.account.id, ["australiaeast"])).rejects.toMatchObject({ status: 400 });
+    await connection.db.update(cloudAccounts).set({ provider: "azure" }).where(eq(cloudAccounts.id, f.account.id));
+    await expect(service.setRegions(f.actor, f.account.id, ["australiaeast"])).resolves.toMatchObject({ regions: ["australiaeast"] });
+    await expect(service.setRegions(f.actor, f.account.id, ["us-east-1"])).rejects.toMatchObject({ status: 400 });
+  });
+  it("reconstructs exact normalized provider metadata and standard address fields for capability evaluation", async () => {
+    const f = await fixture();
+    const ipConfigurationId = "/subscriptions/22222222-2222-4222-8222-222222222222/resourceGroups/" + "r".repeat(90) + "/providers/Microsoft.Network/networkInterfaces/" + "n".repeat(90) + "/ipConfigurations/exact-config";
+    const instanceMetadata = { azure: { supported: true } };
+    const interfaceMetadata = { nicId: ipConfigurationId.split("/ipConfigurations/")[0], ipConfigurationId };
+    const addressMetadata = { sku: "Standard", allocationMethod: "Static" };
+    await connection.db.update(cloudInstances).set({ service: "azure_vm", region: "australiaeast", metadata: { present: true, providerMetadata: instanceMetadata } }).where(eq(cloudInstances.id, f.instance.id));
+    await connection.db.update(cloudInterfaces).set({ externalId: ipConfigurationId, metadata: { primaryAddresses: [f.address.address], providerMetadata: interfaceMetadata } }).where(eq(cloudInterfaces.id, f.iface.id));
+    await connection.db.update(cloudAddresses).set({ remoteAllocationId: ipConfigurationId + "/allocation", metadata: { providerMetadata: addressMetadata, privateAddress: "10.0.0.4", resourceId: ipConfigurationId + "/resource" } }).where(eq(cloudAddresses.id, f.address.id));
+    const slots = await service.slots(f.actor, f.instance.id);
+    expect(slots[0]!.capability).toMatchObject({ available: false, reason: "service_unavailable" });
+    expect(vi.mocked(evaluateCapabilities).mock.lastCall?.[1]).toMatchObject({ metadata: instanceMetadata, interfaces: [{ id: ipConfigurationId, metadata: interfaceMetadata, addresses: [{ metadata: addressMetadata, privateAddress: "10.0.0.4", resourceId: ipConfigurationId + "/resource", allocationId: ipConfigurationId + "/allocation" }] }] });
+    expect(JSON.stringify(await service.list(f.actor))).not.toContain("test-secret-access-key");
+  });
   it("filters accounts by owner and rejects cross-owner instance access", async () => {
     const a = await fixture(); const b = await fixture();
     expect((await service.list(a.actor)).map((row) => row.id)).toEqual([a.account.id]);

@@ -111,7 +111,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     attemptId: uuid("attempt_id").notNull().references(() => rotationAttempts.id, { onDelete: "restrict" }),
     addressId: uuid("address_id"),
     address: varchar("address", { length: 45 }).notNull(),
-    allocationId: varchar("allocation_id", { length: 255 }),
+    allocationId: text("allocation_id"),
     resourceId: text("resource_id"),
     origin: varchar("origin", { length: 16 }).$type<"user" | "system">().notNull(),
     ownershipAttemptId: uuid("ownership_attempt_id"),

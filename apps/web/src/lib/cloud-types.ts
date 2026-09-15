@@ -1,9 +1,9 @@
-import type { SlotRef } from "@masterdns/contracts";
+import type { CloudProvider, CloudService, SlotRef } from "@masterdns/contracts";
 
 export type CloudAccount = {
   id: string;
   ownerUserId: string;
-  provider: "aws";
+  provider: CloudProvider;
   name: string;
   credentialHint: string | null;
   enabled: boolean;
@@ -16,7 +16,7 @@ export type CloudAccount = {
 export type CloudScope = {
   id: string;
   accountId: string;
-  service: "ec2" | "lightsail";
+  service: CloudService;
   region: string;
   generation: number;
   lastStartedAt: string | null;
@@ -29,7 +29,7 @@ export type CloudScope = {
 export type CloudInstance = {
   id: string;
   accountId: string;
-  service: "ec2" | "lightsail";
+  service: CloudService;
   region: string;
   externalId: string;
   name: string | null;
@@ -78,6 +78,7 @@ export type CloudAddress = {
   kind?: "host" | "prefix";
   origin?: "user" | "system";
   remoteAllocationId?: string | null;
+  metadata?: Record<string, unknown>;
   scanGeneration?: number;
 };
 

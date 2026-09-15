@@ -9,7 +9,9 @@ export type RotationAction =
   | "ec2.eip.allocate" | "ec2.eip.associate" | "ec2.eip.release"
   | "ec2.ipv6.assign" | "ec2.ipv6.unassign"
   | "lightsail.static-ip.allocate" | "lightsail.static-ip.detach" | "lightsail.static-ip.attach" | "lightsail.static-ip.release"
-  | "lightsail.ipv6.disable" | "lightsail.ipv6.enable";
+  | "lightsail.ipv6.disable" | "lightsail.ipv6.enable"
+  | "azure.public-ip.allocate" | "azure.public-ip.associate" | "azure.public-ip.delete"
+  | "linode.ipv4.allocate" | "linode.instance.reboot" | "linode.ipv4.release";
 
 /** Trusted server-side evidence captured while the original allocation belonged to this slot. */
 export type CleanupOwnershipSnapshot = {
@@ -27,8 +29,11 @@ export type RotationStepArguments = {
   before: CloudInventory;
   phase: "rotation" | "post_publish_cleanup";
   receipt?: CloudStepResult;
-  /** Persisted applied allocation observation, carried into Lightsail detach/attach. */
+  /** Persisted applied allocation observation, carried into subsequent provider steps. */
   candidateReceipt?: CloudStepResult;
+  /** Trusted receipts from earlier persisted applied steps, in execution order. */
+  priorReceipts?: Array<{ action: string; receipt: CloudStepResult }>;
+  allowStop?: boolean;
   /** Set on recovery of a previously dispatched step; never blindly reissue uncertain writes. */
   previousExecution?: boolean;
   failedCandidates?: string[];
@@ -45,7 +50,7 @@ export function rotationArguments(step: CloudStep): RotationStepArguments {
     throw new CloudError("invalid_rotation_step", false);
   }
   if (![a.slot.accountId, a.slot.instanceId, a.slot.region, a.slot.slotId, a.slot.interfaceId, a.slot.address].every(value => typeof value === "string" && value.length > 0)
-    || !["ec2", "lightsail"].includes(a.slot.service) || ![4, 6].includes(a.slot.family)
+    || !["ec2", "lightsail", "azure_vm", "linode"].includes(a.slot.service) || ![4, 6].includes(a.slot.family)
     || !["rotation", "post_publish_cleanup"].includes(a.phase) || !Array.isArray(a.before.interfaces)) throw new CloudError("invalid_rotation_step", false);
   if (a.slot.accountId !== a.before.ref?.accountId || a.slot.instanceId !== a.before.ref?.instanceId || a.slot.region !== a.before.ref?.region || a.slot.service !== a.before.ref?.service) {
     throw new CloudError("invalid_rotation_step", false);
@@ -54,18 +59,21 @@ export function rotationArguments(step: CloudStep): RotationStepArguments {
 }
 
 export function makeRotationStep(action: RotationAction, args: RotationStepArguments, index: number): CloudStep {
-  return {
+  const step: CloudStep = {
     id: `${args.attemptId}:${index}:${action}`,
     action,
     resourceKey: JSON.stringify([args.slot.accountId, args.slot.service, args.slot.region, args.slot.instanceId, args.slot.interfaceId, args.slot.slotId]),
     arguments: structuredClone(args) as unknown as Record<string, unknown>,
     destructive: !action.endsWith("allocate") && action !== "ec2.ipv6.assign",
   };
+  rotationArguments(step);
+  return step;
 }
 
 export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string }): CloudStep[] {
   const capability = evaluateCapabilities(slot, inventory);
   if (!capability.available) throw new CloudError("rotation_unsupported", false, undefined, capability.reason);
+  if (capability.requiresStop && !options.allowStop) throw new CloudError("rotation_unsupported", false, undefined, "stop_not_authorized");
   const address = inventory.interfaces.find(i => i.id === slot.interfaceId)!.addresses.find(a => a.address === slot.address && a.family === slot.family)!;
   let actions: RotationAction[];
   if (slot.service === "ec2") {
@@ -85,13 +93,16 @@ export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, opti
 }
 
 /** Build only after DNS publication, fresh release authorization and trusted ownership evidence. */
-export function planCloudRotationCleanup(slot: SlotRef, inventory: CloudInventory, options: {
+export type CleanupPlanOptions = {
   attemptId: string;
   releaseAuthorized: boolean;
   publishedAddress: string;
   ownershipAttemptId?: string;
   ownershipSnapshot?: CleanupOwnershipSnapshot;
-}): CloudStep[] {
+  allowStop?: boolean;
+};
+
+export function planCloudRotationCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {
   if (!options.releaseAuthorized || !options.publishedAddress || options.publishedAddress === slot.address) throw new CloudError("cleanup_not_authorized", false);
   // Validate the original slot against its persisted pre-rotation inventory.
   planCloudRotation(slot, inventory, { allowStop: false, attemptId: options.attemptId });

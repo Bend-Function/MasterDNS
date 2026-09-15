@@ -2,14 +2,14 @@ import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@ne
 import { and, eq, ne, or, sql } from "drizzle-orm";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, managedAddressSlots } from "@masterdns/db";
 import { CloudError, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
-import { queueNames, type CloudSyncJob } from "@masterdns/contracts";
+import { queueNames, cloudProviderServices, cloudServiceProvider, validCloudRegion, type CloudService, type CloudSyncJob } from "@masterdns/contracts";
 import { Worker } from "bullmq";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
 import { env } from "../env.js";
 import { CloudRuntimeService } from "./cloud-runtime.service.js";
 
-type Service = "ec2" | "lightsail";
+type Service = CloudService;
 type ScanResult = { scopeStatus: "complete" | "failed"; removedInstances: number; errorCode?: string };
 
 @Injectable()
@@ -37,7 +37,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
     const [account] = await this.database.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId));
     if (!account?.enabled) return [];
     const results: Array<ScanResult & { service: Service; region: string }> = [];
-    for (const service of ["ec2", "lightsail"] as const) {
+    for (const service of cloudProviderServices[account.provider]) {
       try {
         const adapter = await this.runtime.adapter(accountId, service);
         const regions = await adapter.listScopes();
@@ -58,6 +58,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
   async scanScope(accountId: string, service: Service, region: string, adapter: CloudAdapter, expectedAccount?: typeof cloudAccounts.$inferSelect): Promise<ScanResult> {
     const [account] = await this.database.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId));
     if (!account?.enabled) return { scopeStatus: "failed", removedInstances: 0, errorCode: "account_unavailable" };
+    if (cloudServiceProvider(service) !== account.provider || !validCloudRegion(account.provider, region)) return { scopeStatus: "failed", removedInstances: 0, errorCode: "invalid_scope" };
     if (account.regions !== null && !account.regions.includes(region)) return { scopeStatus: "failed", removedInstances: 0, errorCode: "region_excluded" };
     const [scope] = await this.database.db.insert(cloudScanScopes).values({ accountId, service, region, lastStartedAt: new Date() })
       .onConflictDoUpdate({ target: [cloudScanScopes.accountId, cloudScanScopes.service, cloudScanScopes.region], set: { lastStartedAt: new Date(), updatedAt: new Date() } }).returning();
@@ -87,24 +88,25 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         const generation = scope.generation + 1;
         const now = new Date();
         for (const item of items) {
-          const metadata = { present: true, ...(item.nativeName !== undefined ? { nativeName: item.nativeName } : {}), ...(item.ipv6Only !== undefined ? { ipv6Only: item.ipv6Only } : {}) };
+          const metadata = { present: true, providerMetadata: item.metadata ?? {}, ...(item.nativeName !== undefined ? { nativeName: item.nativeName } : {}), ...(item.ipv6Only !== undefined ? { ipv6Only: item.ipv6Only } : {}) };
           const [instance] = await tx.insert(cloudInstances).values({ accountId, service, region, externalId: item.ref.instanceId, name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now })
             .onConflictDoUpdate({ target: [cloudInstances.accountId, cloudInstances.service, cloudInstances.region, cloudInstances.externalId], set: { name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now, updatedAt: now } }).returning();
           if (!instance) throw new Error("Cloud instance insert returned no row");
           for (const remote of item.interfaces) {
-            const interfaceMetadata = { ...(remote.deviceIndex === undefined ? {} : { deviceIndex: remote.deviceIndex }), primaryAddresses: remote.addresses.filter((address) => address.primary).map((address) => address.address) };
+            const interfaceMetadata = { providerMetadata: remote.metadata ?? {}, ...(remote.deviceIndex === undefined ? {} : { deviceIndex: remote.deviceIndex }), primaryAddresses: remote.addresses.filter((address) => address.primary).map((address) => address.address) };
             const [iface] = await tx.insert(cloudInterfaces).values({ instanceId: instance.id, externalId: remote.id, name: remote.deviceIndex === undefined ? null : `eth${remote.deviceIndex}`, metadata: interfaceMetadata, scanGeneration: generation, lastSeenAt: now })
               .onConflictDoUpdate({ target: [cloudInterfaces.instanceId, cloudInterfaces.externalId], set: { name: remote.deviceIndex === undefined ? null : `eth${remote.deviceIndex}`, metadata: interfaceMetadata, scanGeneration: generation, lastSeenAt: now, updatedAt: now } }).returning();
             if (!iface) throw new Error("Cloud interface insert returned no row");
             for (const observed of remote.addresses) {
               const kind = observed.prefixLength === undefined ? "host" : "prefix";
               const family = observed.family === 4 ? "4" : "6";
-              const values = { interfaceId: iface.id, kind, family, address: observed.address, prefixLength: observed.prefixLength ?? null, remoteAllocationId: observed.allocationId ?? null, origin: "user", scanGeneration: generation, lastSeenAt: now } as const;
+              const addressMetadata = { providerMetadata: observed.metadata ?? {}, ...(observed.privateAddress === undefined ? {} : { privateAddress: observed.privateAddress }), ...(observed.resourceId === undefined ? {} : { resourceId: observed.resourceId }) };
+              const values = { metadata: addressMetadata, interfaceId: iface.id, kind, family, address: observed.address, prefixLength: observed.prefixLength ?? null, remoteAllocationId: observed.allocationId ?? null, origin: "user", scanGeneration: generation, lastSeenAt: now } as const;
               // Preserve known origin/attempt ownership; a scan never establishes system ownership.
               const [address] = await tx.insert(cloudAddresses).values(values).onConflictDoUpdate({
                 target: kind === "host" ? [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address] : [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address, cloudAddresses.prefixLength],
                 targetWhere: kind === "host" ? sql`${cloudAddresses.kind} = 'host'` : sql`${cloudAddresses.kind} = 'prefix'`,
-                set: { remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
+                set: { metadata: addressMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
               }).returning();
               if (kind === "host" && address) {
                 // Existing slot pointers and versions are exclusively managed by the verified

@@ -1,8 +1,17 @@
-import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
+import type { CloudProvider, CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
 export type AwsCredentials =
   | { kind: "access_key"; accessKeyId: string; secretAccessKey: string; sessionToken?: string }
   | { kind: "role"; roleArn?: string; externalId?: string };
+
+export type AzureCredentials = { kind: "azure_service_principal"; tenantId: string; subscriptionId: string; clientId: string; clientSecret: string };
+export type LinodeCredentials = { kind: "linode_token"; token: string };
+export type CloudCredentials = AwsCredentials | AzureCredentials | LinodeCredentials;
+export function credentialsMatchProvider(provider: CloudProvider, credentials: { kind: string }): boolean {
+  return provider === "aws" ? credentials.kind === "access_key" || credentials.kind === "role"
+    : provider === "azure" ? credentials.kind === "azure_service_principal"
+      : provider === "linode" && credentials.kind === "linode_token";
+}
 
 export type CloudAddress = {
   address: string;
@@ -12,6 +21,7 @@ export type CloudAddress = {
   privateAddress?: string;
   resourceId?: string;
   prefixLength?: number;
+  metadata?: Record<string, unknown>;
 };
 
 export type CloudInventory = {
@@ -20,7 +30,8 @@ export type CloudInventory = {
   name: string;
   state: string;
   ipv6Only?: boolean;
-  interfaces: Array<{ id: string; deviceIndex?: number; addresses: CloudAddress[] }>;
+  metadata?: Record<string, unknown>;
+  interfaces: Array<{ id: string; deviceIndex?: number; metadata?: Record<string, unknown>; addresses: CloudAddress[] }>;
 };
 
 export type CloudPage = { items: CloudInventory[]; cursor?: string };
