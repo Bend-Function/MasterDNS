@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { addressHealthPolicies, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, probeAgents } from "@masterdns/db";
+import { addressHealthStates, addressHealthPolicies, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, probeAgents } from "@masterdns/db";
 import { fixture, testDatabase } from "./health-policy-test-utils.js";
 import { HealthPoliciesService } from "./health-policies.service.js";
 let connection: Awaited<ReturnType<typeof testDatabase>>;
@@ -46,4 +46,22 @@ it("creates slot config without any linked endpoint and enforces family and owne
  expect(await service.save(actor, input)).toMatchObject({ slotId: slot!.id, endpointId: null });
  await expect(service.save(actor, { ...input, family: "6" })).rejects.toMatchObject({ status: 400 });
  expect(await connection.db.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, slot!.id))).toHaveLength(1);
+ const http = await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-long-header": "b", "x-a": "a" } } });
+ const expiresAt = new Date(Date.now()+60000);
+ const [state] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
+ const repeated = await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-a": "a", "x-long-header": "b" } } });
+ expect(repeated.revision).toBe(http.revision);
+ expect((await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-long-header": "b", "x-a": "a" } } })).revision).toBe(http.revision);
+ expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, state!.id)))[0]).toMatchObject({ latestDecision: "success", evidenceExpiresAt: expiresAt });
+ const local = await service.save(actor, { ...input, configId: http.id, mode: "local", consensus: { mode: "at_least", minimumValid: 2, failureVotes: 2 } });
+ expect(local).toMatchObject({ mode: "local", groupId: null, consensus: { mode: "all", minimumValid: 1 } });
+});
+it("preserves revision and evidence for reordered JSONB consensus and HTTP headers", async () => {
+ const f = await fixture(connection.db); const actor = f.actor as never;
+ const input = { endpointId: f.endpoint.id, family: "4", configId: f.config.id, mode: "external", groupId: f.group.id, consensus: { mode: "at_least", minimumValid: 2, failureVotes: 1 } };
+ const policy = await service.save(actor, input);
+ const expiresAt = new Date(Date.now()+60000);
+ const [state] = await connection.db.insert(addressHealthStates).values({ endpointId: f.endpoint.id, family: "4", latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
+ expect((await service.save(actor, { ...input, consensus: { failureVotes: 1, minimumValid: 2, mode: "at_least" } })).revision).toBe(policy.revision);
+ expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, state!.id)))[0]).toMatchObject({ latestDecision: "success", evidenceExpiresAt: expiresAt });
 });

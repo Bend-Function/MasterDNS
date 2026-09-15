@@ -1,13 +1,16 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import { advanceRoundHealth, evaluateProbeRound } from "@masterdns/automation";
 import { CheckerRegistry } from "@masterdns/checkers";
-import type { ProbeOutcome } from "@masterdns/contracts";
+import { isAllowedProbeTarget, type ProbeOutcome } from "@masterdns/contracts";
 import { addressHealthPolicies, addressHealthStates, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeAgents, probeGroups, probeObservations, probeRounds } from "@masterdns/db";
-import { and, eq, gt, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, gt, isNull, notInArray, sql } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { HealthResultService } from "../health/health-result.service.js";
 @Injectable()
 export class ProbeHealthService {
+  private readonly logger = new Logger(ProbeHealthService.name);
+  private readonly localChecks = new Set<string>();
+  private admittingLocal = false;
   constructor(private readonly database: DatabaseService, private readonly results: HealthResultService) {}
   async closeRound(roundId: string, now = new Date()) {
     return this.database.db.transaction(async tx => {
@@ -22,7 +25,7 @@ export class ProbeHealthService {
       if (!round || round.status !== "pending") return undefined;
       const fresh = !!target && !!state && !!policy && !!config?.enabled 
         && config.revision === round.configVersion && policy.id === state.policyId && policy.revision === round.policyRevision
-        && policy.configId === config.id && policy.groupId === round.groupId && (round.groupId ? group?.revision === round.groupRevision : policy.mode === "local" && round.groupRevision === null)
+        && policy.configId === config.id && (policy.mode === "local" ? round.groupId === null : policy.groupId === round.groupId) && (round.groupId ? group?.revision === round.groupRevision : policy.mode === "local" && round.groupRevision === null)
         && target.addressVersion === round.addressVersion && target.addressId === state.addressId && target.address === round.address
         && state.configVersion === round.configVersion && state.policyRevision === policy.revision && state.groupRevision === (group?.revision ?? null)
         && state.lastAppliedSequence < round.sequence;
@@ -54,16 +57,41 @@ export class ProbeHealthService {
     const rows = await this.database.db.update(probeRounds).set({ localOutcome: outcome, localReceivedAt: now }).where(and(eq(probeRounds.id, roundId), eq(probeRounds.status, "pending"), isNull(probeRounds.localReceivedAt), gt(probeRounds.deadline, now), sql`${probeRounds.memberIds} @> '["local"]'::jsonb`)).returning();
     return rows.length > 0;
   }
-  async checkLocal(roundId: string) {
-    const [round] = await this.database.db.select().from(probeRounds).where(eq(probeRounds.id, roundId));
-    if (!round?.memberIds.includes("local") || round.status !== "pending" || round.localReceivedAt || round.deadline <= new Date()) return;
-    const registry = new CheckerRegistry(undefined, { allowPrivate: process.env.ALLOW_PRIVATE_HEALTH_TARGETS === "true" && !!round.networkPolicy });
-    const config = round.config;
-    const port = config.type === "tcp" ? config.port : config.port ?? (config.protocol === "https" ? 443 : 80);
+  async checkPendingLocal(now = new Date()) {
+    const capacity = 20 - this.localChecks.size;
+    if (this.admittingLocal || capacity <= 0) return;
+    this.admittingLocal = true;
     try {
-      const result = await registry.get(config.type).check({ address: round.address, family: Number(round.family) as 4 | 6, port, hostname: config.type === "http" ? config.hostname ?? round.hostname ?? undefined : undefined }, config as never);
-      const unavailable = ["target_not_allowed", "invalid_target", "eafnosupport", "eaddrnotavail", "enetunreach", "abort_err"].includes(result.errorCode ?? "");
-      await this.recordLocal(round.id, unavailable ? "unavailable" : result.success ? "success" : "failure");
-    } catch { await this.recordLocal(round.id, "unavailable"); }
+      const pending = await this.database.db.select({ id: probeRounds.id }).from(probeRounds).where(and(
+        eq(probeRounds.status, "pending"), isNull(probeRounds.localReceivedAt), gt(probeRounds.deadline, now),
+        sql`${probeRounds.memberIds} @> '["local"]'::jsonb`,
+        this.localChecks.size ? notInArray(probeRounds.id, [...this.localChecks]) : undefined,
+      )).orderBy(asc(probeRounds.deadline), asc(probeRounds.id)).limit(capacity);
+      for (const round of pending) void this.checkLocal(round.id).catch(error => this.logger.warn(String(error)));
+    } finally { this.admittingLocal = false; }
+  }
+  async checkLocal(roundId: string) {
+    if (this.localChecks.size >= 20 || this.localChecks.has(roundId)) return;
+    this.localChecks.add(roundId);
+    try {
+      const [round] = await this.database.db.select().from(probeRounds).where(eq(probeRounds.id, roundId));
+      if (!round?.memberIds.includes("local") || round.status !== "pending" || round.localReceivedAt || round.deadline <= new Date()) return;
+      const family = Number(round.family) as 4 | 6;
+      const privateOptIn = process.env.ALLOW_PRIVATE_HEALTH_TARGETS === "true";
+      if (!isAllowedProbeTarget(round.address, family, privateOptIn ? round.networkPolicy ?? undefined : undefined)) {
+        await this.recordLocal(round.id, "unavailable");
+        return;
+      }
+      const registry = new CheckerRegistry(undefined, { allowPrivate: privateOptIn });
+      const config = round.config;
+      const port = config.type === "tcp" ? config.port : config.port ?? (config.protocol === "https" ? 443 : 80);
+      const remaining = round.deadline.getTime() - Date.now();
+      if (remaining <= 0) return;
+      try {
+        const result = await registry.get(config.type).check({ address: round.address, family, port, hostname: config.type === "http" ? config.hostname ?? round.hostname ?? undefined : undefined }, config as never, AbortSignal.timeout(remaining));
+        const unavailable = ["target_not_allowed", "invalid_target", "eafnosupport", "eaddrnotavail", "enetunreach", "abort_err"].includes(result.errorCode ?? "");
+        await this.recordLocal(round.id, unavailable ? "unavailable" : result.success ? "success" : "failure");
+      } catch { await this.recordLocal(round.id, "unavailable"); }
+    } finally { this.localChecks.delete(roundId); }
   }
 }

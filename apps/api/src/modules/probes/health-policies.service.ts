@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { externalHealthCheckConfigSchema, healthCheckConfigSchema } from "@masterdns/contracts";
 import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, resetHealthEvidence, type HealthTargetIdentity, type ProbeTransaction } from "@masterdns/db";
@@ -10,6 +11,7 @@ export class HealthPoliciesService {
   constructor(private readonly database: DatabaseService) {}
   async save(actor: AuthUser, body: unknown) {
     const input = healthPolicyInputSchema.parse(body);
+    if (input.mode === "local") { delete input.groupId; input.consensus = { mode: "all", minimumValid: 1 }; }
     if (input.networkPolicy && actor.role !== "admin") throw new ForbiddenException("Private targets require administrator authorization");
     return this.database.db.transaction(async tx => {
       const owner = await this.lockOwner(tx, actor, input);
@@ -30,7 +32,7 @@ export class HealthPoliciesService {
       const where = input.slotId ? eq(addressHealthPolicies.slotId, input.slotId) : and(eq(addressHealthPolicies.endpointId, input.endpointId!), eq(addressHealthPolicies.family, input.family));
       const [current] = await tx.select().from(addressHealthPolicies).where(where).for("update");
       if (expectedRevision !== undefined && current?.revision !== expectedRevision) throw new ConflictException("Health policy revision changed");
-      if (current && Object.entries(values).every(([key, value]) => JSON.stringify(current[key as keyof typeof current]) === JSON.stringify(value))) return current;
+      if (current && Object.entries(values).every(([key, value]) => isDeepStrictEqual(current[key as keyof typeof current], value))) return current;
       const [saved] = current
         ? await tx.update(addressHealthPolicies).set({ ...values, revision: current.revision+1, updatedAt: new Date() }).where(eq(addressHealthPolicies.id, current.id)).returning()
         : await tx.insert(addressHealthPolicies).values(values).returning();
@@ -56,7 +58,7 @@ export class HealthPoliciesService {
         if (input.config.timeoutMs + 1000 > policy.executionWindowSeconds*1000) throw new BadRequestException("Check timeout exceeds the round window");
       }
       if (input.expectedRevision !== undefined && current?.revision !== input.expectedRevision) throw new ConflictException("Health configuration revision changed");
-      if (current && JSON.stringify(healthCheckConfigSchema.parse(current.config)) === JSON.stringify(input.config)) return current;
+      if (current && isDeepStrictEqual(healthCheckConfigSchema.parse(current.config), input.config)) return current;
       const values = { slotId, checkerType: input.config.type, config: input.config };
       const [saved] = current ? await tx.update(healthCheckConfigs).set({ ...values, revision: current.revision+1, updatedAt: new Date() }).where(eq(healthCheckConfigs.id, current.id)).returning() : await tx.insert(healthCheckConfigs).values(values).returning();
       await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: new Date(), updatedAt: new Date() }).where(eq(addressHealthStates.slotId, slotId));

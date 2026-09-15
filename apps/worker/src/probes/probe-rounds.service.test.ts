@@ -173,3 +173,21 @@ it("historical healthy state does not satisfy fresh authority until the success 
   expect(state).toMatchObject({ healthState: "healthy", latestDecision: "success", consecutiveSuccesses: 1 });
   expect(hasFreshHealthEvidence(state!, "success", f.policy, next!.deadline)).toBe(false);
 });
+
+it("normalizes legacy local-slot cohorts and timestamps evidence expiry once", async () => {
+ const slot = await slotTarget("local");
+ await connection.db.update(addressHealthPolicies).set({ groupId: slot.group.id, consensus: { mode: "all", minimumValid: 2 } }).where(eq(addressHealthPolicies.id, slot.policy.id));
+ const local = await scheduler.schedulePolicy(slot.policy.id, now);
+ expect(local!.memberIds).toEqual(["local"]);
+ expect(await connection.db.select().from(probeTasks).where(eq(probeTasks.roundId, local!.id))).toHaveLength(0);
+ await health.recordLocal(local!.id, "success", new Date(now.getTime()+1000));
+ expect(await health.closeRound(local!.id, local!.deadline)).toBe("success");
+});
+it("timestamps evidence expiry once for downstream notification deduplication", async () => {
+ const f = await target(); const first = await scheduler.schedulePolicy(f.policy.id, now); await vote(first!.id, "success"); await health.closeRound(first!.id, first!.deadline);
+ const expiry = new Date(now.getTime()+90000); await scheduler.schedulePolicy(f.policy.id, expiry);
+ const [state] = await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id));
+ expect(state).toMatchObject({ latestDecision: "unknown", stateChangedAt: expiry });
+ await scheduler.schedulePolicy(f.policy.id, new Date(expiry.getTime()+15000));
+ expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id)))[0]!.stateChangedAt).toEqual(expiry);
+});

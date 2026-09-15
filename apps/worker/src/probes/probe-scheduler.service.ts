@@ -16,9 +16,10 @@ export class ProbeSchedulerService implements OnModuleInit, OnModuleDestroy {
     try {
       const pending = await this.database.db.select().from(probeRounds).where(and(eq(probeRounds.status, "pending"), lte(probeRounds.deadline, now)));
       for (const round of pending) await this.health.closeRound(round.id, now);
+      await this.health.checkPendingLocal(now);
       const policies = await this.database.db.select().from(addressHealthPolicies);
       for (const policy of policies) {
-        try { const round = await this.schedulePolicy(policy.id, now); if (round?.memberIds.includes("local")) void this.health.checkLocal(round.id).catch(error => this.logger.warn(String(error))); }
+        try { await this.schedulePolicy(policy.id, now); await this.health.checkPendingLocal(now); }
         catch (error) { this.logger.warn(`Probe policy ${policy.id}: ${String(error)}`); }
       }
     } catch (error) { this.logger.error(String(error)); }
@@ -31,7 +32,7 @@ export class ProbeSchedulerService implements OnModuleInit, OnModuleDestroy {
       const target = await lockHealthTarget(tx, snapshot, true, now);
       if (!target || target.addressVersion < 1) return undefined;
       const [config] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, snapshot.configId)).for("share");
-      const [group] = snapshot.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, snapshot.groupId)).for("share") : [];
+      const [group] = snapshot.mode !== "local" && snapshot.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, snapshot.groupId)).for("share") : [];
       const [policy] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId)).for("share");
       if (!policy || policy.revision !== snapshot.revision || !config?.enabled || (!group && policy.mode !== "local")) return undefined;
       let [state] = await tx.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, snapshot));
@@ -39,14 +40,14 @@ export class ProbeSchedulerService implements OnModuleInit, OnModuleDestroy {
       const changed = !state || Object.entries(epoch).some(([key, value]) => state![key as keyof typeof state] !== value);
       if (!changed && state?.nextRoundAt && state.nextRoundAt > now) return undefined;
       if (state && !changed && state.evidenceExpiresAt && state.evidenceExpiresAt <= now) {
-        [state] = await tx.update(addressHealthStates).set({ consecutiveSuccesses: 0, consecutiveFailures: 0, latestDecision: "unknown", evidenceExpiresAt: null, updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
+        [state] = await tx.update(addressHealthStates).set({ consecutiveSuccesses: 0, consecutiveFailures: 0, latestDecision: "unknown", evidenceExpiresAt: null, ...(state.latestDecision !== "unknown" ? { stateChangedAt: now } : {}), updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
       }
       if (state && changed) {
         [state] = await tx.update(addressHealthStates).set({ ...resetHealthEvidence, ...epoch, stateChangedAt: now, updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
       } else if (!state) {
         [state] = await tx.insert(addressHealthStates).values({ slotId: snapshot.slotId, endpointId: snapshot.endpointId, family: snapshot.family, ...epoch, stateChangedAt: now }).returning();
       }
-      const round = await createProbeRound(tx, { id: "worker", role: "admin" }, { slotId: snapshot.slotId ?? undefined, endpointAddressId: snapshot.endpointId ? target.addressId : undefined, configId: config.id, groupId: group?.id, addressVersion: target.addressVersion, consensus: policy.consensus, deadline: new Date(now.getTime()+policy.executionWindowSeconds*1000), resultExpiresAt: new Date(now.getTime()+policy.resultExpirySeconds*1000), networkPolicy: policy.networkPolicy ?? undefined, includeLocal: policy.mode !== "external", dispatchCapableOnly: true, policyId: policy.id, policyRevision: policy.revision }, now);
+      const round = await createProbeRound(tx, { id: "worker", role: "admin" }, { slotId: snapshot.slotId ?? undefined, endpointAddressId: snapshot.endpointId ? target.addressId : undefined, configId: config.id, groupId: group?.id, addressVersion: target.addressVersion, consensus: policy.mode === "local" ? { mode: "all", minimumValid: 1 } : policy.consensus, deadline: new Date(now.getTime()+policy.executionWindowSeconds*1000), resultExpiresAt: new Date(now.getTime()+policy.resultExpirySeconds*1000), networkPolicy: policy.networkPolicy ?? undefined, includeLocal: policy.mode !== "external", dispatchCapableOnly: true, policyId: policy.id, policyRevision: policy.revision }, now);
       await tx.update(addressHealthStates).set({ nextRoundAt: new Date(now.getTime()+policy.checkIntervalSeconds*1000), updatedAt: now }).where(eq(addressHealthStates.id, state!.id));
       return round;
     });
