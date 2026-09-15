@@ -108,9 +108,9 @@ export function Switch({ checked, label, onCheckedChange, onClick, className = "
 
 export function StatusBadge({ value }: { value: string }) {
   const normalized = value.toLowerCase();
-  const tone = ["healthy", "active", "succeeded", "delivered", "applied"].includes(normalized) ? "success"
-    : ["unhealthy", "failed", "error", "disabled", "drifted"].includes(normalized) ? "danger"
-      : ["degraded", "recovering", "running", "retrying", "switching", "partial"].includes(normalized) ? "warning" : "neutral";
+  const tone = ["healthy", "active", "succeeded", "success", "delivered", "applied", "observed", "verified"].includes(normalized) ? "success"
+    : ["unhealthy", "failed", "failure", "error", "disabled", "drifted", "revoked", "exhausted"].includes(normalized) ? "danger"
+      : ["degraded", "recovering", "running", "retrying", "switching", "partial", "paused", "candidate", "pending", "in_flight"].includes(normalized) ? "warning" : "neutral";
   return <span className={`status status-${tone}`}><i />{statusLabel(value)}</span>;
 }
 
@@ -218,6 +218,8 @@ export function MetricStrip({ items }: { items: Array<{ label: string; value: Re
 }
 
 function statusLabel(value: string): string {
-  const labels: Record<string, string> = { healthy: "健康", unhealthy: "故障", degraded: "降级", recovering: "恢复中", unknown: "未知", active: "正常", disabled: "已停用", error: "异常", pending: "等待中", running: "执行中", succeeded: "成功", partial: "部分成功", failed: "失败", superseded: "已过期", delivered: "已送达", retrying: "重试中", switching: "切换中", drifted: "已漂移", maintenance: "维护", enabled: "启用", draining: "排空中", available: "可用", limited: "受限", unverified: "未验证", excluded: "已排除", absent: "已不存在" };
+  if (value.toLowerCase() === "reported") return "已上报";
+  if (value.toLowerCase() === "unavailable") return "不可用";
+  const labels: Record<string, string> = { healthy: "健康", unhealthy: "故障", degraded: "降级", recovering: "恢复中", unknown: "未知", active: "正常", disabled: "已停用", error: "异常", pending: "等待中", in_flight: "执行中", running: "执行中", succeeded: "成功", success: "成功", partial: "部分成功", failed: "失败", failure: "失败", superseded: "已过期", delivered: "已送达", retrying: "重试中", switching: "切换中", drifted: "已漂移", maintenance: "维护", enabled: "启用", draining: "排空中", available: "可用", limited: "受限", unverified: "未验证", excluded: "已排除", absent: "已不存在", revoked: "已吊销", exhausted: "已耗尽", paused: "已暂停", candidate: "候选复测", verified: "已验证", observed: "已观察", applied: "已应用", prepared: "已准备", abandoned: "已放弃", candidate_failed: "候选失败", retained: "保留", released: "已释放", ambiguous: "待确认", not_applied: "未应用", rejected_no_effect: "拒绝且无副作用" };
   return labels[value.toLowerCase()] ?? value;
 }
