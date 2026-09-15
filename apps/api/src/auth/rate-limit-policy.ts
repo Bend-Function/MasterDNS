@@ -21,6 +21,14 @@ export function preAuthRateLimitPolicyFor(request: RateLimitPolicyRequest, route
       ...(identifier ? [{ key: `login-account:${digest(identifier)}`, limit: 10, windowMs: 60_000 }] : []),
     ];
   }
+  if (route.endsWith("/probe-agent/exchange")) return { key: `probe-exchange:${request.ip}`, limit: 20, windowMs: 60_000 };
+  if (route.includes("/probe-agent/")) {
+    const credential = request.headers.authorization ?? request.ip;
+    return [
+      { key: `probe-ip:${request.ip}`, limit: 1200, windowMs: 60_000 },
+      { key: `probe-token:${digest(credential)}`, limit: 240, windowMs: 60_000 },
+    ];
+  }
   if (route.includes("/ddns/heartbeat")) {
     const credential = request.headers.authorization ?? request.ip;
     return [

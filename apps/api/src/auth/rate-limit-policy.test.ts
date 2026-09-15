@@ -62,3 +62,12 @@ describe("API rate-limit policy", () => {
     expect(anonymous).toBeNull();
   });
 });
+
+it("allows one-second agent polls plus results while bounding token and IP traffic", () => {
+  const policy = preAuthRateLimitPolicyFor(request({ headers: { authorization: "Bearer secret" } }), "/api/v1/probe-agent/tasks/lease");
+  expect(Array.isArray(policy)).toBe(true);
+  if (!Array.isArray(policy)) throw new Error("missing buckets");
+  expect(policy.map(p => p.limit)).toEqual([1200, 240]);
+  expect(JSON.stringify(policy)).not.toContain("secret");
+  expect(preAuthRateLimitPolicyFor(request(), "/api/v1/probe-agent/exchange")).toMatchObject({ limit: 20, windowMs: 60000 });
+});

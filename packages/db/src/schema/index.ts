@@ -1,3 +1,4 @@
+import { defineProbeSchema } from "./probes.js";
 import { sql } from "drizzle-orm";
 import {
   boolean,
@@ -240,6 +241,7 @@ export const bindingAssignments = pgTable("binding_assignments", {
 }, (table) => [primaryKey({ columns: [table.domainBindingId, table.endpointId] }), index("binding_assignments_endpoint_idx").on(table.endpointId)]);
 
 export const healthCheckConfigs = pgTable("health_check_configs", {
+  slotId: uuid("slot_id").references(() => managedAddressSlots.id, { onDelete: "cascade" }),
   id: uuid("id").primaryKey().defaultRandom(),
   poolId: uuid("pool_id").references(() => endpointPools.id, { onDelete: "cascade" }),
   endpointId: uuid("endpoint_id").references(() => endpoints.id, { onDelete: "cascade" }),
@@ -250,8 +252,9 @@ export const healthCheckConfigs = pgTable("health_check_configs", {
   revision: integer("revision").notNull().default(1),
   ...timestamps,
 }, (table) => [
-  check("health_check_exactly_one_scope", sql`num_nonnulls(${table.poolId}, ${table.endpointId}, ${table.domainBindingId}) = 1`),
+  check("health_check_exactly_one_scope", sql`num_nonnulls(${table.poolId}, ${table.endpointId}, ${table.domainBindingId}, ${table.slotId}) = 1`),
   index("health_check_pool_idx").on(table.poolId),
+  uniqueIndex("health_check_one_active_slot_unique").on(table.slotId).where(sql`${table.slotId} is not null and ${table.enabled} = true`),
   index("health_check_endpoint_idx").on(table.endpointId),
   uniqueIndex("health_check_one_active_pool_unique").on(table.poolId).where(sql`${table.poolId} is not null and ${table.enabled} = true`),
   uniqueIndex("health_check_one_active_endpoint_unique").on(table.endpointId).where(sql`${table.endpointId} is not null and ${table.enabled} = true`),
@@ -465,3 +468,7 @@ export const notificationDeliveries = pgTable("notification_deliveries", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("notification_event_channel_unique").on(table.eventId, table.channelId), index("notification_retry_idx").on(table.status, table.nextRetryAt)]);
+
+export const { probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRounds, probeTasks, probeObservations } = defineProbeSchema({
+  userId: () => users.id, endpointId: () => endpoints.id, endpointAddressId: () => endpointAddresses.id, configId: () => healthCheckConfigs.id, slotId: () => managedAddressSlots.id,
+});
