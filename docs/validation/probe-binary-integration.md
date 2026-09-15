@@ -1,6 +1,6 @@
 # P12a: standalone binary / platform protocol integration
 
-This gate runs the independently built Go Agent against the real Nest `ProbeAgentController`, authentication, lease and result services over HTTPS. It uses an ephemeral PostgreSQL database and real TCP/HTTPS targets in an owned dual-stack Podman network. It does not implement the health scheduler, cloud rotation or DNS publication/recovery gate; those remain P12b.
+This gate runs the independently built Go Agent against the real Nest `ProbeAgentController`, authentication, lease and result services over HTTPS. It uses an ephemeral PostgreSQL database and real TCP/HTTPS targets in an owned dual-stack Podman network. This document describes the P12a stage; the combined command also runs the [P12b scheduler, rotation and DNS recovery gate](multicloud-ip-rotation.md).
 
 ## Run
 
@@ -10,10 +10,11 @@ Prerequisites: Node 22.18+ (native TypeScript stripping), pnpm, OpenSSL, a runni
 pnpm install
 pnpm build:packages
 podman pull docker.io/library/node:22-alpine
+podman pull docker.io/library/redis:7-alpine
 export MASTERDNS_TEST_AGENT_BINARY=/absolute/path/to/prebuilt/masterdns-agent
 export MASTERDNS_TEST_DATABASE_URL=postgres://test_user:test_password@127.0.0.1:55432/test_database
 pnpm test:probe-integration
-pnpm --filter @masterdns/api exec tsc -p test/tsconfig.json
+node node_modules/typescript/bin/tsc -p apps/api/test/tsconfig.integration.json
 ```
 
 The image must be cached; the harness never silently pulls it. The test database URL is mandatory and never falls back to `DATABASE_URL`. Use a dedicated test PostgreSQL server; every run creates and drops its own `mdns_probe_<uuid>` database. Redis is not used by P5's protocol services, and existing PostgreSQL/Redis containers are not stopped or changed.

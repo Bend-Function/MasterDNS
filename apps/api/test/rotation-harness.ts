@@ -2,7 +2,7 @@ import 'reflect-metadata';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { request } from 'node:https';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -14,9 +14,8 @@ import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fa
 import cookie from '@fastify/cookie';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { eq } from 'drizzle-orm';
-import { ZodError } from 'zod';
-import { createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeAgents, probeObservations, probeTasks } from '@masterdns/db';
-import { healthCheckConfigSchema, resultBatchSchema, type ProbeResult, type ProbeTask } from '@masterdns/contracts';
+import { createDatabase, users, endpointPools, probeAgents } from '@masterdns/db';
+import { resultBatchSchema, type ProbeResult } from '@masterdns/contracts';
 import { AuthGuard } from '../src/auth/auth.guard.js';
 import type { AuthUser } from '../src/auth/auth.types.js';
 import { ApiExceptionFilter } from '../src/common/api-exception.filter.js';
@@ -24,7 +23,6 @@ import { ProbeAgentController } from '../src/modules/probes/probe-agent.controll
 import { ProbeAgentAuth } from '../src/modules/probes/probe-agent-auth.js';
 import { ProbeLeasesService } from '../src/modules/probes/probe-leases.service.js';
 import { ProbeResultsService } from '../src/modules/probes/probe-results.service.js';
-import { ProbeRoundsService } from '../src/modules/probes/probe-rounds.service.js';
 import { ProbesService } from '../src/modules/probes/probes.service.js';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
@@ -68,7 +66,7 @@ async function command(program: string, args: string[], input?: string) {
 }
 const podman = (...args: string[]) => command('podman', args);
 
-async function until<T>(label: string, check: () => Promise<T | undefined | false>, timeout = 15_000): Promise<T> {
+export async function until<T>(label: string, check: () => Promise<T | undefined | false>, timeout = 15_000): Promise<T> {
   const deadline = Date.now() + timeout;
   do {
     const result = await check();
@@ -78,7 +76,7 @@ async function until<T>(label: string, check: () => Promise<T | undefined | fals
   throw new Error(`Timed out: ${label}`);
 }
 
-async function main() {
+export async function createIntegrationHarness() {
   const binary = process.env.MASTERDNS_TEST_AGENT_BINARY;
   const databaseUrl = process.env.MASTERDNS_TEST_DATABASE_URL;
   assert(binary, 'MASTERDNS_TEST_AGENT_BINARY must identify a prebuilt Linux binary matching the Podman VM architecture');
@@ -87,6 +85,7 @@ async function main() {
   secrets.push(databaseUrl, testUrl.password);
   await stat(binary);
   await podman('image', 'exists', image);
+  await podman('image', 'exists', 'docker.io/library/redis:7-alpine');
   directory = await mkdtemp(join(tmpdir(), 'masterdns-probe-'));
   await chmod(directory, 0o700);
   await copyFile(resolve(binary), join(directory, 'agent'));
@@ -103,7 +102,7 @@ async function main() {
   // The CA signing key stays on the host and is no longer needed after issuing this test certificate.
   await rm(join(directory, 'ca.key'));
 
-  await podman('network', 'create', '--ipv6', id);
+  await podman('network', 'create', '--subnet', '192.0.2.0/24', id);
   networkCreated = true;
   const target = `${id}_target`;
   await podman('create', '--name', target, '--network', id, image, 'node', '/test/target.cjs');
@@ -113,8 +112,18 @@ async function main() {
   await until('TCP/HTTPS target startup', async () => (await podman('logs', target)).includes('ready'));
   const inspected = JSON.parse(await podman('inspect', target))[0];
   const addresses = inspected.NetworkSettings.Networks[id];
-  assert(addresses.IPAddress && addresses.GlobalIPv6Address, 'The owned Podman network must provide IPv4 and IPv6');
-  const targets = [{ family: 4 as const, address: addresses.IPAddress as string }, { family: 6 as const, address: addresses.GlobalIPv6Address as string }];
+  assert(addresses.IPAddress, 'The owned documentation network must provide IPv4');
+  const targets = [{ family: 4 as const, address: addresses.IPAddress as string }, { family: 4 as const, address: '192.0.2.254' }];
+  const failedTarget = `${id}_failed`;
+  await podman('create', '--name', failedTarget, '--network', id, '--ip', '192.0.2.254', image, 'sleep', 'infinity');
+  containers.push(failedTarget);
+  await podman('start', failedTarget);
+  const redis = `${id}_redis`;
+  await podman('create', '--name', redis, '-p', '127.0.0.1::6379', 'docker.io/library/redis:7-alpine');
+  containers.push(redis);
+  await podman('start', redis);
+  const redisPort = (await podman('port', redis, '6379')).split(':').at(-1);
+  const redisUrl = `redis://127.0.0.1:${redisPort}`;
   const cidrs = targets.map(t => `${t.address}/${t.family === 4 ? 32 : 128}`);
 
   admin = createDatabase(databaseUrl);
@@ -122,14 +131,24 @@ async function main() {
   databaseCreated = true;
   testUrl.pathname = `/${id}`;
   connection = createDatabase(testUrl.toString());
-  await migrate(connection.db, { migrationsFolder: join(root, 'packages/db/drizzle') });
+  const migrations = join(root, 'packages/db/drizzle');
+  const journal = JSON.parse(await readFile(join(migrations, 'meta/_journal.json'), 'utf8'));
+  const older = join(directory, 'before-publication');
+  await mkdir(join(older, 'meta'), { recursive: true });
+  const entries = journal.entries.filter((entry: { idx: number }) => entry.idx < 19);
+  for (const entry of entries) await copyFile(join(migrations, `${entry.tag}.sql`), join(older, `${entry.tag}.sql`));
+  await writeFile(join(older, 'meta/_journal.json'), JSON.stringify({ ...journal, entries }));
+  await migrate(connection.db, { migrationsFolder: older });
+  const [existing] = await connection.db.insert(users).values({ username: `${id}_upgrade`, passwordHash: 'pre-publication-data' }).returning();
+  await migrate(connection.db, { migrationsFolder: migrations });
+  assert.equal((await connection.db.select().from(users).where(eq(users.id, existing!.id)))[0]!.passwordHash, 'pre-publication-data');
+  console.log('PASS: populated pre-publication schema upgrades with existing data intact');
   const db = connection.db;
   const database = { db } as never;
   const management = new ProbesService(database);
   const auth = new ProbeAgentAuth(database);
   const leases = new ProbeLeasesService(database);
   const results = new ProbeResultsService(database);
-  const rounds = new ProbeRoundsService(database);
   @Module({ controllers: [ProbeAgentController], providers: [
     { provide: ProbeAgentAuth, useValue: auth }, { provide: ProbesService, useValue: management },
     { provide: ProbeLeasesService, useValue: leases }, { provide: ProbeResultsService, useValue: results },
@@ -159,16 +178,6 @@ async function main() {
   await management.setMembers(actor, group.id, [probe.id]);
   const [pool] = await db.insert(endpointPools).values({ ownerUserId: actor.id, name: id, strategy: 'primary_backup' }).returning();
 
-  async function createRound(family: 4 | 6, address: string, config: ProbeTask['config'], lifetime = 10_000, allow = true) {
-    const [endpoint] = await db.insert(endpoints).values({ poolId: pool!.id, name: randomUUID() }).returning();
-    const [targetAddress] = await db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: String(family) as '4' | '6', address, state: 'current', source: 'static' }).returning();
-    const [check] = await db.insert(healthCheckConfigs).values({ endpointId: endpoint!.id, checkerType: config.type, config }).returning();
-    const now = new Date();
-    return rounds.create(actor, { endpointAddressId: targetAddress!.id, configId: check!.id, groupId: group.id, addressVersion: 1, consensus: { mode: 'all', minimumValid: 1 }, deadline: new Date(now.getTime() + lifetime), resultExpiresAt: new Date(now.getTime() + lifetime + 60_000), ...(allow ? { networkPolicy: { allowedPrivateCIDRs: cidrs } } : {}) }, now);
-  }
-  async function observation(roundId: string) {
-    return until('persisted binary observation', async () => (await db.select().from(probeObservations).where(eq(probeObservations.roundId, roundId)))[0]);
-  }
   let runtimeToken = '';
   async function post(path: string, body: unknown, token = runtimeToken) {
     return new Promise<{ status: number; body: any }>((resolve, reject) => {
@@ -186,7 +195,7 @@ async function main() {
   const agent = `${id}_agent`;
   await podman('create', '--name', agent, '--network', id, '--env', 'SSL_CERT_FILE=/test/ca.crt', image, '/test/agent', 'run', '--config', '/test/config.json');
   containers.push(agent);
-  const config = { serverUrl: `https://host.containers.internal:${port}`, caFile: '/test/ca.crt', tokenFile: '/test/token', stateDir: '/test/state', maxConcurrency: 4, allowIpv4: true, allowIpv6: true, allowedPrivateCidrs: [] as string[] };
+  const config = { serverUrl: `https://host.containers.internal:${port}`, caFile: '/test/ca.crt', tokenFile: '/test/token', stateDir: '/test/state', maxConcurrency: 4, allowIpv4: true, allowIpv6: true, allowedPrivateCidrs: cidrs };
   await writeFile(join(directory, 'config.json'), JSON.stringify(config), { mode: 0o600 });
   await podman('cp', `${directory}/.`, `${agent}:/test`);
   // Enrollment executes the supplied binary before its persistent run process starts.
@@ -213,98 +222,34 @@ async function main() {
   await podman('cp', join(directory, 'config.json'), `${agent}:/test/config.json`);
   await podman('cp', join(directory, 'token'), `${agent}:/test/token`);
 
-  await assert.rejects(createRound(4, targets[0]!.address, { type: 'tcp', port: 18080, timeoutMs: 1000 }, 10_000, false),
-    (error: unknown) => error instanceof ZodError && error.issues.some(issue => issue.code === 'custom' && issue.path[0] === 'address' && issue.message.includes('private allowlist')),
-    'platform must reject private target without its allowlist');
-  const deniedRound = await createRound(4, targets[0]!.address, { type: 'tcp', port: 18080, timeoutMs: 1000 });
   await podman('start', agent);
-  const denied = await observation(deniedRound.id);
-  assert.equal(denied.outcome, 'unavailable', 'local allowlist must independently deny the private target');
-  assert.equal(denied.errorCode, 'target_forbidden');
-  console.log('PASS: private target denied without either required allowlist');
-  await podman('stop', '--time', '10', agent);
-  enrolled.allowedPrivateCidrs = cidrs;
-  await writeFile(join(directory, 'config.json'), JSON.stringify(enrolled), { mode: 0o600 });
-  await podman('cp', join(directory, 'config.json'), `${agent}:/test/config.json`);
-  await podman('start', agent);
-
-  for (const target of targets) {
-    for (const config of [
-      { type: 'tcp', port: 18080, timeoutMs: 1000 },
-      { type: 'http', protocol: 'https', port: 18443, hostname: 'probe-target.test', path: '/health', verifyTls: true, bodyContains: 'masterdns isolated target', timeoutMs: 1500 },
-    ]) {
-      const round = await createRound(target.family, target.address, healthCheckConfigSchema.parse(config));
-      const observed = await observation(round.id);
-      assert.equal(observed.outcome, 'success', `IPv${target.family} ${config.type}: ${observed.errorCode}`);
-      assert.equal(observed.status, 'accepted');
-      if (config.type === 'http') assert.equal(observed.statusCode, 200);
-      console.log(`PASS: binary IPv${target.family} ${config.type === 'http' ? 'HTTPS with verified TLS, Host and SNI' : 'TCP'} persisted success`);
-    }
-    const round = await createRound(target.family, target.address, { type: 'tcp', port: 18081, timeoutMs: 1000 });
-    assert.equal((await observation(round.id)).outcome, 'failure', 'connection refused is failure, not unavailable');
-    console.log(`PASS: binary IPv${target.family} TCP refused persisted failure`);
+  await until('agent heartbeat', async () => (await db.select().from(probeAgents).where(eq(probeAgents.id, probe.id)))[0]?.lastSeenAt);
+  let fixtureNumber = 0;
+  async function fixtureTargets() {
+    if (fixtureNumber++ === 0) return { success: targets[0]!.address, failure: targets[1]!.address, stopTcp: () => podman('kill', '--signal', 'USR1', target) };
+    const success = `192.0.2.${10 + fixtureNumber * 2}`, failure = `192.0.2.${11 + fixtureNumber * 2}`;
+    const serving = `${id}_target_${fixtureNumber}`, refusing = `${id}_failed_${fixtureNumber}`;
+    const assets = join(directory!, `target-assets-${fixtureNumber}`);
+    await mkdir(assets);
+    for (const file of ['target.cjs', 'server.crt', 'server.key']) await copyFile(join(directory!, file), join(assets, file));
+    await podman('create', '--name', serving, '--network', id, '--ip', success, image, 'node', '/test/target.cjs');
+    containers.push(serving); await podman('cp', `${assets}/.`, `${serving}:/test`); await podman('start', serving);
+    await until('fixture target ready', async () => (await podman('logs', serving)).includes('ready'));
+    await podman('create', '--name', refusing, '--network', id, '--ip', failure, image, 'sleep', 'infinity');
+    containers.push(refusing); await podman('start', refusing);
+    return { success, failure, stopTcp: () => podman('kill', '--signal', 'USR1', serving) };
   }
-  const badCertificate = await createRound(4, targets[0]!.address, healthCheckConfigSchema.parse({
-    type: 'http', protocol: 'https', port: 18443, hostname: 'wrong-certificate.test', verifyTls: true, timeoutMs: 1500,
-  }));
-  const tlsFailure = await observation(badCertificate.id);
-  assert.equal(tlsFailure.outcome, 'failure');
-  assert.equal(tlsFailure.errorCode, 'tls_failed', 'HTTPS must reject a certificate for the wrong hostname before reading HTTP status');
-  console.log('PASS: binary HTTPS rejects certificate hostname mismatch');
-  const [reported] = await db.select().from(probeAgents).where(eq(probeAgents.id, probe.id));
-  assert.equal(reported!.agentVersion, version);
-  assert.deepEqual(reported!.capabilities, { ipv4: true, ipv6: true });
-  assert(reported!.lastSeenAt);
-  const recorded = submitted.find(r => r.outcome === 'success')!;
-  const replay = await post('results', { protocol: 'probe-agent/v1', results: [recorded, recorded] });
-  assert.equal(replay.status, 200);
-  assert.deepEqual(replay.body.results.map((r: { status: string }) => r.status), ['duplicate', 'duplicate']);
-  assert.equal((await db.select().from(probeObservations).where(eq(probeObservations.taskId, recorded.taskId))).length, 1);
-  console.log('PASS: replay of actual binary result does not duplicate observation');
-
-  await podman('stop', '--time', '10', agent);
-  const lateRound = await createRound(4, targets[0]!.address, { type: 'tcp', port: 18080, timeoutMs: 1000 }, 1000);
-  const leased = await post('tasks/lease', { protocol: 'probe-agent/v1', capacity: 1 });
-  assert.equal(leased.status, 200);
-  const task: ProbeTask = leased.body.tasks[0];
-  assert.equal(task.roundId, lateRound.id);
-  const late: ProbeResult = { protocol: 'probe-agent/v1', taskId: task.taskId, leaseId: task.leaseId, addressVersion: task.addressVersion, configVersion: task.configVersion, outcome: 'success', latencyMs: 1, measuredAt: new Date().toISOString() };
-  const wrong = await post('results', { protocol: 'probe-agent/v1', results: [{ ...late, addressVersion: 2 }] });
-  assert.equal(wrong.body.results[0].status, 'stale');
-  assert.equal((await db.select().from(probeObservations).where(eq(probeObservations.taskId, task.taskId))).length, 0);
-  await delay(Math.max(0, lateRound.deadline.getTime() - Date.now() + 50));
-  const expired = await post('results', { protocol: 'probe-agent/v1', results: [late] });
-  assert.equal(expired.body.results[0].status, 'stale');
-  assert.equal((await observation(lateRound.id)).status, 'stale');
-  assert((await db.select().from(endpoints)).every(endpoint => endpoint.healthState === 'unknown'), 'protocol ingestion alone must not publish health decisions');
-  console.log('PASS: real HTTPS rejects wrong version and persists expired result only as stale');
-  const incompatible = await post('heartbeat', { protocol: 'probe-agent/v99', agentVersion: version, capabilities: { ipv4: true, ipv6: true }, maxConcurrency: 4 });
-  assert.equal(incompatible.status, 400);
-  assert.match(JSON.stringify(incompatible.body), /protocol/);
-  console.log('PASS: incompatible protocol receives an explanatory HTTP 400');
-
-  await podman('start', agent);
-  const pollsBefore = calls.filter(p => p.endsWith('/tasks/lease')).length;
-  await until('agent resumed polling', async () => calls.filter(p => p.endsWith('/tasks/lease')).length > pollsBefore);
-  await management.revoke(actor, probe.id);
-  await until('agent exits after revocation', async () => {
-    const state = JSON.parse(await podman('inspect', agent))[0].State;
-    return !state.Running ? state : undefined;
-  }).then(state => assert.equal(state.ExitCode, 3));
-  const afterRevoke = calls.length;
-  await delay(2200);
-  assert.equal(calls.length, afterRevoke, 'revoked process must stop API polling');
-  assert.equal((await post('tasks/lease', { protocol: 'probe-agent/v1', capacity: 1 })).status, 401);
-  assert.equal((await post('results', { protocol: 'probe-agent/v1', results: [recorded] })).status, 401);
-  assert.equal((await db.select().from(probeTasks).where(eq(probeTasks.id, recorded.taskId)))[0]!.status, 'accepted');
-  console.log('PASS: revoke rejects lease/results and binary exits 3 without continued polling');
-  for (const container of containers) await podman('logs', container);
-  for (const secret of secrets.filter(Boolean)) assert(!output.join('\n').includes(secret), 'subprocess output contains a secret');
-  console.log('PASS: subprocess output contains no installation/runtime token or database credential');
-  console.log('P12a protocol integration passed. The combined entry runs P12b closed-loop and crash recovery next.');
+  return { db, database, actor, probe, group, pool: pool!, databaseUrl: testUrl.toString(), redisUrl, fixtureTargets, post, submitted, podman,
+    startBackupTcp: async () => {
+      const backup = `${id}_backup`;
+      await podman('create', '--name', backup, '--network', id, '--ip', '192.0.2.253', image, 'node', '-e', "require('node:net').createServer(socket => socket.end()).listen(18080, '0.0.0.0')");
+      containers.push(backup); await podman('start', backup); return '192.0.2.253';
+    },
+    stopAgent: () => podman('stop', '--time', '1', agent), startAgent: () => podman('start', agent),
+    assertSecretFree: async () => { for (const container of containers) await podman('logs', container); for (const secret of secrets.filter(Boolean)) assert(!output.join('\n').includes(secret), 'subprocess output contains a secret'); },
+  };
 }
-
-async function cleanup() {
+export async function cleanup() {
   const failures: unknown[] = [];
   async function attempt(run: () => Promise<unknown>) { try { await run(); } catch (error) { failures.push(error); } }
   for (const name of containers.toReversed()) await attempt(() => podman('rm', '--force', '--time', '1', name));
@@ -316,11 +261,4 @@ async function cleanup() {
   if (directory) await attempt(() => rm(directory!, { recursive: true, force: true }));
   if (failures.length) throw new Error(`Cleanup failed for owned resources ${id}: ${failures.map(String).join('; ')}`);
   console.log('Cleanup: owned containers, network, database and temporary files removed');
-}
-
-try { await main(); }
-catch (error) { console.error(redact(String(error))); process.exitCode = 1; }
-finally {
-  try { await cleanup(); }
-  catch (error) { console.error(redact(String(error))); process.exitCode = 1; }
 }

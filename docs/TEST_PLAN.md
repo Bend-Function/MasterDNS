@@ -112,7 +112,7 @@
 
 ## 6. 发布门槛
 
-独立 Probe Agent 与真实 P5 API 的 P12a 协议联调使用 `pnpm test:probe-integration`。前置环境、IPv4/IPv6 实际覆盖、安全边界与 P12b 未验收项见 [二进制联调说明](validation/probe-binary-integration.md)。此命令不代表完整换址、云写入或 DNS 恢复验收。
+`pnpm test:probe-integration` 顺序执行 P12a 独立 Agent 协议验收与 P12b 完整闭环/进程崩溃恢复验收。覆盖真实二进制、HTTPS API、三轮故障/成功、换址预算、DNS 部分成功重启、TTL 清理和 Pool 备用地址切换；仅远端云/DNS 控制面使用 fake，不代表真实 AWS 写入验收。环境和边界见 [二进制协议说明](validation/probe-binary-integration.md) 与 [闭环验收说明](validation/multicloud-ip-rotation.md)。
 
 通知测试中的 “delivered” 只表示 Fake Queue/Fake Delivery 或隔离的自有接收端完成，不能表述为真实邮件、Telegram 或第三方 Webhook 已送达。CI 不向真实人员或第三方频道发消息。真实 AWS 验收必须使用专门隔离的 EC2/Lightsail 资源和测试 DNS，不能使用现有生产实例；没有完成该验收时，构建、Fake Provider 和跨编译结果都不能记为真实云通过。
 
