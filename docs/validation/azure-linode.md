@@ -13,7 +13,7 @@
 | 厂商 | 本期换址范围 | 约束 |
 | --- | --- | --- |
 | Azure | 独立 VM 已有 NIC IP 配置直接关联的 Standard/Regional/Static 公网 IPv4 或 IPv6 | 保留私网地址与其他配置；拒绝尚未支持的 VMSS、NAT/LB、Basic、StandardV2 等拓扑 |
-| Linode | legacy_config、唯一配置、已开启 Network Helper 的普通公网 IPv4 | 必须明确允许重启并有额外 IPv4 配额；分配后重启，授权清理旧地址后再重启并重新验证健康 |
+| Linode | legacy_config、唯一配置、已开启 Network Helper 的普通公网 IPv4 | 必须明确允许重启并有额外 IPv4 配额；分配后重启，清理后再重启并重新验证健康；释放开关仅控制用户原有地址，系统地址自动清理可能多次额外重启 |
 | Linode IPv6 | 已有 SLAAC 地址可绑定与监测 | 不支持自动轮换；不会从路由前缀随意生成主机地址 |
 
 账号表单区分 AWS 凭证、Azure service principal 和 Linode PAT，服务名称、区域提示、能力原因与重启提示均按厂商展示。详细设置与 API 边界见 [Azure](../providers/azure.md)、[Linode](../providers/linode.md)。

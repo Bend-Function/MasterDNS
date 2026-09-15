@@ -204,3 +204,30 @@ describe('Azure exact-resource rotation', () => {
         expect(f.writes).toHaveLength(2);
     });
 });
+
+it.each(['missing receipt GUID', 'missing remote GUID', 'recreated GUID'] as const)('rejects association with %s without another NIC write', async fault => {
+    const f = await prepare();
+    const allocation = await f.adapter.execute(f.steps[0]!);
+    const applied = await f.adapter.observeDetails({ ...f.steps[0]!, arguments: { ...f.steps[0]!.arguments, receipt: allocation } });
+    if (fault === 'missing receipt GUID') delete (applied.after!.addressMetadata as Record<string, unknown>).resourceGuid;
+    else f.resources[allocation.allocationId!].properties.resourceGuid = fault === 'missing remote GUID' ? undefined : 'recreated';
+    const step = withCandidate(f.steps[1], applied);
+    await expect(f.adapter.execute(step)).rejects.toMatchObject({ code: 'resource_ownership_ambiguous' });
+    expect(await f.adapter.observeDetails({ ...step, arguments: { ...step.arguments, previousExecution: true } })).toMatchObject({ status: 'ambiguous' });
+    expect(f.writes).toHaveLength(1);
+});
+
+it.each(['owner', 'topology', 'generation', 'tags'] as const)('keeps %s conflicts ambiguous while the NIC is Updating', async conflict => {
+    const f = await prepare();
+    const allocation = await f.adapter.execute(f.steps[0]!);
+    const applied = await f.adapter.observeDetails({ ...f.steps[0]!, arguments: { ...f.steps[0]!.arguments, receipt: allocation } });
+    const step = withCandidate(f.steps[1], applied);
+    await f.adapter.execute(step);
+    f.resources[nicId].properties.provisioningState = 'Updating';
+    if (conflict === 'owner') f.resources[nicId].properties.virtualMachine.id = vmId + '-foreign';
+    if (conflict === 'topology') f.resources[nicId].properties.ipConfigurations[0].properties.loadBalancerBackendAddressPools = [{ id: 'foreign-pool' }];
+    if (conflict === 'generation') f.resources[allocation.allocationId!].properties.resourceGuid = 'recreated';
+    if (conflict === 'tags') { f.resources[allocation.allocationId!].tags['masterdns-attempt'] = 'foreign'; f.resources[allocation.allocationId!].properties.provisioningState = 'Updating'; }
+    expect(await f.adapter.observeDetails({ ...step, arguments: { ...step.arguments, previousExecution: true } })).toMatchObject({ status: 'ambiguous' });
+    expect(f.writes.filter(write => write.url === nicId)).toHaveLength(1);
+});

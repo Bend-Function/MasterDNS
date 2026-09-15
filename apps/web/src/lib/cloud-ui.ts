@@ -103,7 +103,7 @@ export function cloudRotationBlock(slot: AddressSlot, authorization: CloudAuthor
 }
 export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean): string | null {
   if (!slot.capability?.requiresStop) return null;
-  if (slot.ref?.service === "linode") return `Linode 换址将重启实例，使 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? "DNS 发布并满足清理条件后，释放旧 IPv4 还会再次重启实例，以移除旧网络配置。" : "若以后授权释放旧 IPv4，发布后的清理还需要再次重启实例。"}额外 IPv4 需获批配额并产生费用。`;
+  if (slot.ref?.service === "linode") return `Linode 换址将重启实例，使 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? "已授权释放用户原有 IPv4，DNS 发布并满足清理条件后，清理还会再次重启实例。" : "未授权释放用户原有 IPv4。"}此释放开关仅控制用户原有地址；系统创建的地址（包括失败候选和后续换下的旧地址）仍可自动清理，在停机授权有效时可能导致多次额外重启和服务中断。额外 IPv4 需获批配额并产生费用。`;
   return "该槽位换址需要停止并启动或重启实例，期间服务会中断。";
 }
 

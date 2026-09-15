@@ -165,3 +165,13 @@ describe("cloud error presentation", () => {
     expect(capabilityReason("probe_insufficient")).toContain("证据不足");
   });
 });
+
+
+it("warns of automatic system cleanup reboots without permission to release pre-existing user addresses", async () => {
+  const { rotationDowntimeNotice } = await import("./cloud-ui");
+  const linode = slot({ ref: { ...slot().ref!, service: "linode" }, capability: { ...slot().capability!, requiresStop: true } });
+  const notice = rotationDowntimeNotice(linode, false)!;
+  expect(notice).toMatch(/用户原有/);
+  expect(notice).toMatch(/系统创建.*清理.*(?:多次|多次额外)重启/);
+  expect(notice).toMatch(/停机授权/);
+});

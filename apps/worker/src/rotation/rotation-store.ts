@@ -1,3 +1,4 @@
+import { allocationIdentity } from "../cloud/allocation-identity.js";
 import { isIP } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
@@ -206,7 +207,7 @@ export class RotationStore {
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, steps[0]!.attemptId));
     if (!attempt) throw new Error("rotation_attempt_missing");
     const providerMetadata = result.after?.addressMetadata;
-    const metadata = { providerMetadata: providerMetadata && typeof providerMetadata === "object" && !Array.isArray(providerMetadata) ? providerMetadata : {},
+    const metadata = { ...(c.instance.service === "azure_vm" ? { allocationIdentity: allocationIdentity(result) } : {}), providerMetadata: providerMetadata && typeof providerMetadata === "object" && !Array.isArray(providerMetadata) ? providerMetadata : {},
       ...(typeof result.after?.privateAddress === "string" ? { privateAddress: result.after.privateAddress } : {}),
       ...(result.resourceId ? { resourceId: result.resourceId } : {}) };
     const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, metadata, origin: "system", attemptId: attempt.id, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, scanGeneration: c.instance.scanGeneration, metadata } }).returning();

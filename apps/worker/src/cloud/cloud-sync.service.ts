@@ -102,11 +102,20 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
               const family = observed.family === 4 ? "4" : "6";
               const addressMetadata = { providerMetadata: observed.metadata ?? {}, ...(observed.privateAddress === undefined ? {} : { privateAddress: observed.privateAddress }), ...(observed.resourceId === undefined ? {} : { resourceId: observed.resourceId }) };
               const values = { metadata: addressMetadata, interfaceId: iface.id, kind, family, address: observed.address, prefixLength: observed.prefixLength ?? null, remoteAllocationId: observed.allocationId ?? null, origin: "user", scanGeneration: generation, lastSeenAt: now } as const;
+              // Refresh observations, but preserve the existing allocation proof atomically.
+              // Legacy GUIDs must be anchored BEFORE the first scan can overwrite them.
+              // Receipt-backed UPSERT rows may still have origin=user, so origin alone
+              // cannot identify trusted proof. Never derive it from incoming inventory.
+              const refreshedMetadata = service === "azure_vm" ? sql`${JSON.stringify(addressMetadata)}::jsonb || case
+                when ${cloudAddresses.metadata} ? 'allocationIdentity' then jsonb_build_object('allocationIdentity', ${cloudAddresses.metadata}->'allocationIdentity')
+                when ${cloudAddresses.origin} = 'system' or nullif(${cloudAddresses.metadata}->'providerMetadata'->>'resourceGuid', '') is not null
+                  then jsonb_build_object('allocationIdentity', jsonb_build_object('allocationId', ${cloudAddresses.remoteAllocationId}, 'resourceId', ${cloudAddresses.metadata}->'resourceId', 'resourceGuid', ${cloudAddresses.metadata}->'providerMetadata'->'resourceGuid'))
+                else '{}'::jsonb end` : addressMetadata;
               // Preserve known origin/attempt ownership; a scan never establishes system ownership.
               const [address] = await tx.insert(cloudAddresses).values(values).onConflictDoUpdate({
                 target: kind === "host" ? [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address] : [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address, cloudAddresses.prefixLength],
                 targetWhere: kind === "host" ? sql`${cloudAddresses.kind} = 'host'` : sql`${cloudAddresses.kind} = 'prefix'`,
-                set: { metadata: addressMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
+                set: { metadata: refreshedMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
               }).returning();
               if (kind === "host" && address) {
                 // Existing slot pointers and versions are exclusively managed by the verified

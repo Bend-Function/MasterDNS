@@ -56,9 +56,9 @@ export function azurePublicIpMetadata(pip: AzureResource, supported: boolean, ip
         ...(ipConfigurationId === undefined ? {} : { ipConfigurationId }),
     };
 }
-export function nicSupported(nic: AzureResource): boolean {
+export function nicSupported(nic: AzureResource, allowUpdating = false): boolean {
     const p = nic.properties ?? {};
-    return p.provisioningState === 'Succeeded'
+    return (p.provisioningState === 'Succeeded' || allowUpdating && p.provisioningState === 'Updating')
         && ownKeys(nic, ['id', 'name', 'type', 'etag', 'location', 'tags', 'properties'])
         && ownKeys(p, ['provisioningState', 'resourceGuid', 'macAddress', 'virtualMachine', 'primary', 'ipConfigurations', 'networkSecurityGroup', 'dnsSettings', 'enableAcceleratedNetworking', 'enableIPForwarding', 'disableTcpStateTracking', 'hostedWorkloads', 'dscpConfiguration', 'nicType', 'vnetEncryptionSupported'])
         && empty(p.hostedWorkloads) && !p.dscpConfiguration && (p.nicType === undefined || p.nicType === 'Standard')
@@ -137,7 +137,7 @@ export class AzureCloudAdapter implements CloudAdapter {
         }
     }
     async inspect(ref: CloudRef): Promise<CloudInventory> { return (await this.read(ref)).inventory; }
-    async read(ref: CloudRef): Promise<AzureRead> {
+    async read(ref: CloudRef, allowNicUpdating = false): Promise<AzureRead> {
         if (ref.accountId !== this.accountId || ref.service !== 'azure_vm')
             throw new CloudError('resource_ownership_ambiguous', false);
         const vmId = this.http.resourceId(ref.instanceId, 'Microsoft.Compute', 'virtualMachines');
@@ -158,7 +158,7 @@ export class AzureCloudAdapter implements CloudAdapter {
             nics.set(id.toLowerCase(), nic);
             if (!equalArmId(nic.id, id))
                 throw new CloudError('resource_ownership_ambiguous', false);
-            const supported = vmSupported && nicSupported(nic) && equalArmId(nic.properties?.virtualMachine?.id, vm.id) && nic.location?.toLowerCase() === ref.region;
+            const supported = vmSupported && nicSupported(nic, allowNicUpdating) && equalArmId(nic.properties?.virtualMachine?.id, vm.id) && nic.location?.toLowerCase() === ref.region;
             if (!Array.isArray(nic.properties?.ipConfigurations) || nic.properties.ipConfigurations.length > 256)
                 throw new CloudError('resource_ownership_ambiguous', false);
             for (const configuration of nic.properties.ipConfigurations) {

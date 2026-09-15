@@ -11,6 +11,7 @@ vi.mock("../src/config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.al
 vi.mock("../../worker/src/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { CloudBindingsService } from "../src/modules/cloud/cloud-bindings.service.js";
 import { fixture } from "../../worker/src/rotation/rotation-test-utils.js";
+import { CloudSyncService } from "../../worker/src/cloud/cloud-sync.service.js";
 import { CloudRuntimeService } from "../../worker/src/cloud/cloud-runtime.service.js";
 import { RotationStore } from "../../worker/src/rotation/rotation-store.js";
 import { RotationProcessor } from "../../worker/src/rotation/rotation.processor.js";
@@ -57,10 +58,10 @@ async function setup(remote: HttpCloud) {
     createRecord: async (zone: string, record: DnsRecordInput) => { dnsWrites.push(record.content); const result = { ...record, externalId: randomUUID(), zoneExternalId: zone }; records.set(result.externalId, result); return result; },
     updateRecord: async (zone: string, id: string, record: DnsRecordInput) => { dnsWrites.push(record.content); const result = { ...record, externalId: id, zoneExternalId: zone }; records.set(id, result); return result; },
   } }) } as never, runtime);
-  async function reconcilePending() {
+  async function reconcilePending(runOperations = true) {
     for (const pool of f.pools) {
       for (const intent of await f.d.select().from(db.reconcileIntents).where(and(eq(db.reconcileIntents.poolId, pool.id), isNull(db.reconcileIntents.completedAt)))) await (reconcile as any).process({ data: intent });
-      for (const operation of await f.d.select().from(db.operations).where(eq(db.operations.resourceId, pool.id))) await (operations as any).process({ data: { operationId: operation.id }, attemptsMade: 0, opts: { attempts: 1 } });
+      if (runOperations) for (const operation of await f.d.select().from(db.operations).where(eq(db.operations.resourceId, pool.id))) await (operations as any).process({ data: { operationId: operation.id }, attemptsMade: 0, opts: { attempts: 1 } });
     }
   }
   await publication.publishSlot(f.slot.id);
@@ -110,7 +111,7 @@ function linodeCloud(): HttpCloud {
 
 import { fixture as azureFixture, credentials as azureCredentials, vmId, nicId, configId, pipId } from "../../../packages/cloud-providers/src/azure-fixtures.js";
 let fixtureNumber = 0;
-function azureCloud(): HttpCloud {
+function azureCloud(): HttpCloud & { setNicState(state: string): void; setCandidateGuid(guid: string | undefined): void; refreshDiscovery(): void; setCandidateSupported(supported: boolean): void } {
   const remote = azureFixture();
   const number = ++fixtureNumber;
   const subscription = `subscription-${randomUUID()}`;
@@ -119,6 +120,10 @@ function azureCloud(): HttpCloud {
   let candidateAddress = `20.30.40.${101 + number * 2}`;
   remote.resources[pipId].properties.ipAddress = oldAddress;
   return { credentials: { ...azureCredentials, subscriptionId: subscription }, externalAccountId: subscription, service: "azure_vm", region: "eastus", instanceId: arm(vmId), interfaceId: arm(configId), oldAddress, get candidateAddress() { return candidateAddress; }, advanceCandidate: () => { candidateAddress = `20.30.40.${151 + number * 2}`; },
+    setNicState: state => { remote.resources[nicId].properties.provisioningState = state; },
+    setCandidateGuid: guid => { for (const [id, resource] of Object.entries(remote.resources)) if (id.includes('/publicIPAddresses/masterdns-')) resource.properties.resourceGuid = guid; },
+    refreshDiscovery: () => remote.setPages([{ value: [remote.resources[vmId]] }]),
+    setCandidateSupported: supported => { for (const [id, resource] of Object.entries(remote.resources)) if (id.includes('/publicIPAddresses/masterdns-')) { if (supported) delete resource.properties.dnsSettings; else resource.properties.dnsSettings = { domainNameLabel: 'external-change' }; } },
     get writes() { return remote.writes.map(write => `${write.method} ${write.url}`); },
     mutateOwner: () => { remote.resources[nicId].properties.virtualMachine.id = `${vmId}-foreign`; },
     fetch: async (input, init) => {
@@ -364,4 +369,100 @@ it("still rejects a confirmed pre-write Linode identity mismatch without chargin
   expect(remote.writes).toEqual([]);
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(0);
+});
+
+it("recovers a lost Azure association through Updating without sticky ambiguity or another NIC PUT", async () => {
+  const remote = azureCloud(), fetch = remote.fetch;
+  remote.fetch = async (...args) => {
+    const response = await fetch(...args);
+    if (args[1]?.method === "PUT" && String(args[0]).includes("/networkInterfaces/")) { remote.setNicState("Updating"); throw new Error("lost-associate-response"); }
+    return response;
+  };
+  const f = await setup(remote);
+  await f.drive(4);
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id));
+  const getStep = async () => (await f.d.select().from(db.rotationSteps).where(and(eq(db.rotationSteps.attemptId, attempt!.id), eq(db.rotationSteps.sequence, 1))))[0]!;
+  expect((await getStep()).status).toBe("in_flight");
+  await f.drive(2);
+  expect((await getStep()).status).toBe("pending");
+  expect((await getStep()).receipt).toMatchObject({ status: "pending" });
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+  remote.setNicState("Succeeded"); await f.drive(2);
+  expect((await getStep()).status).toBe("applied");
+  const [slot] = await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id));
+  expect(slot).toMatchObject({ currentVersion: 1, candidateVersion: 2 });
+  expect(slot!.candidateAddressId).not.toBeNull();
+  expect((await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id))).map(a => a.id)).toEqual([attempt!.id]);
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
+  expect(remote.writes.filter(w => w.includes("/networkInterfaces/"))).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
+  expect(f.dnsWrites).toEqual([remote.oldAddress, remote.candidateAddress]);
+});
+
+it.each(["before association", "after lost association"] as const)("pins Azure allocation GUID %s", async when => {
+  const remote = azureCloud(), fetch = remote.fetch;
+  if (when === "after lost association") remote.fetch = async (...args) => {
+    const response = await fetch(...args);
+    if (args[1]?.method === "PUT" && String(args[0]).includes("/networkInterfaces/")) { remote.setCandidateGuid("recreated-generation"); throw new Error("lost-associate-response"); }
+    return response;
+  };
+  const f = await setup(remote); await f.drive(3);
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id));
+  const [allocated] = await f.d.select().from(db.rotationSteps).where(and(eq(db.rotationSteps.attemptId, attempt!.id), eq(db.rotationSteps.sequence, 0)));
+  expect(allocated!.status).toBe("applied");
+  if (when === "before association") remote.setCandidateGuid("recreated-generation");
+  await f.drive(3);
+  const [associate] = await f.d.select().from(db.rotationSteps).where(and(eq(db.rotationSteps.attemptId, attempt!.id), eq(db.rotationSteps.sequence, 1)));
+  expect(associate!.status).toBe("ambiguous");
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, allocated!.id)))[0]!.receipt).toEqual(allocated!.receipt);
+  expect(remote.writes.filter(w => w.includes("/networkInterfaces/"))).toHaveLength(when === "before association" ? 0 : 1);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+  expect(f.dnsWrites).toEqual([remote.oldAddress]);
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
+});
+
+it.each(["new receipt", "legacy metadata", "scan-created row"] as const)("keeps Azure generation proof through scan and queued DNS with %s", async proof => {
+  const remote = azureCloud(), f = await setup(remote);
+  await f.drive(4);
+  const sync = new CloudSyncService({ db: f.d } as never, f.runtime, {} as never);
+  const scan = async () => { remote.refreshDiscovery(); expect(await sync.scanScope(f.account.id, "azure_vm", "eastus", await f.runtime.adapter(f.account.id, "azure_vm"))).toMatchObject({ scopeStatus: "complete" }); };
+  if (proof === "scan-created row") await scan();
+  await f.drive();
+  const [slot] = await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id));
+  const getAddress = async () => (await f.d.select().from(db.cloudAddresses).where(eq(db.cloudAddresses.id, slot!.candidateAddressId!)))[0]!;
+  const installed = await getAddress();
+  const guid = (installed.metadata.providerMetadata as Record<string, unknown>).resourceGuid;
+  if (proof === "legacy metadata") {
+    const { allocationIdentity: _anchor, ...metadata } = installed.metadata;
+    await f.d.update(db.cloudAddresses).set({ metadata }).where(eq(db.cloudAddresses.id, installed.id));
+  }
+  if (proof === "scan-created row") expect(installed.origin).toBe("user");
+  await f.setHealth("success");
+  await scan();
+  expect((await getAddress()).metadata.providerMetadata).toMatchObject({ resourceGuid: guid, supported: true });
+  remote.setCandidateSupported(false); await scan();
+  expect((await getAddress()).metadata.providerMetadata).toMatchObject({ supported: false });
+  remote.setCandidateSupported(true); await scan();
+  expect((await getAddress()).metadata.providerMetadata).toMatchObject({ supported: true });
+  await f.drive();
+  remote.setCandidateGuid("recreated-generation");
+  if (proof === "legacy metadata") {
+    const { allocationIdentity: _anchor, ...metadata } = (await getAddress()).metadata;
+    await f.d.update(db.cloudAddresses).set({ metadata }).where(eq(db.cloudAddresses.id, installed.id));
+  }
+  await scan();
+  await expect(f.publication.publishSlot(f.slot.id, f.incident.id)).rejects.toThrow("live_cloud_address_changed");
+  remote.setCandidateGuid(String(guid)); await scan();
+  await f.drive(); // Queue the healthy, unchanged generation for DNS publication.
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, f.incident.id));
+  expect(publication).toBeDefined();
+  await f.reconcilePending(false);
+  const queued = await f.d.select({ step: db.operationSteps }).from(db.operationSteps).innerJoin(db.operations, eq(db.operations.id, db.operationSteps.operationId)).where(eq(db.operations.resourceId, f.pools[0]!.id));
+  expect(queued.some(({ step }) => step.status === "pending" && (step.input.record as { content?: string } | undefined)?.content === remote.candidateAddress)).toBe(true);
+  remote.setCandidateGuid("recreated-generation"); await scan();
+  expect((await getAddress()).metadata.providerMetadata).toMatchObject({ resourceGuid: "recreated-generation" });
+  await f.reconcilePending();
+  expect(f.dnsWrites).toEqual([remote.oldAddress]);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ candidateVersion: 2, currentVersion: 2 });
 });

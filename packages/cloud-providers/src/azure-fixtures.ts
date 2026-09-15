@@ -56,7 +56,7 @@ export function fixture(family: 4 | 6 = 4) {
                 resources[nicId] = { ...body, id: nicId, properties: { ...body.properties, provisioningState: 'Succeeded', virtualMachine: { id: vmId } } };
             }
             else
-                resources[url.pathname] = { ...body, id: url.pathname, properties: { ...body.properties, ipAddress: family === 4 ? '20.30.40.51' : '2603:1010::11', provisioningState: 'Succeeded' } };
+                resources[url.pathname] = { ...body, id: url.pathname, properties: { ...body.properties, ipAddress: family === 4 ? '20.30.40.51' : '2603:1010::11', resourceGuid: 'allocated-resource-generation', provisioningState: 'Succeeded' } };
             return response(resources[url.pathname]);
         }
         return resources[url.pathname] ? response(resources[url.pathname]) : response({ error: { code: 'NotFound' } }, 404);

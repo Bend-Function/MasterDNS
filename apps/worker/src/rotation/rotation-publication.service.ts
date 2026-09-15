@@ -1,3 +1,4 @@
+import type { AllocationIdentity } from "../cloud/allocation-identity.js";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, inArray, isNull, ne, notExists, sql } from "drizzle-orm";
@@ -48,6 +49,10 @@ export function publicationAuthorizationError(c: RotationContext) {
 export function livePublicationMatches(c: RotationContext, live: CloudInventory) {
   const metadata = c.address?.metadata;
   const providerMetadata = metadata?.providerMetadata as Record<string, unknown> | undefined;
+  const identity = metadata?.allocationIdentity as AllocationIdentity | undefined;
+  // Missing Azure generation evidence cannot be replaced by a fresh scan.
+  if (c.instance.service === "azure_vm" && (identity || c.address?.origin === "system") &&
+      !(identity ? identity.resourceGuid : providerMetadata?.resourceGuid)) return false;
   return (
     live.ref.accountId === c.account.id &&
     live.ref.instanceId === c.instance.externalId &&
@@ -62,7 +67,8 @@ export function livePublicationMatches(c: RotationContext, live: CloudInventory)
             a.address === c.address?.address &&
             (!c.address.remoteAllocationId || a.allocationId === c.address.remoteAllocationId) &&
             (!metadata?.resourceId || a.resourceId === metadata.resourceId) &&
-            (!providerMetadata?.resourceGuid || a.metadata?.resourceGuid === providerMetadata.resourceGuid),
+            (!providerMetadata?.resourceGuid || a.metadata?.resourceGuid === providerMetadata.resourceGuid) &&
+            (!identity || a.allocationId === identity.allocationId && a.resourceId === identity.resourceId && a.metadata?.resourceGuid === identity.resourceGuid),
         ),
     )
   );

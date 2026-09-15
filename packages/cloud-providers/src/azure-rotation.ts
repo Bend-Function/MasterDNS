@@ -101,6 +101,9 @@ function validateCandidateReceipt(a: RotationStepArguments): CloudStepResult {
     const receipt = a.candidateReceipt;
     if (!receipt || !equalArmId(receipt.allocationId, candidateId(a)) || !equalArmId(receipt.resourceId, candidateId(a)) || isIP(receipt.candidateAddress ?? '') !== a.slot.family || receipt.candidateAddress === a.slot.address)
         return ambiguous();
+    // A deterministic ARM name and matching tags do not identify a resource generation.
+    const generation = (receipt.after?.addressMetadata as Record<string, unknown> | undefined)?.resourceGuid;
+    if (typeof generation !== 'string' || !generation) return ambiguous();
     return receipt;
 }
 function template(a: RotationStepArguments, old: AzureResource): AzureResource {
@@ -118,12 +121,19 @@ function sameJson(a: unknown, b: unknown): boolean {
     }
     return false;
 }
-function checkCandidate(a: RotationStepArguments, candidate: AzureResource, old?: AzureResource): void {
-    if (!equalArmId(candidate.id, candidateId(a)) || candidate.location?.toLowerCase() !== a.slot.region || !Object.entries(tags(a)).every(([k, v]) => candidate.tags?.[k] === v) || !pipSupported(candidate, a.slot.family))
+function checkCandidateIdentity(a: RotationStepArguments, candidate: AzureResource): void {
+    if (!equalArmId(candidate.id, candidateId(a)) || candidate.location?.toLowerCase() !== a.slot.region || !Object.entries(tags(a)).every(([k, v]) => candidate.tags?.[k] === v))
         ambiguous();
+    if (a.candidateReceipt) {
+        const trusted = validateCandidateReceipt(a);
+        if (candidate.properties.resourceGuid !== (trusted.after!.addressMetadata as Record<string, unknown>).resourceGuid || candidate.properties.ipAddress !== trusted.candidateAddress) ambiguous();
+    }
     if (candidate.properties.ipConfiguration && !equalArmId(candidate.properties.ipConfiguration.id, a.slot.interfaceId))
         ambiguous();
-    if (isIP(candidate.properties.ipAddress) !== a.slot.family || candidate.properties.ipAddress === a.slot.address)
+}
+function checkCandidate(a: RotationStepArguments, candidate: AzureResource, old?: AzureResource): void {
+    checkCandidateIdentity(a, candidate);
+    if (!pipSupported(candidate, a.slot.family) || isIP(candidate.properties.ipAddress) !== a.slot.family || candidate.properties.ipAddress === a.slot.address)
         ambiguous();
     if (old) {
         const expected = template(a, old);
@@ -138,13 +148,13 @@ function checkOld(a: RotationStepArguments, old: AzureResource): void {
     if (!sameJson(old.zones ?? [], original.metadata?.zones ?? []) || !sameJson(old.sku, original.metadata?.sku) || (original.metadata?.resourceGuid !== undefined && old.properties.resourceGuid !== original.metadata.resourceGuid))
         ambiguous();
 }
-async function context(adapter: AzureCloudAdapter, a: RotationStepArguments): Promise<{
+async function context(adapter: AzureCloudAdapter, a: RotationStepArguments, observation = false): Promise<{
     read: AzureRead;
     nic: AzureResource;
     configuration: AzureResource;
     binding: string;
 }> {
-    const read = await adapter.read(a.slot);
+    const read = await adapter.read(a.slot, observation);
     const current = read.inventory.interfaces.find(i => equalArmId(i.id, a.slot.interfaceId));
     const before = selected(a);
     if (read.inventory.metadata?.supported !== true || !current || current.metadata?.supported !== true || !before?.metadata)
@@ -255,13 +265,14 @@ export async function executeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         const existing = await adapter.http.getResource(candidateId(a), NETWORK_API, true);
         if (existing.status !== 404) {
             checkCandidate(a, existing.body, old);
-            return { ...receipt(adapter, a), candidateAddress: existing.body.properties.ipAddress };
+            return { ...receipt(adapter, a), candidateAddress: existing.body.properties.ipAddress, after: { addressMetadata: azurePublicIpMetadata(existing.body, false, undefined, 'public_ip_unattached') } };
         }
         const result = await adapter.http.request(`${candidateId(a)}?api-version=${NETWORK_API}`, 'PUT', template(a, old));
         const resultReceipt = receipt(adapter, a, result);
         if (result.body.properties?.provisioningState === 'Succeeded') {
             checkCandidate(a, result.body, old);
             resultReceipt.candidateAddress = result.body.properties.ipAddress;
+            resultReceipt.after = { ...resultReceipt.after, addressMetadata: azurePublicIpMetadata(result.body, false, undefined, 'public_ip_unattached') };
         }
         return resultReceipt;
     }
@@ -298,7 +309,7 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         const operation = await poll(adapter, a);
         if (operation.status === 'pending')
             return { ...a.receipt, ...(operation.after ? { after: operation.after } : {}), status: 'pending' };
-        const current = await context(adapter, a);
+        const current = await context(adapter, a, true);
         if (step.action === 'azure.public-ip.delete' && a.publishedInventory) {
             const response = await adapter.http.getResource(originalId(a), NETWORK_API, true);
             if (response.status !== 404) cleanupOwnership(a, response.body);
@@ -312,9 +323,15 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         if (candidateResponse.status === 404)
             return { ...a.receipt, status: (a.previousExecution || a.receipt) ? 'ambiguous' : 'not_applied' };
         const candidate = candidateResponse.body;
+        // Check pinned identity even when provisioning has not converged.
+        checkCandidateIdentity(a, candidate);
         if (['Updating', 'Creating', 'Deleting'].includes(candidate.properties?.provisioningState))
             return { ...a.receipt, status: 'pending' };
         checkCandidate(a, candidate, old);
+        // NIC Updating is normal after a lost PUT response. All identity/topology
+        // checks above still apply, but no binding is installed until Succeeded.
+        if (current.nic.properties.provisioningState === 'Updating')
+            return { ...a.receipt, status: 'pending' };
         if (step.action === 'azure.public-ip.allocate') {
             if (!old)
                 return { ...a.receipt, status: 'ambiguous' };

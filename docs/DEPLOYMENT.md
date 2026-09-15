@@ -165,9 +165,9 @@ migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 
 
 先同步清单，核对实例、地址和能力原因，再开启“允许 MasterDNS 管理”。只做绑定与监控时可将全部轮换权限保持关闭；Linode SLAAC IPv6 不可替换，但已发现的实际公网主机地址可绑定 AAAA 和监控。新版 Linode Interfaces、复杂网络及不支持的 Azure 拓扑也不得以“开启管理”绕过能力检查。路由前缀不能当作已配置主机地址发布。
 
-IPv4、IPv6、停止/启动/重启和旧地址释放是独立显式授权，默认关闭；轮换策略也必须单独开启。技术能力可用与凭证验证成功都不证明写权限、配额或公网可达性。Azure 需要 VM/NIC/公网 IP/子网读取、公网 IP write/join、NIC write、适用 join 和异步操作读取权限；清理另需 delete。Linode 轮换需要 `linodes:read_write`、`ips:read_only` 和 `events:read_only`（对应 read_write 或 `*` 可满足 scope 检查），以及用户对所选实例和 profile 的有效访问权限。
+IPv4、IPv6、停止/启动/重启和用户原有旧地址释放是独立显式授权，默认关闭；轮换策略也必须单独开启。技术能力可用与凭证验证成功都不证明写权限、配额或公网可达性。Azure 需要 VM/NIC/公网 IP/子网读取、公网 IP write/join、NIC write、适用 join 和异步操作读取权限；清理另需 delete。Linode 轮换需要 `linodes:read_write`、`ips:read_only` 和 `events:read_only`（对应 read_write 或 `*` 可满足 scope 检查），以及用户对所选实例和 profile 的有效访问权限。
 
-Linode 额外 IPv4 需要支持团队批准配额并产生费用。换址会重启实例以应用 Network Helper 配置；候选地址通过外部健康复测后才能发布 DNS。另行授权释放旧 IPv4 后，发布后的清理会再次重启以移除旧配置，必须预留两次服务中断。清理重启后的完整健康阈值也需重新满足；`cleanup_health_failed` 表示探测未恢复，`probe_insufficient` 表示证据不足。控制面 running 或重启 API 成功不能代替 guest 网络与外部健康验收。MasterDNS 不会自动启用 Network Helper，也不提交配额申请。
+Linode 额外 IPv4 需要支持团队批准配额并产生费用。换址会重启实例以应用 Network Helper 配置；候选地址通过外部健康复测后才能发布 DNS。旧地址释放开关仅控制用户原有 IPv4；系统创建的地址（包括失败候选及后续换下的旧地址）仍可自动清理。在停止、启动或重启授权有效时，每次清理都可能再次重启以移除旧配置，因此可能发生多次额外服务中断，不能按固定两次预留。清理重启后的完整健康阈值也需重新满足；`cleanup_health_failed` 表示探测未恢复，`probe_insufficient` 表示证据不足。控制面 running 或重启 API 成功不能代替 guest 网络与外部健康验收。MasterDNS 不会自动启用 Network Helper，也不提交配额申请。
 
 Azure 的 whole-NIC PUT 没有已证明的外部原子 CAS 保证；MasterDNS 内部锁无法防止第三方在最终读取与写入之间修改 NIC。Linode 丢失分配响应时不能根据新增地址清单认领资源或重新分配，重启事件也无法在所有情况下区分同用户的并发手动操作。遇到 ambiguous 状态应先核实远端与持久证据，不能通过反复提交来猜测成功。
 
