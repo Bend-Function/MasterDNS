@@ -1,0 +1,52 @@
+# Azure virtual machine public-IP rotation
+
+The Azure adapter uses a service principal (`tenantId`, `subscriptionId`, `clientId`, `clientSecret`) and the public Azure endpoints `login.microsoftonline.com` and `management.azure.com`. Sovereign clouds and delegated cross-tenant/Lighthouse access are outside the initial scope. Identity verification checks the configured subscription and tenant and requires an Enabled subscription; a token alone does not verify access.
+
+## Supported scope
+
+Rotation supports an existing public IPv4 or IPv6 address on an exact NIC IP configuration of a running standalone VM. The public IP must be Standard, Regional, Static, and directly associated with that configuration. IPv6 rotation retains the existing private IPv6 configuration and every IPv4 configuration; it does not add guest addresses or require stopping the VM. Unknown power/provisioning states are unavailable.
+
+A configuration's full ARM ID is the synthetic MasterDNS interface ID. This identifies the selected configuration across multi-NIC and multi-configuration VMs without relying on array ordering. Unsupported addresses remain discoverable for monitoring when their linked resources are readable. An unreadable linked resource fails discovery explicitly.
+
+Initial unsupported topologies include VM scale sets, Basic/StandardV2/Global or dynamic public IPs, public-IP prefixes, DNS-label/reverse-DNS dependencies, NAT gateways, load-balancer/backend/inbound-NAT/application-gateway membership, service-managed or private-endpoint NIC features, and unknown mutable NIC/public-IP properties. These are conservative application boundaries. Discovery does not establish write permission: capability permission remains `unverified`.
+
+## Rotation and recovery
+
+1. Freshly read the VM, instance view, NIC, public IP, and selected subnet. Validate ownership, provisioning, family, private IP, primary flag, subnet, and the original binding against persisted preflight evidence.
+2. Allocate a Standard static replacement in the old public IP's resource group. Preserve region, zones, IPv4 idle timeout, and supported DDoS and deletion settings. A bounded resource name derives deterministically from the account, VM, exact slot, and attempt. The planned step records `azureCandidateId` before dispatch. Candidate tags bind the attempt, account, and slot. An existing mismatched resource is an ownership conflict and is never overwritten.
+3. Send a whole-NIC PUT built from a fresh GET. Replace only the selected configuration's public-IP reference. Preserve writable private/configuration/sibling, NSG, DNS, accelerated networking, and forwarding settings; omit known read-only properties.
+4. Observe any ARM operation, then independently read actual resources. Confirm the new public IP, exact forward/back references, unchanged VM/slot ownership, and detached old public IP before permitting DNS publication.
+5. Retain the old static allocation until separately authorized post-publication cleanup. Cleanup requires the trusted original ownership snapshot, a matching candidate receipt, the published candidate still attached to this slot, and the old IP still having its original address, matching its original resource GUID when present, and having no owner. DELETE completion is confirmed by GET 404.
+
+The client makes one bounded HTTP attempt per request and never transparently retries writes. Lost responses are recovered by observing the same deterministic resource and exact binding. Missing or inconsistent evidence after dispatch is ambiguous; it is not permission to allocate a second candidate or repeat an uncertain NIC PUT. Redirects are refused. Pagination and operation URLs must remain on the fixed ARM host and configured subscription; pagination additionally binds the Compute VM-list path, API version, region, and a bounded visited-page history.
+
+Azure's documented NIC create/update operation is a whole-resource PUT. Its published parameters do **not** establish `If-Match` enforcement. The adapter does not claim atomic external concurrency protection. Fresh ownership comparisons and MasterDNS's internal fences cannot prevent a third party changing the NIC between the final GET and PUT. Live concurrent-write acceptance is required before claiming conditional-write safety. The adapter sends no speculative conditional headers.
+
+The old address stops receiving traffic when the association changes; retaining its allocation does not preserve simultaneous reachability. Static-address deletion permanently releases it. The adapter advertises neither automatic restoration nor immediate old-address release.
+
+## ARM versions, async operations, and credentials
+
+Subscription/location reads pin `2022-12-01`; Compute VM and instance-view reads pin `2025-04-01`; Network reads/writes pin `2025-09-01`. The token request uses form-encoded client credentials, `grant_type=client_credentials`, and `scope=https://management.azure.com/.default`; tokens are cached until shortly before expiry. Credentials and raw response/error bodies are not included in errors.
+
+Operation receipts retain `operationId`, `after.operationKind` (`azure-asyncoperation` or `location`), the Retry-After interval, and `after.pollAfter` (the earliest next poll time in epoch milliseconds). Pending observations update these fields, and the runtime must persist the updated receipt. Azure-AsyncOperation takes priority over Location. Operation URLs up to 16 KiB are accepted after validation. Failed/Canceled operations report failure; 404, unreadable polling evidence, and nonterminal operations remain pending. A terminal operation response never substitutes for resource verification. Applied association observations also contain `after.addressMetadata` copied from the independently inspected candidate and `after.privateAddress`, so the runtime can install complete address evidence immediately.
+
+Reads require subscription/location, VM/instance-view, NIC, PIP, and subnet access. Rotation needs public-IP write/join and NIC write, plus subnet/NSG join access where Azure requires it for a full NIC PUT. Cleanup needs public-IP delete. Async tracking needs Network locations operations/operationResults reads at the applicable resource-group or subscription scope. Network Contributor at the relevant resource groups plus required read access is a broad starting point; least-privilege roles need live validation. Policy, locks, quota, and registration can still reject writes.
+
+## Evidence and outstanding acceptance
+
+Offline tests inject `fetch` and use real REST paths, form bodies, resource shapes, HTTP statuses, and async headers. They cover both families, pagination, fixed-host checks, exact configuration preservation, topology rejection, ownership/collision guards, uncertain-response recovery, and protected cleanup. No live Azure deployment or write was performed.
+
+Outstanding live acceptance: a disposable running standalone dual-stack VM, real async receipts and interrupted-request recovery, selected/sibling/private-address preservation, no deallocation, public ingress checks, observed egress behavior, DNS convergence, permission boundaries, cleanup, and external concurrent NIC edits. Existing guest configuration, routes, NSGs, listener bindings, and host firewalls remain prerequisites; this adapter does not configure them.
+
+## Official references
+
+- [Client credentials protocol](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow) and [ARM SDK scopes](https://learn.microsoft.com/en-us/javascript/api/@azure/ms-rest-js/serviceclientoptions?view=azure-node-latest).
+- [Subscription GET](https://learn.microsoft.com/en-us/rest/api/resources/subscriptions/get?view=rest-resources-2022-12-01) and [locations list](https://learn.microsoft.com/en-us/rest/api/resources/subscriptions/list-locations?view=rest-resources-2022-12-01).
+- [VM list](https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/list-all?view=rest-compute-2025-04-01), [VM GET](https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/get?view=rest-compute-2025-04-01), and [instance view](https://learn.microsoft.com/en-us/rest/api/compute/virtual-machines/instance-view?view=rest-compute-2025-04-01).
+- [NIC GET](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/network-interfaces/get?view=rest-virtualnetwork-2025-09-01) and [NIC PUT](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/network-interfaces/create-or-update?view=rest-virtualnetwork-2025-09-01).
+- [Public-IP GET](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/public-ip-addresses/get?view=rest-virtualnetwork-2025-09-01), [PUT](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/public-ip-addresses/create-or-update?view=rest-virtualnetwork-2025-09-01), and [DELETE](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/public-ip-addresses/delete?view=rest-virtualnetwork-2025-09-01).
+- [Subnet GET](https://learn.microsoft.com/en-us/rest/api/virtualnetwork/subnets/get?view=rest-virtualnetwork-2025-09-01) and [ARM asynchronous operations](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/async-operations).
+- [Public IP capabilities](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/public-ip-addresses), [configuration rules](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/virtual-network-public-ip-address), [NIC addresses](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/virtual-network-network-interface-addresses), and [IPv6 overview](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/ipv6-overview).
+- [NIC permissions](https://learn.microsoft.com/en-us/azure/virtual-network/virtual-network-network-interface#permissions), [public-IP permissions](https://learn.microsoft.com/en-us/azure/virtual-network/ip-services/virtual-network-public-ip-address#permissions), and [Network RBAC actions](https://learn.microsoft.com/en-us/azure/role-based-access-control/permissions/networking).
+
+References were checked in the bounded research supplied on 2026-09-15. Network documentation redirected older requested versions to the pinned `2025-09-01` contract.
