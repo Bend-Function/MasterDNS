@@ -39,6 +39,7 @@ export type NotificationEvent = {
   eventType: string;
   ownerUserId: string;
   poolId?: string;
+  poolIds?: string[];
   occurredAt: string;
   payload: Record<string, unknown>;
 };

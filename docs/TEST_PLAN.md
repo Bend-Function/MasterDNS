@@ -18,6 +18,7 @@
 - Operation 的部分成功、过期决策和幂等性。
 - 使用本地 HTTP/TCP 测试服务模拟健康、超时、拒绝和恢复。
 - 使用 Provider Fake 验证限流、权限、超时和读取验证流程。
+- 在隔离 PostgreSQL 中从持久健康/轮换状态重建通知，使用 Fake Queue 验证 Redis wake 丢失后的稳定去重、跨 Pool 同 owner 路由和敏感字段隔离；不调用真实 Webhook、Telegram 或收件人。
 
 ### 端到端测试
 
@@ -113,6 +114,8 @@
 
 独立 Probe Agent 与真实 P5 API 的 P12a 协议联调使用 `pnpm test:probe-integration`。前置环境、IPv4/IPv6 实际覆盖、安全边界与 P12b 未验收项见 [二进制联调说明](validation/probe-binary-integration.md)。此命令不代表完整换址、云写入或 DNS 恢复验收。
 
+通知测试中的 “delivered” 只表示 Fake Queue/Fake Delivery 或隔离的自有接收端完成，不能表述为真实邮件、Telegram 或第三方 Webhook 已送达。CI 不向真实人员或第三方频道发消息。真实 AWS 验收必须使用专门隔离的 EC2/Lightsail 资源和测试 DNS，不能使用现有生产实例；没有完成该验收时，构建、Fake Provider 和跨编译结果都不能记为真实云通过。
+
 ### 6.1 自动化门槛
 
 - `pnpm build`、`pnpm typecheck`、`pnpm lint` 和 `pnpm test` 全部通过。
@@ -125,4 +128,6 @@
 - Provider Adapter Contract 全部通过；Cloudflare 隔离真实 API 测试通过且无残留记录。
 - 安全日志测试确认不含 Token、Secret、Cookie 和凭证明文。
 - Worker 被强制终止后，未完成 Operation 能够恢复且不产生重复记录。
+- Worker/Redis 重启后，持久通知状态和 retrying delivery 能恢复；相同语义状态在同一 channel 只产生一条 delivery，后续状态转换产生新事件。
+- 分别验证 probe insufficient/unknown、target failure/recovery、rotation exhausted、permission/quota、DNS partial、cleanup failed/completed；通知 payload 和日志不含 Token、凭证、自定义 header、原始云请求、完整配置或 plan。
 - Playwright 验证桌面和移动端无阻塞操作问题。

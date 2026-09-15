@@ -8,7 +8,7 @@ import {
   notificationDeliveries,
   poolNotificationChannels,
 } from "@masterdns/db";
-import { and, eq, inArray, isNull, lte, or } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, lte, or } from "drizzle-orm";
 import { Job, Worker } from "bullmq";
 import { request } from "undici";
 import { DatabaseService } from "../database.service.js";
@@ -29,6 +29,7 @@ export class NotificationProcessor implements OnModuleInit, OnModuleDestroy {
   private worker?: Worker<NotificationJob>;
   private recoveryTimer?: NodeJS.Timeout;
   private recovering = false;
+  private recoveryCursor: string | undefined;
 
   constructor(private readonly database: DatabaseService, private readonly queues: QueueRuntimeService) {}
 
@@ -54,16 +55,21 @@ export class NotificationProcessor implements OnModuleInit, OnModuleDestroy {
     return this.deliver(job.data.deliveryId, job.attemptsMade, job.opts.attempts ?? 1);
   }
 
-  private async fanout(event: NotificationEvent) {
+  async fanout(event: NotificationEvent) {
     const defaults = await this.database.db.select().from(notificationChannels).where(and(
       eq(notificationChannels.ownerUserId, event.ownerUserId),
       eq(notificationChannels.enabled, true),
       eq(notificationChannels.isDefault, true),
     ));
-    const linked = event.poolId
+    const poolIds = [...new Set([...(event.poolId ? [event.poolId] : []), ...(event.poolIds ?? [])])];
+    const linked = poolIds.length > 0
       ? await this.database.db.select({ channel: notificationChannels, link: poolNotificationChannels })
         .from(poolNotificationChannels).innerJoin(notificationChannels, eq(poolNotificationChannels.channelId, notificationChannels.id))
-        .where(and(eq(poolNotificationChannels.poolId, event.poolId), eq(notificationChannels.enabled, true)))
+        .where(and(
+          inArray(poolNotificationChannels.poolId, poolIds),
+          eq(notificationChannels.ownerUserId, event.ownerUserId),
+          eq(notificationChannels.enabled, true),
+        ))
       : [];
     const matchingLinks = linked.filter(({ link }) => link.eventFilter.length === 0 || link.eventFilter.includes(event.eventType));
     const overrideDefaults = matchingLinks.some(({ link }) => link.overridesDefaults);
@@ -166,9 +172,14 @@ export class NotificationProcessor implements OnModuleInit, OnModuleDestroy {
     try {
       const due = await this.database.db.select({ id: notificationDeliveries.id, attempts: notificationDeliveries.attempts })
         .from(notificationDeliveries).where(and(
+          this.recoveryCursor ? gt(notificationDeliveries.id, this.recoveryCursor) : undefined,
           inArray(notificationDeliveries.status, ["pending", "retrying"]),
           or(isNull(notificationDeliveries.nextRetryAt), lte(notificationDeliveries.nextRetryAt, new Date())),
-        ));
+        )).orderBy(asc(notificationDeliveries.id)).limit(100);
+      if (due.length === 0) {
+        this.recoveryCursor = undefined;
+        return;
+      }
       const exhausted = due.filter((delivery) => delivery.attempts >= 5);
       if (exhausted.length > 0) {
         await this.database.db.update(notificationDeliveries).set({ status: "failed", errorCode: "retry_exhausted", nextRetryAt: null, updatedAt: new Date() })
@@ -185,6 +196,7 @@ export class NotificationProcessor implements OnModuleInit, OnModuleDestroy {
         removeOnComplete: 5_000,
         removeOnFail: 5_000,
       })));
+      this.recoveryCursor = due.length === 100 ? due.at(-1)!.id : undefined;
     } catch (error) {
       this.logger.warn(`Notification recovery scan failed: ${error instanceof Error ? error.message.slice(0, 160) : "unknown"}`);
     } finally {
@@ -221,6 +233,7 @@ async function deliverTelegram(chatId: string | null, botToken: string, payload:
     `Time: ${event.occurredAt ?? new Date().toISOString()}`,
     `Event: ${event.eventId ?? "unknown"}`,
     event.poolId ? `Pool: ${event.poolId}` : undefined,
+    event.poolIds?.length ? `Pools: ${event.poolIds.join(", ")}` : undefined,
     summarizePayload(event.payload),
   ].filter(Boolean).join("\n").slice(0, 4096);
   const response = await request(`https://api.telegram.org/bot${botToken}/sendMessage`, {

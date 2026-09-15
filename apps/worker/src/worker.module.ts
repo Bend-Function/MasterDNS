@@ -15,6 +15,7 @@ import { HealthRetentionService } from "./health/health-retention.service.js";
 import { HealthSchedulerService } from "./health/health-scheduler.service.js";
 import { NotificationProcessor } from "./notifications/notification.processor.js";
 import { AllDownReminderService } from "./notifications/all-down-reminder.service.js";
+import { NotificationStateScannerService } from "./notifications/notification-state-scanner.service.js";
 import { OperationProcessor } from "./operations/operation.processor.js";
 import { ProviderRuntimeService } from "./providers/provider-runtime.service.js";
 import { QueueRuntimeService } from "./queue-runtime.service.js";
@@ -41,6 +42,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
     ReconcileProcessor,
     ReconcileOutboxService,
     NotificationProcessor,
+    NotificationStateScannerService,
     AllDownReminderService,
   ],
 })

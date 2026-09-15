@@ -26,7 +26,10 @@ BOOTSTRAP_ADMIN_PASSWORD=<高强度初始密码>
 WEB_URL=https://dns.example.internal
 PUBLIC_API_URL=https://dns-api.example.internal
 NEXT_PUBLIC_API_URL=https://dns-api.example.internal
+NEXT_PUBLIC_PROBE_AGENT_VERSION=
 ```
+
+外部 Probe Agent 可选。没有已发布版本时将 `NEXT_PUBLIC_PROBE_AGENT_VERSION` 留空，核心 Web、API 和 Worker 仍可构建与运行，但 Agent 安装控件必须保持不可用。启用安装控件时必须填写已经发布并审核的精确 `vN.N.N` 标签，不能使用 `latest`、分支名或提交名；任何非空非法值会使镜像构建失败。Web 只从固定来源 `https://github.com/Bend-Function/MasterDNS-Agent/releases/download/VERSION/` 生成安装地址。Agent 是独立仓库的发布物；平台生产镜像不会编译、复制或发布 Go Agent。本开发任务没有选择或发布 Agent 版本。
 
 Compose 会将 `POSTGRES_PASSWORD` 作为独立的 `PGPASSWORD` 参数传给应用，因此可安全使用 URL 保留字符。本地直接运行 API 时可设置 `DATABASE_URL`，其中密码的 URL 保留字符必须进行百分号编码；也可以设置完整的 `PGHOST`、`PGPORT`、`PGDATABASE`、`PGUSER` 和 `PGPASSWORD`。上述命令会以 `0600` 权限创建 `.env`。`MASTER_ENCRYPTION_KEY` 丢失后无法解密已保存的云凭证，必须与数据库备份分开保管。
 
@@ -75,7 +78,33 @@ sudo journalctl -u masterdns-ddns.service -n 100 --no-pager
 
 新地址先进入 candidate 状态，只有通过该节点或 Pool 的 HTTP/TCP 健康检查后才会提升和发布。因此，启用 DDNS 前必须配置至少一个有效健康检查。
 
-## 7. 备份与恢复
+## 7. 外部 Probe Agent
+
+Probe Agent 与 API 必须通过 HTTPS 通信。主机需要出站访问 MasterDNS API、策略允许的 TCP/HTTP/HTTPS 目标，以及安装或升级时固定的 GitHub Release 地址。内网目标默认被拒绝；管理员必须在对应健康策略中显式配置允许的 private CIDR，并同时确保 Agent 主机的路由和防火墙只开放必要范围。自定义 HTTP header 属于敏感配置，不会进入通知。
+
+管理员配置已发布的固定版本后，从控制台取得该版本的 `install.sh` 和一次性安装 Token。先安装但不启动服务，再通过标准输入或权限受限的 Token 文件注册：
+
+```bash
+sudo sh install.sh install --version vN.N.N --server-url https://dns-api.example.internal
+printf '%s\n' "$MASTERDNS_PROBE_INSTALL_TOKEN" | \
+  sudo -u masterdns-agent /usr/local/bin/masterdns-agent enroll --config /etc/masterdns-agent/config.json
+sudo systemctl start masterdns-agent
+sudo sh install.sh status
+```
+
+不要把 Token 值放入命令参数、下载 URL、日志或世界可读文件。文件方式使用 `masterdns-agent enroll --config /etc/masterdns-agent/config.json --install-token-file PATH`，并确保该文件只有 Agent 账号可读。控制台吊销 Agent 后，下一次认证返回 401，服务停止领取任务；吊销不会删除现有 DNS。升级使用 `sudo sh install.sh update --version vN.N.N`。卸载默认保留配置和缓冲结果；只有明确执行 `sudo sh install.sh uninstall --purge` 才删除它们。
+
+协议固定为 `probe-agent/v1`。每个 Agent 的服务端并发上限默认为 16、最大 100；实际租约数还受 Agent heartbeat 上报能力和未完成租约限制。一次租约最多返回 100 个任务，一次结果提交最多 100 条；Agent 本地缓冲上限为 1,000 条或 10 MiB，达到上限会暂停领取新任务，不会删除结果。`deadline` 是该轮接受测量的截止时间，`resultExpirySeconds` 是已聚合证据的有效期；所有主机应使用 NTP。`minimumValid` 是形成结果所需的有效票数，`majority`、`all` 或指定探测点决定 quorum；不足或过期为 unknown，不能当作目标 failure。
+
+## 8. 地址健康和轮换策略
+
+IPv4 与 IPv6 使用独立健康策略和轮换开关。实例 `managed` 授权默认关闭，并独立于地址族开关、允许停止再启动和允许释放原地址三个 opt-in；发现资源不会自动授权。默认最多实际换址 3 次，最小间隔 60 秒，云端等待 120 秒，candidate 外部复测窗口 180 秒。新地址必须由对应地址族的外部 quorum 验证后才能发布 DNS；unknown 只会等待或告警。
+
+停止实例只在 `allowStopStart` 打开时允许。原地址清理只在 `allowReleaseAddress` 打开、资源归属可验证且远端读取确认后执行。EC2 自动公网地址、Lightsail 临时地址及已释放的系统地址通常不能恢复为原值；数据库回退也不会重新取得它们。权限、配额错误不会通过停止实例规避，也不会刷新换址预算。
+
+通知 Worker 从持久健康状态、轮换阶段、DNS publication 和 cleanup 状态恢复事件。Redis 丢失可重新入队，`event/channel` 唯一键避免重复投递。unknown/探测不足、目标失败与恢复分别通知；轮换通知包括预算耗尽、权限/配额、DNS 部分发布、cleanup 失败与完成。Webhook/Telegram 内容只含归属范围内的状态和资源 ID，不含凭证、Token、自定义 header、云请求或完整策略快照。
+
+## 9. 备份与恢复
 
 数据库是持久状态的事实来源，Redis 仅保存可恢复的队列状态。建议每日执行 PostgreSQL 逻辑备份，并定期验证恢复流程：
 
@@ -91,9 +120,11 @@ docker compose start api worker web
 docker compose ps
 ```
 
-恢复操作会覆盖目标数据库，应只在明确的恢复窗口执行。完整恢复需要同时具备数据库备份和对应的 `MASTER_ENCRYPTION_KEY`；Redis 卷可以重建，Worker 会扫描未完成的 Operation 与通知投递并重新入队。
+恢复操作会覆盖目标数据库，应只在明确的恢复窗口执行。完整恢复需要同时具备数据库备份和对应的 `MASTER_ENCRYPTION_KEY`；Redis 卷可以重建，Worker 会扫描未完成的 Operation、持久通知状态与通知投递并重新入队。
 
-## 8. 升级与回退
+备份只能恢复平台的持久状态。恢复旧数据库前先停止 Web、API、Worker 和 migration，防止旧状态继续驱动副作用；恢复后先核对 AWS、DNS、candidate/current/publication 与 cleanup 的远端实际状态，再恢复自动化。数据库备份不能撤销已经执行的 EC2/Lightsail 或 DNS 写入，也不能找回已释放且不可复原的地址。
+
+## 10. 升级与回退
 
 升级前先备份数据库和 `.env`，再构建并启动新版本：
 
@@ -108,9 +139,9 @@ docker compose logs --since=10m migrate api worker
 
 升级预检是只读操作。若它报告同一 Zone、FQDN 和记录类型被多个 Pool 绑定，应在旧版本仍运行时根据报告中的 Binding/Pool ID 保留一个业务上正确的绑定，并删除或改名其他绑定；预检不会替操作员选择或删除数据。重复运行预检直至通过后再执行 `docker compose up -d`。健康检查唯一约束升级会按 `updated_at`、`created_at`、`id` 顺序保留每个 scope 最新的启用配置，并自动禁用其余旧配置。
 
-migration 只向前执行。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。不要只回退代码而忽略数据库兼容性。
+migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 `MASTER_ENCRYPTION_KEY`、旧镜像标签和旧 Agent 精确版本。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。down migration 即使存在也不能撤销已经执行的 AWS 或 DNS 写入；回退后必须按远端读取结果人工处置 partial publication、ambiguous ownership 和 cleanup failure，不能只回退代码。
 
-## 9. 常见检查
+## 11. 常见检查
 
 - API 不健康：检查 `postgres`、`redis` 与 `migrate` 日志以及 `DATABASE_URL` 或 `PG*` 数据库配置。
 - 无法登录：确认访问协议为 HTTPS、`WEB_URL` 与浏览器 Origin 完全一致，Cookie 未被代理删除。
@@ -118,3 +149,6 @@ migration 只向前执行。若应用版本需要回退，应先确认旧版本�
 - DDNS heartbeat 401：重新生成安装 Token 并安装，或检查 Agent 是否已被吊销。
 - DDNS 地址不发布：检查 candidate 对应健康检查结果，不要绕过候选地址验证。
 - 自动化没有切换：检查失败阈值、冷却时间、Pool 是否暂停，以及是否仍存在健康候选节点。
+- Probe 一直 unknown：检查 Agent 时间、在线状态、地址族能力、任务 deadline、有效票数和 private CIDR 策略；不要把 unknown 当作 failure。
+- DNS 部分发布：查看 rotation publication 与对应 Operation/Step，先读取各 DNS 厂商远端值，再决定重试或人工修复。
+- cleanup 失败：核对地址归属、引用关系、release opt-in 和远端附着状态；无法确认归属时保留资源并人工处理。

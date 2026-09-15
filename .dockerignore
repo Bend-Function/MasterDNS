@@ -1,5 +1,7 @@
 .git
 .gitignore
+.superpowers
+**/.superpowers
 node_modules
 **/node_modules
 .pnpm-store
@@ -9,6 +11,7 @@ node_modules
 coverage
 playwright-report
 test-results
+**/test-credentials*
 .env
 .env.*
 **/.env
