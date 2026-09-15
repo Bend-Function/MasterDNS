@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { cp, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { expect, it } from "vitest";
 import { createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeRoundSequences, cloudAccounts, cloudInstances, cloudInterfaces, managedAddressSlots } from "./index.js";
@@ -38,12 +39,17 @@ it("backfills retained endpoint/family and slot sequence maxima when upgrading P
     const [slot] = await db.insert(managedAddressSlots).values({ interfaceId: iface!.id, name: "public", family: "4" }).returning();
     const [slotCheck] = await db.insert(healthCheckConfigs).values({ slotId: slot!.id, checkerType: "tcp", config }).returning();
     const base = { configId: check!.id, addressVersion: 1, configVersion: 1, config, memberIds: [randomUUID()], consensus: { mode: "all" as const, minimumValid: 1 }, deadline: new Date(), resultExpiresAt: new Date(Date.now()+60000) };
-    await db.insert(probeRounds).values([
+    const historicalRounds: Array<typeof probeRounds.$inferInsert> = [
       { ...base, endpointId: endpoint!.id, endpointAddressId: v4!.id, family: "4", address: v4!.address, sequence: 4 },
       { ...base, endpointId: endpoint!.id, endpointAddressId: v4!.id, family: "4", address: v4!.address, sequence: 8 },
       { ...base, endpointId: endpoint!.id, endpointAddressId: v6!.id, family: "6", address: v6!.address, sequence: 3 },
       { ...base, configId: slotCheck!.id, slotId: slot!.id, family: "4", address: "192.0.2.2", sequence: 9 },
-    ]);
+    ];
+    // Insert only columns present in migration 15, independent of today's schema defaults.
+    for (const round of historicalRounds) await db.execute(sql`
+      insert into probe_rounds (slot_id, endpoint_id, endpoint_address_id, config_id, sequence, address_version, config_version, address, family, config, member_ids, consensus, deadline, result_expires_at)
+      values (${round.slotId ?? null}, ${round.endpointId ?? null}, ${round.endpointAddressId ?? null}, ${round.configId}, ${round.sequence}, ${round.addressVersion}, ${round.configVersion}, ${round.address}, ${round.family}, ${JSON.stringify(round.config)}::jsonb, ${JSON.stringify(round.memberIds)}::jsonb, ${JSON.stringify(round.consensus)}::jsonb, ${round.deadline.toISOString()}, ${round.resultExpiresAt.toISOString()})
+    `);
     await migrate(db, { migrationsFolder: migrations });
     const counters = await db.select().from(probeRoundSequences);
     expect(counters).toHaveLength(3);
