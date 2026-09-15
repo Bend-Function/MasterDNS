@@ -111,6 +111,8 @@
 
 ## 6. 发布门槛
 
+独立 Probe Agent 与真实 P5 API 的 P12a 协议联调使用 `pnpm test:probe-integration`。前置环境、IPv4/IPv6 实际覆盖、安全边界与 P12b 未验收项见 [二进制联调说明](validation/probe-binary-integration.md)。此命令不代表完整换址、云写入或 DNS 恢复验收。
+
 ### 6.1 自动化门槛
 
 - `pnpm build`、`pnpm typecheck`、`pnpm lint` 和 `pnpm test` 全部通过。
