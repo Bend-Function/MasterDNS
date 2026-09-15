@@ -238,6 +238,9 @@ export class PoolsService {
       if (!sameIdSet(currentEndpoints, snapshot.endpoints) || !sameIdSet(currentBindings, snapshot.bindings)) {
         throw new ConflictException("旧版本与当前版本的节点或域名绑定集合不同；请先通过节点/绑定流程恢复相同结构，再重试策略回滚");
       }
+      if (currentEndpoints.some((endpoint) => endpoint.addressMode === "cloud")) {
+        throw new ConflictException("Cloud 节点策略回滚暂不支持；请使用云地址槽位管理流程");
+      }
 
       const restoredAt = new Date();
       const [pool] = await tx.update(endpointPools).set({

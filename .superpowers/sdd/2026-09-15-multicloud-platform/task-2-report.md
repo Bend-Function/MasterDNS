@@ -55,3 +55,17 @@ Green evidence:
 - `pnpm_config_verify_deps_before_run=false pnpm db:generate`: no schema changes, confirming generated snapshot consistency.
 - Explicit 0010-to-0011 upgrade rerun passed with `oldEndpointMode=static`, enum values `{static,ddns,cloud}`, and active current/candidate uniqueness preserved.
 - `git diff --check`: passed.
+
+## Review fix round 2
+
+- Added the symmetric current-state guard inside `restorePolicyVersion`: after the pool and current resources are locked and loaded, but before the first write, restore now rejects when any current endpoint uses cloud mode. This prevents a legacy static/DDNS snapshot from converting a current cloud endpoint until P10 implements slot-aware restore.
+- The regression uses a valid legacy static snapshot with a current cloud endpoint and verifies the advisory lock/read phase ran while `tx.update` was never called.
+
+Red evidence:
+
+- `pnpm_config_verify_deps_before_run=false pnpm --filter @masterdns/api test -- src/modules/pools/pools.service.test.ts`: the new case reached the first update and failed with `Cannot read properties of undefined (reading 'set')`; 62 other API tests passed.
+
+Green evidence:
+
+- `pnpm_config_verify_deps_before_run=false pnpm --filter @masterdns/api test -- src/modules/pools/pools.service.test.ts`: 11 files, 63 tests passed, including 12 pool-service tests.
+- `pnpm_config_verify_deps_before_run=false pnpm --filter @masterdns/api typecheck`: passed.

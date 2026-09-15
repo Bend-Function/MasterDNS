@@ -124,6 +124,56 @@ describe("PoolsService policy rollback", () => {
     expect(transaction).not.toHaveBeenCalled();
   });
 
+  it("rejects a legacy snapshot when the current endpoint is cloud before any write", async () => {
+    const snapshot = restorableSnapshot([{
+      endpointId,
+      family: "4",
+      address: "192.0.2.40",
+      state: "current",
+      source: "static",
+    }]);
+    const update = vi.fn();
+    const tx = {
+      execute: vi.fn(async () => undefined),
+      update,
+      select: vi.fn(() => ({
+        from: vi.fn((table: unknown) => {
+          if (table === endpointAddresses) {
+            return { innerJoin: vi.fn(() => ({ where: vi.fn(async () => []) })) };
+          }
+          return {
+            where: vi.fn(() => ({
+              limit: vi.fn(() => ({
+                for: vi.fn(async () => table === endpointPools ? [{
+                  id: poolId,
+                  ownerUserId: actor.id,
+                  enabledAt: new Date("2026-07-30T00:00:00.000Z"),
+                }] : []),
+              })),
+              for: vi.fn(async () => table === endpoints ? [{ id: endpointId, addressMode: "cloud" }] : []),
+            })),
+          };
+        }),
+      })),
+    };
+    const database = {
+      db: {
+        transaction: vi.fn(async (callback: (value: typeof tx) => unknown) => callback(tx)),
+        select: vi.fn(() => ({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({ limit: vi.fn(async () => [{ poolId, version: 1, snapshot }]) })),
+          })),
+        })),
+      },
+    };
+    const service = new PoolsService(database as never, {} as never);
+    vi.spyOn(service as any, "findOwnedPool").mockResolvedValue({ id: poolId });
+
+    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud.*暂不支持/i);
+    expect(tx.execute).toHaveBeenCalledOnce();
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it("retires all DDNS active addresses before restoring static addresses", async () => {
     const restoredAt = new Date("2026-07-30T12:00:00.000Z");
     const updateCalls: Array<{ table: unknown; values: Record<string, unknown> }> = [];
