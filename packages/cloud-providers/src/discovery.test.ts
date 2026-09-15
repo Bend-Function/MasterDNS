@@ -3,7 +3,7 @@ import {
   DescribeNetworkInterfacesCommand,
   DescribeRegionsCommand,
 } from "@aws-sdk/client-ec2";
-import { GetInstanceCommand, GetInstancesCommand, GetRegionsCommand, GetStaticIpsCommand } from "@aws-sdk/client-lightsail";
+import { GetInstanceCommand, GetInstancesCommand, GetRegionsCommand, GetStaticIpCommand, GetStaticIpsCommand } from "@aws-sdk/client-lightsail";
 import { GetCallerIdentityCommand } from "@aws-sdk/client-sts";
 import { describe, expect, it } from "vitest";
 
@@ -152,6 +152,59 @@ describe("EC2 read adapter", () => {
 });
 
 describe("Lightsail read adapter", () => {
+  it("inspects an explicit instance and static IP without account-wide listing", async () => {
+    const stableArn = "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid";
+    const requests: Array<[string, unknown]> = [];
+    const adapter = new LightsailCloudAdapter("local-account", credentials, {
+      lightsailSend: async (command) => {
+        requests.push([command.constructor.name, command.input]);
+        if (command instanceof GetInstanceCommand) return { instance: {
+          name: "web-one", arn: stableArn, isStaticIp: true, publicIpAddress: "203.0.113.4", state: { name: "running" }, ipAddressType: "ipv4",
+        } };
+        if (command instanceof GetStaticIpCommand) return { staticIp: {
+          name: "web-static", arn: "arn:aws:lightsail:us-east-1:123456789012:StaticIp/static-guid", attachedTo: "web-one", ipAddress: "203.0.113.4",
+        } };
+        throw new Error("account-wide request is forbidden");
+      },
+    });
+
+    await expect(adapter.inspectScoped(
+      { accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn },
+      { instanceName: "web-one", staticIpName: "web-static" },
+    )).resolves.toMatchObject({ nativeName: "web-one", interfaces: [{ addresses: expect.arrayContaining([
+      expect.objectContaining({ address: "203.0.113.4", allocationId: "web-static" }),
+    ]) }] });
+    expect(requests).toEqual([
+      ["GetInstanceCommand", { instanceName: "web-one" }],
+      ["GetStaticIpCommand", { staticIpName: "web-static" }],
+    ]);
+  });
+
+  it.each([
+    ["instance ARN", { instanceArn: "arn:aws:lightsail:us-east-1:123456789012:Instance/recreated", address: "203.0.113.4", attachedTo: "web-one" }],
+    ["static-IP address", { instanceArn: "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid", address: "203.0.113.99", attachedTo: "web-one" }],
+    ["static-IP attachment", { instanceArn: "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid", address: "203.0.113.4", attachedTo: "other" }],
+  ])("rejects a scoped Lightsail %s mismatch", async (_label, mismatch) => {
+    const stableArn = "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid";
+    const adapter = new LightsailCloudAdapter("local-account", credentials, {
+      lightsailSend: async (command) => {
+        if (command instanceof GetInstanceCommand) return { instance: {
+          name: "web-one", arn: mismatch.instanceArn, isStaticIp: true, publicIpAddress: "203.0.113.4",
+        } };
+        if (command instanceof GetStaticIpCommand) return { staticIp: {
+          name: "web-static", arn: "arn:aws:lightsail:us-east-1:123456789012:StaticIp/static-guid",
+          attachedTo: mismatch.attachedTo, ipAddress: mismatch.address,
+        } };
+        throw new Error("account-wide request is forbidden");
+      },
+    });
+
+    await expect(adapter.inspectScoped(
+      { accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn },
+      { instanceName: "web-one", staticIpName: "web-static" },
+    )).rejects.toMatchObject({ code: "remote_identity_changed" });
+  });
+
   it("passes a resumed Lightsail cursor to the SDK", async () => {
     const adapter = new LightsailCloudAdapter("local-account", credentials, {
       stsSend: async () => ({}),

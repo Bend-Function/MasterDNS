@@ -21,6 +21,8 @@ Use temporary STS credentials dedicated to an isolated test resource. Every reso
 | `MASTERDNS_AWS_E2E_INTERFACE_ID` | Exact EC2 ENI ID, or exactly `primary` for Lightsail |
 | `MASTERDNS_AWS_E2E_ADDRESS` | Exact currently attached public IPv4 or IPv6 address |
 | `MASTERDNS_AWS_E2E_FAMILY` | Exactly `4` or `6`, matching the address |
+| `MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME` | Lightsail only: exact native instance name |
+| `MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME` | Lightsail only: exact attached static-IP name, or exactly `none` for a dynamic address |
 
 Run the read-only inspection and plan first:
 
@@ -42,7 +44,11 @@ The journal directory and file must be protected as test control data. Credentia
 
 ## Safety and recovery
 
-The harness creates one attempt and persists its full production `CloudStep` plan before dispatch. Before each mutation it rechecks the STS account and exact instance/interface scope. After each side effect it immediately persists the provider receipt, then reads the remote state through `observeDetails`. No next step is dispatched until the prior observation is `applied`.
+The harness acquires `<journal>.lock` before loading the journal and holds it through observation or completion. A concurrent invocation exits with `journal_locked` before any cloud read or mutation. Lock ownership uses the local host and PID only to distinguish a definitely dead same-host owner as `journal_lock_stale`; it never steals a lock based on elapsed time. After confirming the recorded process is gone and inspecting the journal/resources, an operator may remove only that stale `.lock` file and rerun with the same scope.
+
+The harness creates one attempt and persists its original normalized inventory and full production `CloudStep` plan before dispatch. Each journal replacement is written to a private temporary file, synced, renamed, and followed by a directory sync. Persistence errors abort before the corresponding mutation. On resume, the plan is rebuilt from the persisted original inventory and must exactly match action order, IDs, scope, and before snapshots. Before each mutation the harness rechecks the STS account and exact instance/interface scope. After each side effect it immediately persists the provider receipt, then reads the remote state through `observeDetails`. No next step is dispatched until the prior observation is `applied`.
+
+Lightsail inspection uses only `GetInstance` for the explicit native instance name and, unless `MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME=none`, `GetStaticIp` for the explicit static-IP name. It verifies the instance ARN and the static IP's address and attachment identity. The harness does not call `GetInstances` or `GetStaticIps` to discover matching resources.
 
 If the process stops after dispatch, rerun the same command with the same scope and journal path. A `dispatched`, `received`, or `pending` step is observed; it is not blindly executed again. A pending observation exits with code 2 and retains the attempt, action, allocation/resource ID, and candidate address in the journal and output. An ambiguous or not-applied observation becomes `needs_review`, also exits with code 2, and requires inspection rather than replay. Do not edit or delete the journal to force another attempt.
 

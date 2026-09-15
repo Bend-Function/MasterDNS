@@ -2,6 +2,7 @@ import {
   GetInstanceCommand,
   GetInstancesCommand,
   GetRegionsCommand,
+  GetStaticIpCommand,
   GetStaticIpsCommand,
   LightsailClient,
 } from "@aws-sdk/client-lightsail";
@@ -121,6 +122,30 @@ export class LightsailCloudAdapter implements CloudAdapter {
       ]);
       if (instanceResponse.instance?.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
       const inventory = mapLightsailInstance(this.accountId, ref.region, instanceResponse.instance, staticIpResponse);
+      if (inventory === undefined) throw new CloudError("resource_not_found", false);
+      return inventory;
+    } catch (error) {
+      throw normalizeAwsError(error);
+    }
+  }
+
+  async inspectScoped(ref: CloudRef, scope: { instanceName: string; staticIpName?: string }): Promise<CloudInventory> {
+    if (ref.accountId !== this.accountId || ref.service !== "lightsail") throw new CloudError("resource_not_found", false);
+    try {
+      const instanceResponse = await this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName: scope.instanceName }));
+      const instance = instanceResponse.instance;
+      if (!instance || instance.name !== scope.instanceName || instance.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
+      let staticIps: StaticIp[] = [];
+      if (scope.staticIpName !== undefined) {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.staticIpName }));
+        const staticIp = response.staticIp as StaticIp | undefined;
+        if (!staticIp || !staticIp.arn || staticIp.name !== scope.staticIpName || staticIp.attachedTo !== scope.instanceName
+          || staticIp.ipAddress !== instance.publicIpAddress || instance.isStaticIp !== true) throw new CloudError("remote_identity_changed", false);
+        staticIps = [staticIp];
+      } else if (instance.isStaticIp !== false) {
+        throw new CloudError("remote_identity_changed", false);
+      }
+      const inventory = mapLightsailInstance(this.accountId, ref.region, instance, staticIps);
       if (inventory === undefined) throw new CloudError("resource_not_found", false);
       return inventory;
     } catch (error) {

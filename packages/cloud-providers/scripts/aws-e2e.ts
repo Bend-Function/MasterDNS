@@ -1,6 +1,7 @@
 import { CloudError } from "../src/errors.js";
 import { createCloudAdapter } from "../src/factory.js";
 import { FileAwsE2eJournalStore, loadAwsE2eConfig, runAwsE2e } from "../src/aws-e2e-harness.js";
+import { LightsailCloudAdapter } from "../src/lightsail.js";
 
 try {
   const loaded = loadAwsE2eConfig(process.env);
@@ -16,6 +17,9 @@ try {
     const result = await runAwsE2e(config, {
       adapter,
       ...(config.journalPath ? { journal: new FileAwsE2eJournalStore(config.journalPath) } : {}),
+      ...(config.scope.service === "lightsail" && config.lightsailScope && adapter instanceof LightsailCloudAdapter
+        ? { inspect: (ref) => adapter.inspectScoped(ref, config.lightsailScope!) }
+        : {}),
     });
     console.log(JSON.stringify(result));
     if (result.outcome === "pending" || result.outcome === "needs_review") process.exitCode = 2;
