@@ -1,4 +1,6 @@
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { RotationPublicationService } from "./rotation-publication.service.js";
+import { RotationCleanupService } from "./rotation-cleanup.service.js";
+import { Injectable, Optional, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { Worker } from "bullmq";
 import { queueNames, type RotationJob } from "@masterdns/contracts";
 import { CloudError } from "@masterdns/cloud-providers";
@@ -13,7 +15,7 @@ const noEffectErrors = new Set(["permission_denied", "quota_exceeded", "rate_lim
 export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
   private worker?: Worker<RotationJob>;
   private readonly logger = new Logger(RotationProcessor.name);
-  constructor(private readonly store: RotationStore, private readonly runtime: CloudRuntimeService, private readonly queues: QueueRuntimeService) {}
+  constructor(private readonly store: RotationStore, private readonly runtime: CloudRuntimeService, private readonly queues: QueueRuntimeService, @Optional() private readonly publication?: RotationPublicationService, @Optional() private readonly cleanup?: RotationCleanupService) {}
   onModuleInit() {
     this.worker = new Worker<RotationJob>(queueNames.rotation, job => this.run(job.data.incidentId), { connection: this.queues.redis, concurrency: 8 });
     this.worker.on("error", error => this.logger.error(error.message));
@@ -24,7 +26,12 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
     try {
       const run = await this.store.read(incidentId, lease);
       const action = run.action;
-      if (run.incident.phase === "publish" || run.incident.phase === "cleanup") { await this.store.defer(incidentId); return; } // Durable P10 boundary, never no-op success.
+      if (run.incident.phase === "publish" || run.incident.phase === "cleanup") {
+        await this.store.release(lease);
+        if (run.incident.phase === "publish") await this.publication?.publish(incidentId);
+        else await this.cleanup?.complete(incidentId);
+        await this.store.defer(incidentId); return;
+      }
       if (action.kind !== "execute" && action.kind !== "observe") { await this.store.settle(incidentId, lease); return; }
       const identity = { credentialCiphertext: run.c.account.credentialCiphertext, externalAccountId: run.c.account.externalAccountId };
       const adapter = await this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" });

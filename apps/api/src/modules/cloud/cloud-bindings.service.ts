@@ -1,7 +1,7 @@
 import { isIP } from "node:net";
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { auditLogs, bindingAssignments, cloudAccounts, cloudAddresses, cloudEndpointLinks, cloudInstances, cloudInterfaces, cloudScanScopes, dnsRecords, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, operationSteps, policyVersions, providerAccounts, zones } from "@masterdns/db";
+import { captureCloudPolicyLinks, auditLogs, bindingAssignments, cloudAccounts, cloudAddresses, cloudEndpointLinks, cloudInstances, cloudInterfaces, cloudScanScopes, dnsRecords, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, operationSteps, policyVersions, providerAccounts, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -91,7 +91,7 @@ export class CloudBindingsService {
             tx.select().from(domainBindings).where(eq(domainBindings.poolId, pool.id)),
             tx.select().from(healthCheckConfigs).where(or(eq(healthCheckConfigs.poolId, pool.id), inArray(healthCheckConfigs.endpointId, tx.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, pool.id))), inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, pool.id))))),
           ]);
-          await tx.insert(policyVersions).values({ poolId: pool.id, version: updatedPool!.policyRevision, actorUserId: actor.id, reason: "cloud_binding.create", snapshot: { pool: updatedPool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings: bindingRows, healthChecks: checks } });
+          await tx.insert(policyVersions).values({ poolId: pool.id, version: updatedPool!.policyRevision, actorUserId: actor.id, reason: "cloud_binding.create", snapshot: { cloudLinks: await captureCloudPolicyLinks(tx, pool.id), pool: updatedPool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings: bindingRows, healthChecks: checks } });
           await tx.insert(auditLogs).values({ ownerUserId: ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_binding.create", resourceType: "domain_binding", resourceId: binding.id, afterSnapshot: { binding, endpoint, slotId: source.slot.id } });
           lease.assertOwned();
           return { pool: updatedPool!, endpoint, binding, awaitingExternalVerification: true };

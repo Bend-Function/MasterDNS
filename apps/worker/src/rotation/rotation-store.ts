@@ -1,7 +1,7 @@
 import { isIP } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { nextRotationAction, type RotationSnapshot, type RotationStepSnapshot, type RotationCloudRejection } from "@masterdns/automation";
 import { planCloudRotation, type CloudInventory, type CloudObservation, type CloudStepResult } from "@masterdns/cloud-providers";
 import { cloudAddresses, databaseNow, healthRevisionMatches, lockRotationContext, lockRotationHealth, resetHealthEvidence, addressHealthStates, managedAddressSlots, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, rotationAuthorizationError, type RotationContext, type RotationTransaction } from "@masterdns/db";
@@ -49,7 +49,7 @@ export class RotationStore {
       lease: { held: !!physical, revision: physical?.revision ?? 0, expectedRevision: lease.revision },
       budget: { segmentId: budget.id, attemptsUsed: budget.attemptsUsed, maxAttempts: budget.maxAttempts, exhausted: budget.exhausted },
       nextAttemptAt: incident.nextAttemptAt.getTime(),
-      attempt: attempt ? { attemptId: attempt.id, segmentId: attempt.segmentId, charged: attempt.charged, steps: steps.map(stepSnapshot) } : null,
+      attempt: attempt ? { attemptId: attempt.id, segmentId: attempt.segmentId, charged: attempt.charged, steps: steps.filter(s => s.plan.arguments.phase !== "post_publish_cleanup").map(stepSnapshot) } : null,
       candidate: c.slot.candidateAddressId && h.policy && h.config ? {
         addressVersion: c.slot.candidateVersion, probeConfigRevision: h.config.revision, successThreshold: h.policy.successThreshold, failureThreshold: h.policy.failureThreshold,
         probeWindowEndsAt: incident.candidateDeadline?.getTime() ?? h.now.getTime(), nextProbeAt: h.state?.nextRoundAt?.getTime() ?? h.now.getTime(),
@@ -60,7 +60,7 @@ export class RotationStore {
         } : null,
       } : null,
       publication: publication?.status === "applied" || publication?.status === "in_flight" ? { status: publication.status, addressVersion: publication.addressVersion } : { status: publication?.status ?? "pending" },
-      cleanup: { status: "failed" }, // P10 owns this phase; P9 cannot manufacture completion.
+      cleanup: { status: "failed" }, // Completion remains with P10 after all required cleanup settles.
     };
     let action = nextRotationAction(snapshot, h.now.getTime());
     if (action.kind !== "observe") {
@@ -176,6 +176,11 @@ export class RotationStore {
         await tx.update(rotationIncidents).set({ phase: "publish", status: "active", errorCode: null, nextRunAt: new Date(run.h.now.getTime() + 30000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
         if (run.attempt) await tx.update(rotationAttempts).set({ status: run.attempt.charged ? "verified" : "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
       } else if (action.kind === "complete" && run.h.success && !run.attempt?.charged && !c.slot.candidateAddressId && c.slot.currentVersion > 0) {
+        const pendingCleanup = await tx.select({ id: rotationResources.id }).from(rotationResources).where(and(eq(rotationResources.incidentId, id), inArray(rotationResources.cleanupStatus, ["pending", "failed"])));
+        if (pendingCleanup.length) {
+          await tx.update(rotationIncidents).set({ phase: "cleanup", errorCode: "cleanup_pending", nextRunAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
+          return;
+        }
         await tx.update(rotationIncidents).set({ phase: "complete", status: "complete", errorCode: null, completedAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
         await tx.update(rotationLeases).set({ incidentId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.incidentId, id)));
         if (run.attempt) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));

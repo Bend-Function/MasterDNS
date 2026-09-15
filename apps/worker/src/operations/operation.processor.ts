@@ -1,8 +1,14 @@
-import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
+import { Injectable, Optional, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import type { DnsRecordInput, OperationJob, ProviderRecord } from "@masterdns/contracts";
 import { ProviderError, queueNames } from "@masterdns/contracts";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
+  rotationLeases,
+  rotationPublications,
+  captureCloudPolicyLinks,
+  cloudEndpointLinks,
+  lockRotationContext,
+  healthRevisionMatches,
   auditLogs,
   bindingAssignments,
   dnsRecords,
@@ -25,6 +31,9 @@ import { QueueRuntimeService } from "../queue-runtime.service.js";
 import { ProviderRuntimeService } from "../providers/provider-runtime.service.js";
 import { isDnsZoneLockError, type DnsZoneLease, withDnsZoneLock, withRedisLease } from "../sync/dns-zone-lock.js";
 
+import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
+import { assertPublicationContext, livePublicationMatches, effectiveOldTtl } from "../rotation/rotation-publication.service.js";
+
 const stepInputSchema = z.object({
   zoneExternalId: z.string().min(1),
   recordExternalId: z.string().min(1).optional(),
@@ -43,6 +52,8 @@ const stepInputSchema = z.object({
   assignmentMode: z.enum(["single", "set"]).optional(),
   previousEndpointIds: z.array(z.string().uuid()).optional(),
   deleteBinding: z.boolean().optional(),
+  cloud: z.record(z.string(), z.unknown()).optional(),
+  cleanupOldTtl: z.number().nonnegative().optional(),
 });
 
 @Injectable()
@@ -56,6 +67,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     private readonly database: DatabaseService,
     private readonly queues: QueueRuntimeService,
     private readonly providers: ProviderRuntimeService,
+    @Optional() private readonly cloudRuntime?: CloudRuntimeService,
   ) {}
 
   async onModuleInit() {
@@ -195,7 +207,23 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     const input = stepInputSchema.parse(step.input);
     const { adapter } = await this.providers.forAccount(step.providerAccountId);
     if (!await this.prepareStep(operation, step)) return false;
+    // Save the remote pre-change TTL before any DNS side effect. A lost SDK
+    // response or rolled-back result transaction must not lose the cleanup grace.
+    const beforeRecord = operation.resourceType === "endpoint_pool" && input.recordExternalId
+      ? await adapter.getRecord(input.zoneExternalId, input.recordExternalId) : undefined;
+    if (beforeRecord) {
+      await this.database.db.update(operationSteps).set({ input: { ...step.input, cleanupOldTtl: Math.max(input.cleanupOldTtl ?? 0, effectiveOldTtl(beforeRecord.ttl, adapter.provider)) } }).where(eq(operationSteps.id, step.id));
+    }
+    const cloud = input.endpointId && step.action !== "delete" ? await this.database.db.transaction(async tx => {
+      const [endpoint] = await tx.select().from(endpoints).where(eq(endpoints.id, input.endpointId!));
+      if (endpoint?.addressMode !== "cloud") return;
+      const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, endpoint.id), eq(cloudEndpointLinks.family, input.record?.type === "AAAA" ? "6" : "4")));
+      if (!link || !input.cloud || input.cloud.slotId !== link.slotId) throw new ProviderError("Cloud publication identity is missing", "validation_failed", adapter.provider);
+      return lockRotationContext(tx, link.slotId);
+    }) : undefined;
+    const live = cloud && this.cloudRuntime ? await (await this.cloudRuntime.adapter(cloud.account.id, cloud.instance.service, { observation: true })).inspect({ accountId: cloud.account.id, service: cloud.instance.service, region: cloud.instance.region, instanceId: cloud.instance.externalId }) : undefined;
     return this.database.db.transaction(async (tx) => {
+      if (cloud) await lockRotationContext(tx, cloud.slot.id);
       if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
         const [pool] = await tx.select({
@@ -207,6 +235,24 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
             .where(eq(operationSteps.id, step.id));
           return false;
         }
+      }
+      if (cloud) {
+        const c = await lockRotationContext(tx, cloud.slot.id);
+        const [physical] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey)).for("share");
+        if (physical?.unresolvedStepId) throw new ProviderError("Cloud mutation still requires observation", "transient_failure", adapter.provider);
+        const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, input.endpointId!), eq(cloudEndpointLinks.family, c.slot.family)));
+        const [owner] = await tx.select().from(endpointPools).where(eq(endpointPools.id, input.poolId!));
+        const [publication] = typeof input.cloud?.publicationId === "string" ? await tx.select().from(rotationPublications).where(eq(rotationPublications.id, input.cloud.publicationId)) : [];
+        if (!publication || publication.slotId !== c.slot.id || publication.addressVersion !== c.addressVersion) throw new ProviderError("Cloud publication is missing or superseded", "validation_failed", adapter.provider);
+        const h = await assertPublicationContext(tx, c, publication.status === "applied" ? undefined : publication);
+        const current = live && livePublicationMatches(c, live)
+          && c.account.credentialCiphertext === cloud.account.credentialCiphertext
+          && !c.slot.candidateAddressId && link?.slotId === c.slot.id
+          && owner?.ownerUserId === c.account.ownerUserId && c.address?.address === input.record?.content
+          && input.cloud?.addressId === c.address?.id && input.cloud?.addressVersion === c.addressVersion
+          && input.cloud?.authorizationRevision === c.authorization?.revision && input.cloud?.physicalKey === c.physicalKey
+          && healthRevisionMatches(input.cloud as never, h);
+        if (!current) throw new ProviderError("Cloud publication authorization or address changed", "validation_failed", adapter.provider);
       }
       lease.assertOwned();
       // Manual operations may have been queued before the RRset acquired a manager.
@@ -236,7 +282,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         remote = await verifyRemoteRecord(adapter, input.zoneExternalId, remote.externalId, input.record);
       } else if (step.action === "update") {
         if (!input.record || !input.recordExternalId) throw new ProviderError("Update step is incomplete", "validation_failed", adapter.provider);
-        const existing = await adapter.getRecord(input.zoneExternalId, input.recordExternalId);
+        const existing = beforeRecord ?? await adapter.getRecord(input.zoneExternalId, input.recordExternalId);
         if (!existing) throw new ProviderError("DNS record no longer exists", "not_found", adapter.provider);
         remote = dnsRecordMatches(existing, input.record)
           ? existing
@@ -398,7 +444,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
               await tx.insert(policyVersions).values({
                 poolId: binding.poolId,
                 version: pool.policyRevision,
-                snapshot: { pool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings, healthChecks: checks },
+                snapshot: { ...(endpointRows.some(e => e.addressMode === "cloud") ? { cloudLinks: await captureCloudPolicyLinks(tx, binding.poolId) } : {}), pool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings, healthChecks: checks },
                 reason: "binding.delete",
                 actorUserId: operation.actorUserId,
               });
