@@ -5,12 +5,14 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useMemo, useRef, useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../../components/console-layout";
+import { CloudSourcePicker } from "../../../components/cloud-source-picker";
 import { RelativeTime } from "../../../components/relative-time";
 import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState, Switch } from "../../../components/ui";
 import { useResource } from "../../../hooks/use-resource";
 import { api, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { demoNow, demoZones } from "../../../lib/demo";
 import { createIntentKey } from "../../../lib/intent-key";
+import { submitCloudIntent } from "../../../lib/cloud-ui";
 import type { DnsRecord, ZoneListRow } from "../../../lib/types";
 
 const previewRecords: DnsRecord[] = [
@@ -54,6 +56,9 @@ export default function ZoneRecordsPage() {
   const [saving, setSaving] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [source, setSource] = useState<"manual" | "cloud">("manual");
+  const [cloudSlotId, setCloudSlotId] = useState("");
   const saveIntentKey = useRef(createIntentKey());
   const deleteIntentKey = useRef(createIntentKey());
   const records = useMemo(() => (data ?? []).filter((record) => `${record.name} ${record.type} ${record.content}`.toLowerCase().includes(search.toLowerCase())), [data, search]);
@@ -62,6 +67,9 @@ export default function ZoneRecordsPage() {
   const openEditor = (record?: DnsRecord) => {
     saveIntentKey.current.reset();
     setActionError(null);
+    setActionNotice(null);
+    setSource("manual");
+    setCloudSlotId("");
     setEditing(record ?? "new");
     setDraft(record ? {
       type: record.type,
@@ -81,6 +89,22 @@ export default function ZoneRecordsPage() {
     setSaving(true);
     setActionError(null);
     try {
+      if (source === "cloud") {
+        if (!cloudSlotId || !["A", "AAAA"].includes(draft.type)) throw new Error("请选择匹配地址族的云地址槽位");
+        if (!UI_PREVIEW) {
+          const result = await submitCloudIntent(saveIntentKey.current, (key) => api<{ awaitingExternalVerification: boolean }>(`/v1/address-slots/${cloudSlotId}/bindings`, {
+            method: "POST",
+            headers: { "idempotency-key": key },
+            ...jsonBody({ zoneId, fqdn: draft.name, recordType: draft.type, takeoverExisting: editing !== "new" }),
+          }));
+          setActionNotice(result.awaitingExternalVerification ? "云地址来源已绑定，正在等待外部验证；尚未确认发布。" : "云地址来源已绑定。");
+          await reload();
+        } else {
+          setActionNotice("云地址来源已绑定，正在等待外部验证；尚未确认发布。");
+        }
+        setEditing(null);
+        return;
+      }
       const metadata: Record<string, unknown> = editing && editing !== "new" ? { ...editing.providerMetadata } : {};
       if (zone?.provider === "cloudflare") {
         if (["A", "AAAA", "CNAME"].includes(draft.type)) metadata.proxied = draft.proxied;
@@ -169,6 +193,7 @@ export default function ZoneRecordsPage() {
       <div className="detail-actions"><Button variant="secondary" icon={<RefreshCw size={14} />} disabled={syncing} onClick={() => void sync()}>{syncing ? "已入队" : "同步云端"}</Button><Button icon={<Plus size={15} />} onClick={() => openEditor()}>添加记录</Button></div>
     </div>
     {actionError && <div className="inline-error" role="alert">{actionError}</div>}
+    {actionNotice && <div className="inline-notice" role="status">{actionNotice}</div>}
     <div className="toolbar"><div className="toolbar-left"><label className="search-box"><Search size={15} /><input aria-label="搜索 DNS 记录" placeholder="名称、类型或内容" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div><div className="toolbar-right"><span className="muted">受管记录需在 IP Pool 中修改</span></div></div>
     {loading ? <div className="surface"><LoadingState /></div> : error ? <div className="surface"><ErrorState message={error} onRetry={() => void reload()} /></div> : records.length === 0 ? <div className="surface"><EmptyState title="没有 DNS 记录" action={<Button icon={<Plus size={14} />} onClick={() => openEditor()}>添加记录</Button>} /></div> : <div className="table-wrap"><table>
       <thead><tr><th>名称</th><th>类型</th><th>内容</th><th>TTL</th><th>厂商属性</th><th>管理方式</th><th>同步</th><th aria-label="操作" /></tr></thead>
@@ -186,13 +211,14 @@ export default function ZoneRecordsPage() {
 
     <Dialog open={editing !== null} title={editing === "new" ? "添加 DNS 记录" : "编辑 DNS 记录"} onClose={() => setEditing(null)} footer={<><Button variant="secondary" onClick={() => setEditing(null)}>取消</Button><Button type="submit" form="record-form" disabled={saving}>{saving ? "提交中" : "提交变更"}</Button></>}>
       <form id="record-form" className="field-grid" onSubmit={save}>
-        <Field label="记录类型"><select value={draft.type} onChange={(event) => setDraft({ ...draft, type: event.target.value })}>{["A", "AAAA", "CNAME", "TXT", "MX", "CAA", "SRV", "NS"].map((type) => <option key={type}>{type}</option>)}</select></Field>
-        <Field label="TTL"><input type="number" min={1} max={86400} value={draft.ttl} onChange={(event) => setDraft({ ...draft, ttl: Number(event.target.value) })} /></Field>
+        <Field label="记录类型"><select value={draft.type} onChange={(event) => { setDraft({ ...draft, type: event.target.value }); setCloudSlotId(""); if (!["A", "AAAA"].includes(event.target.value)) setSource("manual"); }}>{["A", "AAAA", "CNAME", "TXT", "MX", "CAA", "SRV", "NS"].map((type) => <option key={type}>{type}</option>)}</select></Field>
+        <Field label={source === "cloud" ? "TTL（由绑定策略管理）" : "TTL"}><input type="number" min={1} max={86400} value={draft.ttl} disabled={source === "cloud"} onChange={(event) => setDraft({ ...draft, ttl: Number(event.target.value) })} /></Field>
         <Field label="名称"><input placeholder="api 或完整域名" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} required /></Field>
-        <Field label="内容"><input className="mono" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required /></Field>
+        {["A", "AAAA"].includes(draft.type) && <Field label="地址来源"><select value={source} onChange={(event) => { setSource(event.target.value as "manual" | "cloud"); setCloudSlotId(""); }}><option value="manual">手工地址</option><option value="cloud">云实例地址槽位</option></select></Field>}
+        {source === "cloud" && ["A", "AAAA"].includes(draft.type) ? <CloudSourcePicker recordType={draft.type as "A" | "AAAA"} {...(zone?.ownerUserId ? { ownerUserId: zone.ownerUserId } : {})} value={cloudSlotId} onChange={setCloudSlotId} /> : <Field label="内容"><input className="mono" value={draft.content} onChange={(event) => setDraft({ ...draft, content: event.target.value })} required /></Field>}
         {["MX", "SRV"].includes(draft.type) && <Field label="优先级"><input type="number" min={0} max={65535} value={draft.priority} onChange={(event) => setDraft({ ...draft, priority: Number(event.target.value) })} /></Field>}
-        {provider === "cloudflare" && ["A", "AAAA", "CNAME"].includes(draft.type) && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={draft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setDraft({ ...draft, proxied })} /></div>}
-        {provider === "aliyun" && <><Field label="解析线路"><input value={draft.aliLine} onChange={(event) => setDraft({ ...draft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={draft.aliWeight} onChange={(event) => setDraft({ ...draft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={draft.aliStatus} onChange={(event) => setDraft({ ...draft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
+        {source === "manual" && provider === "cloudflare" && ["A", "AAAA", "CNAME"].includes(draft.type) && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={draft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setDraft({ ...draft, proxied })} /></div>}
+        {source === "manual" && provider === "aliyun" && <><Field label="解析线路"><input value={draft.aliLine} onChange={(event) => setDraft({ ...draft, aliLine: event.target.value })} required /></Field><Field label="权重（可选）"><input type="number" min={1} max={100} value={draft.aliWeight} onChange={(event) => setDraft({ ...draft, aliWeight: event.target.value })} /></Field><Field label="记录状态"><select value={draft.aliStatus} onChange={(event) => setDraft({ ...draft, aliStatus: event.target.value as "Enable" | "Disable" })}><option value="Enable">启用</option><option value="Disable">停用</option></select></Field></>}
         {actionError && <div className="login-error span-2" role="alert">{actionError}</div>}
       </form>
     </Dialog>

@@ -218,6 +218,6 @@ export function MetricStrip({ items }: { items: Array<{ label: string; value: Re
 }
 
 function statusLabel(value: string): string {
-  const labels: Record<string, string> = { healthy: "健康", unhealthy: "故障", degraded: "降级", recovering: "恢复中", unknown: "未知", active: "正常", disabled: "已停用", error: "异常", pending: "等待中", running: "执行中", succeeded: "成功", partial: "部分成功", failed: "失败", superseded: "已过期", delivered: "已送达", retrying: "重试中", switching: "切换中", drifted: "已漂移", maintenance: "维护", enabled: "启用", draining: "排空中" };
+  const labels: Record<string, string> = { healthy: "健康", unhealthy: "故障", degraded: "降级", recovering: "恢复中", unknown: "未知", active: "正常", disabled: "已停用", error: "异常", pending: "等待中", running: "执行中", succeeded: "成功", partial: "部分成功", failed: "失败", superseded: "已过期", delivered: "已送达", retrying: "重试中", switching: "切换中", drifted: "已漂移", maintenance: "维护", enabled: "启用", draining: "排空中", available: "可用", limited: "受限", unverified: "未验证", excluded: "已排除", absent: "已不存在" };
   return labels[value.toLowerCase()] ?? value;
 }
