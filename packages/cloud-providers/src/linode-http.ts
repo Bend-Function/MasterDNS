@@ -19,23 +19,31 @@ export class LinodeHttp {
       });
     } catch { throw new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_transport_failed" : "linode_write_outcome_unknown"); }
     if (response.status >= 300 && response.status < 400) throw new CloudError("remote_identity_changed", false, undefined, "linode_redirect_refused");
-    let data: unknown;
-    try { data = JSON.parse(await response.text()); } catch { throw new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response"); }
+    // Status and retry headers remain authoritative even when an error body is empty, HTML, or interrupted.
+    let statusError: CloudError | undefined;
     if (!response.ok) {
-      const error = data as { errors?: Array<{ reason?: string }> };
-      const quota = error?.errors?.some(e => typeof e.reason === "string" && /additional IPv4.*technical justification|IPv4.*quota|IP address.*limit/i.test(e.reason));
-      if (response.status === 401) throw new CloudError("invalid_credentials", false);
-      if (response.status === 403) throw new CloudError("permission_denied", false);
-      if (response.status === 404) throw new CloudError("resource_not_found", false);
-      if (response.status === 400 && quota) throw new CloudError("quota_exceeded", false, undefined, "linode_additional_ipv4_requires_approval");
-      if (response.status === 429) {
+      if (response.status === 401) statusError = new CloudError("invalid_credentials", false);
+      else if (response.status === 403) statusError = new CloudError("permission_denied", false);
+      else if (response.status === 404) statusError = new CloudError("resource_not_found", false);
+      else if (response.status === 429) {
         const seconds = Number(response.headers.get("Retry-After"));
         const reset = Number(response.headers.get("X-RateLimit-Reset")) * 1_000 - Date.now();
         const delay = Number.isFinite(seconds) && seconds > 0 ? seconds * 1_000 : Number.isFinite(reset) && reset > 0 ? reset : undefined;
-        throw new CloudError("rate_limited", method === "GET", delay);
-      }
-      if (response.status >= 500) throw new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_service_unavailable" : "linode_write_outcome_unknown");
-      throw new CloudError("unknown_cloud_error", false);
+        statusError = new CloudError("rate_limited", method === "GET", delay);
+      } else if (response.status >= 500) statusError = new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_service_unavailable" : "linode_write_outcome_unknown");
+      else statusError = new CloudError("unknown_cloud_error", false);
+    }
+    let body: string;
+    try { body = await response.text(); }
+    catch { throw statusError ?? new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_transport_failed" : "linode_write_outcome_unknown"); }
+    let data: unknown;
+    try { data = JSON.parse(body); }
+    catch { throw statusError ?? new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response"); }
+    if (statusError) {
+      const error = data as { errors?: Array<{ reason?: string }> };
+      const quota = Array.isArray(error?.errors) && error.errors.some(e => typeof e?.reason === "string" && /additional IPv4.*technical justification|IPv4.*quota|IP address.*limit/i.test(e.reason));
+      if (response.status === 400 && quota) throw new CloudError("quota_exceeded", false, undefined, "linode_additional_ipv4_requires_approval");
+      throw statusError;
     }
     const uuid = response.headers.get("X-Customer-UUID")?.trim();
     if (!uuid || (this.externalAccountId !== undefined && uuid !== this.externalAccountId)) throw new CloudError("remote_identity_changed", false);

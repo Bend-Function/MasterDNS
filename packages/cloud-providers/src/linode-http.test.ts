@@ -25,6 +25,33 @@ describe("Linode HTTP boundaries", () => {
     await expect(http.request("/profile")).rejects.toMatchObject({ code: "rate_limited", retryable: true, retryAfterMs: 12_000 });
     await expect(http.request("/linode/instances/42/ips", { method: "POST", body: { type: "ipv4", public: true } })).rejects.toMatchObject({ code: "rate_limited", retryable: false, retryAfterMs: 12_000 }); expect(calls).toBe(2);
   });
+  it.each(["GET", "POST"] as const)("classifies %s HTML 503 independently of JSON", async method => {
+    let calls = 0; const http = new LinodeHttp("secret", async () => { calls++; return new Response("<html>Unavailable</html>", { status: 503 }); });
+    await expect(http.request("/linode/instances/42/ips", { method })).rejects.toMatchObject({ code: "temporary_cloud_error", retryable: method === "GET",
+      reason: method === "GET" ? "linode_service_unavailable" : "linode_write_outcome_unknown" }); expect(calls).toBe(1);
+  });
+  it.each(["GET", "POST"] as const)("preserves %s empty 429 retry delay without retrying", async method => {
+    let calls = 0; const http = new LinodeHttp("secret", async () => { calls++; return new Response(null, { status: 429, headers: { "Retry-After": "17" } }); });
+    await expect(http.request("/linode/instances/42/ips", { method })).rejects.toMatchObject({ code: "rate_limited", retryable: method === "GET", retryAfterMs: 17_000 }); expect(calls).toBe(1);
+  });
+  it.each([[401, "invalid_credentials"], [403, "permission_denied"], [404, "resource_not_found"]] as const)("classifies empty %s responses independently of JSON", async (status, code) => {
+    const http = new LinodeHttp("secret", async () => new Response(null, { status }));
+    await expect(http.request("/profile")).rejects.toMatchObject({ code, retryable: false });
+  });
+  it.each(["GET", "POST", "DELETE"] as const)("maps %s interrupted response bodies without claiming no write effect", async method => {
+    let calls = 0;
+    const http = new LinodeHttp("secret", async () => {
+      calls++; const body = new ReadableStream({ start(controller) { controller.error(new DOMException("secret interrupted stream", "AbortError")); } });
+      return new Response(body, { status: 200, headers: { "X-Customer-UUID": "customer", "X-OAuth-Scopes": "*" } });
+    });
+    const error = await http.request("/linode/instances/42/ips", { method }).catch(error => error);
+    expect(error).toMatchObject({ code: "temporary_cloud_error", retryable: method === "GET", reason: method === "GET" ? "linode_transport_failed" : "linode_write_outcome_unknown" });
+    expect(JSON.stringify(error)).not.toContain("secret"); expect(calls).toBe(1);
+  });
+  it("retains quota classification from a valid 400 response body", async () => {
+    const http = new LinodeHttp("secret", async () => response({ errors: [{ reason: "Additional IPv4 addresses require technical justification" }] }, 400));
+    await expect(http.request("/linode/instances/42/ips", { method: "POST" })).rejects.toMatchObject({ code: "quota_exceeded", retryable: false });
+  });
   it("reads complete paginated collections including empty intermediate pages", async () => {
     const http = new LinodeHttp("secret", async url => { const page = Number(new URL(String(url)).searchParams.get("page")); return response({ data: page === 2 ? [] : [{ id: page }], page, pages: 3, results: 2 }); });
     expect(await http.all("/account/events")).toEqual([{ id: 1 }, { id: 3 }]);
