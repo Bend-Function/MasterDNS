@@ -77,6 +77,8 @@ export const heartbeatRequestSchema = z.object({
   maxConcurrency: z.number().int().min(1).max(1_000),
 }).strict();
 
+export const heartbeatResponseSchema = z.object({}).strict();
+
 export const leaseRequestSchema = z.object({
   protocol: probeProtocolSchema,
   capacity: z.number().int().min(1).max(100),
@@ -108,8 +110,8 @@ export type ResultAck = z.infer<typeof resultAckSchema>;
 
 function isPermanentlyForbiddenAddress(address: string, family: 4 | 6): boolean {
   const ranges = family === 4
-    ? ["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"]
-    : ["::/128", "::1/128", "fe80::/10", "ff00::/8"];
+    ? ["0.0.0.0/8", "100.100.100.200/32", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"]
+    : ["::/128", "::1/128", "fd00:ec2::254/128", "fe80::/10", "ff00::/8"];
   return isIpv4MappedIpv6(address, family) || ranges.some((cidr) => cidrContains(cidr, address));
 }
 

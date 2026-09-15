@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
   heartbeatRequestSchema,
+  heartbeatResponseSchema,
   leaseRequestSchema,
   leaseResponseSchema,
   probeResultSchema,
@@ -61,6 +62,11 @@ describe("probe-agent/v1 contracts", () => {
     expect(leaseRequestSchema.safeParse({ protocol: "probe-agent/v1", capacity: 0 }).success).toBe(false);
   });
 
+  it("accepts only an empty heartbeat response object", () => {
+    expect(heartbeatResponseSchema.safeParse({}).success).toBe(true);
+    expect(heartbeatResponseSchema.safeParse({ ok: true }).success).toBe(false);
+  });
+
   it("limits result batches to 100 observations", () => {
     expect(resultBatchSchema.safeParse({ protocol: "probe-agent/v1", results: Array.from({ length: 101 }, () => resultFixture) }).success).toBe(false);
   });
@@ -114,6 +120,18 @@ describe("probe-agent/v1 contracts", () => {
     ["IPv6 link-local", "fe80::1", 6, "fe80::/10"],
     ["IPv6 multicast", "ff02::1", 6, "ff00::/8"],
   ])("permanently rejects %s even with a matching allowlist", (_name, address, family, cidr) => {
+    expect(probeTaskSchema.safeParse({
+      ...(taskFixture as object),
+      address,
+      family,
+      networkPolicy: { allowedPrivateCIDRs: [cidr] },
+    }).success).toBe(false);
+  });
+
+  it.each([
+    ["AWS IPv6 metadata", "fd00:ec2::254", 6, "fc00::/7"],
+    ["Alibaba IPv4 metadata", "100.100.100.200", 4, "100.64.0.0/10"],
+  ])("permanently rejects %s even when its private range is allowed", (_name, address, family, cidr) => {
     expect(probeTaskSchema.safeParse({
       ...(taskFixture as object),
       address,

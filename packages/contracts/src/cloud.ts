@@ -10,5 +10,6 @@ export type CloudRef = {
 export type SlotRef = CloudRef & {
   slotId: string;
   interfaceId: string;
+  address: string;
   family: AddressFamily;
 };

@@ -1,0 +1,27 @@
+{
+  "name": "@masterdns/cloud-providers",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run src --passWithNoTests"
+  },
+  "dependencies": {
+    "@aws-sdk/client-ec2": "^3.1131.0",
+    "@aws-sdk/client-lightsail": "^3.1131.0",
+    "@aws-sdk/client-sts": "^3.1131.0",
+    "@aws-sdk/credential-providers": "^3.1131.0",
+    "@masterdns/contracts": "workspace:*"
+  }
+}

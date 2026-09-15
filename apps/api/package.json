@@ -16,6 +16,7 @@
     "@fastify/helmet": "^13.1.0",
     "@masterdns/automation": "workspace:*",
     "@masterdns/checkers": "workspace:*",
+    "@masterdns/cloud-providers": "workspace:*",
     "@masterdns/contracts": "workspace:*",
     "@masterdns/crypto": "workspace:*",
     "@masterdns/db": "workspace:*",
