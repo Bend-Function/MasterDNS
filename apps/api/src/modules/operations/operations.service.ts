@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { dnsRecordInputSchema, type DnsRecordInput, type OperationSource } from "@masterdns/contracts";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones } from "@masterdns/db";
+import { endpointPools, dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -183,6 +183,11 @@ export class OperationsService {
     const operation = await this.get(actor, id);
     if (!["failed", "partial"].includes(operation.status)) throw new ConflictException("只有失败或部分成功的操作可以重试");
     await this.database.db.transaction(async (tx) => {
+      if (operation.resourceType === "endpoint_pool" && operation.resourceId) {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
+        const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, operation.resourceId));
+        if (!pool || (operation.policyRevision !== null && pool.policyRevision !== operation.policyRevision) || (operation.decisionRevision !== null && pool.decisionRevision !== operation.decisionRevision)) throw new ConflictException("该操作已被新策略或地址决策替代，请重新协调 Pool");
+      }
       await tx.update(operationSteps).set({ status: "pending", errorCode: null, errorDetail: null, nextRetryAt: null, finishedAt: null, updatedAt: new Date() })
         .where(and(eq(operationSteps.operationId, id), eq(operationSteps.status, "failed")));
       await tx.update(operations).set({ status: "pending", errorCode: null, finishedAt: null, updatedAt: new Date() }).where(eq(operations.id, id));

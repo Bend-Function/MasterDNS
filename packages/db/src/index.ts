@@ -56,3 +56,4 @@ export * from "./rotation-context.js";
 export * from "./rotation-incidents.js";
 export * from "./probe-rounds.js";
 export * from "./address-health.js";
+export * from "./cloud-policy.js";

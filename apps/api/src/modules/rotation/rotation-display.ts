@@ -1,6 +1,6 @@
 import { isIP } from "node:net";
 import { and, desc, eq, isNull } from "drizzle-orm";
-import { bindingAssignments, cloudAddresses, cloudEndpointLinks, dnsRecords, domainBindings, endpointPools, endpoints, lockRotationContext, lockRotationHealth, rotationAttempts, rotationIncidents, rotationStepObservations, rotationSteps, type RotationTransaction } from "@masterdns/db";
+import { bindingAssignments, cloudAddresses, cloudEndpointLinks, dnsRecords, domainBindings, endpointPools, endpoints, lockRotationContext, lockRotationHealth, rotationAttempts, rotationResources, rotationIncidents, rotationStepObservations, rotationSteps, type RotationTransaction } from "@masterdns/db";
 
 // Only public address values leave this query. SDK receipts and probe config (which
 // can contain authorization headers) never become API display objects.
@@ -32,10 +32,12 @@ export async function rotationDisplay(tx: RotationTransaction, slotId: string) {
     const previous = published.get(row.id);
     published.set(row.id, { zoneId: row.zoneId, fqdn: row.fqdn, recordType: row.recordType, address: row.address, status: row.applied || previous?.status === "applied" ? "applied" : "observed", lastObservedAt: row.lastObservedAt });
   }
+  const released = current ? await tx.select({ id: rotationResources.id }).from(rotationResources).innerJoin(rotationIncidents, eq(rotationIncidents.id, rotationResources.incidentId)).where(and(eq(rotationIncidents.slotId, slotId), eq(rotationResources.address, current.address), eq(rotationResources.cleanupStatus, "released"))) : [];
+  const currentCloudState = released.length ? "released" : current && observedCloud.addresses.includes(current.address) ? "present" : "not_observed";
   return { instanceId: c.instance.id, addresses: {
     observedCloud,
     candidate: candidate ? { id: candidate.id, address: candidate.address, version: c.slot.candidateVersion, verified: h.success } : null,
-    lastVerified: current && c.slot.currentVersion > 0 ? { id: current.id, address: current.address, version: c.slot.currentVersion } : null,
+    lastVerified: current && c.slot.currentVersion > 0 ? { id: current.id, address: current.address, version: c.slot.currentVersion, cloudState: currentCloudState, verifiedNow: !candidate && h.success && currentCloudState === "present" } : null,
     published: [...published.values()],
   } };
 }

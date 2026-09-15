@@ -300,3 +300,23 @@ describe("cloud request idempotency", () => {
     await expect(bind(f.actor, input, key)).rejects.toMatchObject({ status: 404 });
   });
 });
+
+import { policyVersions, cloudEndpointLinks, reconcileIntents } from "@masterdns/db";
+import { PoolsService } from "../pools/pools.service.js";
+it("restores a cloud policy through saved slot identity and current address retesting without replaying snapshot IPs", async () => {
+ const f=await fixture();f.instance.externalId=`i-${randomUUID()}`;await connection.db.update(cloudInstances).set({externalId:f.instance.externalId}).where(eq(cloudInstances.id,f.instance.id));await service.authorize(f.actor,f.instance.id,{managed:true,revision:0});
+ const bound=await bind(f.actor,{zoneId:f.zone.id,fqdn:"restore",recordType:"A",slotId:f.slot.id,takeoverExisting:false});
+ const [version]=await connection.db.select().from(policyVersions).where(eq(policyVersions.poolId,bound.pool.id));
+ expect((version!.snapshot as any).cloudLinks).toMatchObject([{slotId:f.slot.id,instanceId:f.instance.externalId}]);
+ const snapshot={...(version!.snapshot as any),addresses:[{endpointId:bound.endpoint.id,family:"4",state:"current",source:"cloud",address:"198.51.100.250"}]};
+ await connection.db.update(policyVersions).set({snapshot}).where(eq(policyVersions.id,version!.id));
+ await connection.db.update(managedAddressSlots).set({currentVersion:1}).where(eq(managedAddressSlots.id,f.slot.id));
+ await connection.db.insert(endpointAddresses).values({endpointId:bound.endpoint.id,family:"4",address:f.address.address,state:"current",source:"cloud",healthState:"healthy",consecutiveSuccesses:3});
+ const pools=new PoolsService({db:connection.db} as never,{} as never);
+ await pools.restorePolicyVersion(f.actor,bound.pool.id,version!.version,{force:true});
+ const addresses=await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId,bound.endpoint.id));
+ expect(addresses).toMatchObject([{address:f.address.address,healthState:"unknown",consecutiveSuccesses:0}]);
+ const [slot]=await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id,f.slot.id));expect(slot).toMatchObject({candidateAddressId:f.address.id,candidateVersion:2,currentVersion:1});
+ expect(await connection.db.select().from(cloudEndpointLinks).where(eq(cloudEndpointLinks.endpointId,bound.endpoint.id))).toMatchObject([{slotId:f.slot.id}]);
+ expect(await connection.db.select().from(reconcileIntents).where(eq(reconcileIntents.poolId,bound.pool.id))).toMatchObject([{force:false}]);
+});

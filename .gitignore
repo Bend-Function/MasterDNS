@@ -17,4 +17,6 @@ test-results/
 .DS_Store
 *.tsbuildinfo
 task-12a-report.md
+
+# Local task plans and verification reports
 .superpowers/

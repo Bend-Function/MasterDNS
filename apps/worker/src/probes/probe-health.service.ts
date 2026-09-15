@@ -2,7 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { advanceRoundHealth, evaluateProbeRound } from "@masterdns/automation";
 import { CheckerRegistry } from "@masterdns/checkers";
 import { isAllowedProbeTarget, type ProbeOutcome } from "@masterdns/contracts";
-import { addressHealthPolicies, addressHealthStates, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeAgents, probeGroups, probeObservations, probeRounds } from "@masterdns/db";
+import { lockRotationContext, addressHealthPolicies, addressHealthStates, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeAgents, probeGroups, probeObservations, probeRounds } from "@masterdns/db";
 import { and, asc, eq, gt, isNull, notInArray, sql } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { HealthResultService } from "../health/health-result.service.js";
@@ -16,6 +16,7 @@ export class ProbeHealthService {
     return this.database.db.transaction(async tx => {
       const [snapshot] = await tx.select().from(probeRounds).where(eq(probeRounds.id, roundId));
       if (!snapshot || snapshot.status !== "pending" || snapshot.deadline > now) return undefined;
+      if (snapshot.slotId) await lockRotationContext(tx, snapshot.slotId);
       const target = await lockHealthTarget(tx, snapshot);
       const [config] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, snapshot.configId)).for("share");
       const [group] = snapshot.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, snapshot.groupId)).for("share") : [];
@@ -48,6 +49,7 @@ export class ProbeHealthService {
       if (target.endpoint && target.pool && target.endpointAddress) {
         await this.results.applyObserved({ endpoint: target.endpoint, pool: target.pool, address: target.endpointAddress, config }, { success: decision === "success", latencyMs: 0, checkedAt: now }, tx, { next, decision, roundId: round.id, successThreshold: policy.successThreshold });
       }
+      if (round.slotId) await this.results.applyCloudSlotRound(round.slotId, round.id, tx);
       await tx.update(probeRounds).set({ status: "completed", consensusResult: decision, finalizedAt: now, appliedAt: now }).where(eq(probeRounds.id, round.id));
       return decision;
     });

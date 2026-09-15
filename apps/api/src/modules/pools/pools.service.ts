@@ -3,6 +3,9 @@ import { isIP } from "node:net";
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { healthCheckConfigSchema, type HealthCheckConfig, type HealthCheckJob, type PoolReconcileJob } from "@masterdns/contracts";
 import {
+  captureCloudPolicyLinks,
+  prepareCloudPolicyRestore,
+  lockRotationContexts,
   auditLogs,
   bindingAssignments,
   bindingEndpointHealth,
@@ -52,6 +55,11 @@ const policySnapshotSchema = z.object({
     allDownReminderSeconds: z.number().int().min(60).default(1800),
     enabled: z.boolean(),
   }),
+  cloudLinks: z.array(z.object({
+    endpointId: z.string().uuid(), family: z.enum(["4", "6"]), slotId: z.string().uuid(),
+    accountId: z.string().uuid(), externalAccountId: z.string().nullable(), service: z.enum(["ec2", "lightsail"]),
+    region: z.string(), instanceId: z.string(), interfaceId: z.string(),
+  })).optional(),
   endpoints: z.array(z.object({
     id: z.string().uuid(),
     name: z.string().min(1).max(120),
@@ -91,10 +99,9 @@ type PolicySnapshot = z.infer<typeof policySnapshotSchema>;
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
 
 export function validateRestorablePolicySnapshot(snapshot: PolicySnapshot, poolId: string) {
-  if (snapshot.endpoints.some((endpoint) => endpoint.addressMode === "cloud")
-    || snapshot.addresses.some((address) => address.source === "cloud")) {
-    throw new ConflictException("Cloud 节点策略回滚暂不支持；请使用云地址槽位管理流程");
-  }
+  const cloudEndpoints = snapshot.endpoints.filter(e => e.addressMode === "cloud");
+  if (cloudEndpoints.length && (!snapshot.cloudLinks?.length || cloudEndpoints.some(e => !snapshot.cloudLinks!.some(l => l.endpointId === e.id)))) throw new ConflictException("Cloud 历史策略缺少完整槽位身份，无法安全恢复");
+  if (snapshot.cloudLinks?.some(l => !cloudEndpoints.some(e => e.id === l.endpointId)) || (snapshot.cloudLinks && new Set(snapshot.cloudLinks.map(l => `${l.endpointId}:${l.family}`)).size !== snapshot.cloudLinks.length)) throw new ConflictException("Cloud 历史槽位关联无效");
   const endpointIds = new Set(snapshot.endpoints.map((endpoint) => endpoint.id));
   const bindingIds = new Set(snapshot.bindings.map((binding) => binding.id));
   for (const endpoint of snapshot.endpoints) {
@@ -220,6 +227,7 @@ export class PoolsService {
     const eventId = randomUUID();
 
     const restored = await this.database.db.transaction(async (tx) => {
+      await lockRotationContexts(tx, snapshot.cloudLinks?.map(l => l.slotId) ?? []);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
       const [lockedPool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, poolId)).limit(1).for("update");
       if (!lockedPool || (actor.role !== "admin" && lockedPool.ownerUserId !== actor.id)) throw new NotFoundException("IP Pool 不存在");
@@ -238,8 +246,12 @@ export class PoolsService {
       if (!sameIdSet(currentEndpoints, snapshot.endpoints) || !sameIdSet(currentBindings, snapshot.bindings)) {
         throw new ConflictException("旧版本与当前版本的节点或域名绑定集合不同；请先通过节点/绑定流程恢复相同结构，再重试策略回滚");
       }
-      if (currentEndpoints.some((endpoint) => endpoint.addressMode === "cloud")) {
-        throw new ConflictException("Cloud 节点策略回滚暂不支持；请使用云地址槽位管理流程");
+      if (currentEndpoints.some(e => (e.addressMode === "cloud" || snapshot.endpoints.find(s => s.id === e.id)?.addressMode === "cloud") && snapshot.endpoints.find(s => s.id === e.id)?.addressMode !== e.addressMode)) {
+        throw new ConflictException("Cloud 类型转换须先通过云槽位绑定流程完成，策略回滚不支持直接转换");
+      }
+      if (snapshot.cloudLinks?.length) {
+        try { await prepareCloudPolicyRestore(tx, poolId, lockedPool.ownerUserId, snapshot.cloudLinks); }
+        catch (error) { throw new ConflictException(error instanceof Error ? error.message : "cloud_restore_failed"); }
       }
 
       const restoredAt = new Date();
@@ -325,7 +337,7 @@ export class PoolsService {
           inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
         )),
       ]);
-      const restoredSnapshot = { pool, endpoints: restoredEndpoints, addresses: restoredAddresses.map((row) => row.address), bindings: restoredBindings, healthChecks: restoredChecks };
+      const restoredSnapshot = { ...(snapshot.cloudLinks?.length ? { cloudLinks: await captureCloudPolicyLinks(tx, poolId) } : {}), pool, endpoints: restoredEndpoints, addresses: restoredAddresses.map((row) => row.address), bindings: restoredBindings, healthChecks: restoredChecks };
       await tx.insert(policyVersions).values({ poolId, version: pool.policyRevision, snapshot: restoredSnapshot, reason: `policy.rollback:${version}`, actorUserId: actor.id });
       await tx.insert(reconcileIntents).values({
         eventId,
@@ -334,7 +346,7 @@ export class PoolsService {
         policyRevision: pool.policyRevision,
         trigger: "configuration",
         source: "rollback",
-        force: input.force,
+        force: snapshot.cloudLinks?.length ? false : input.force,
         availableAt: restoredAt,
       });
       await tx.insert(auditLogs).values({
@@ -772,7 +784,7 @@ export class PoolsService {
           inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId))),
         )),
       ]);
-      const snapshot = { pool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings, healthChecks: checks };
+      const snapshot = { ...(endpointRows.some(e => e.addressMode === "cloud") ? { cloudLinks: await captureCloudPolicyLinks(tx, poolId) } : {}), pool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings, healthChecks: checks };
       await tx.insert(policyVersions).values({ poolId, version: pool.policyRevision, snapshot, reason, actorUserId: actor.id });
       await tx.insert(auditLogs).values({
         ownerUserId: ownerOverride ?? pool.ownerUserId,

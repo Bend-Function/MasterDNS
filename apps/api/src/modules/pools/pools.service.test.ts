@@ -98,6 +98,11 @@ describe("PoolsService DDNS to static conversion", () => {
 });
 
 describe("PoolsService policy rollback", () => {
+  it("accepts cloud identity snapshots without using their historic address strings", () => {
+    const snapshot = { ...restorableSnapshot([]), endpoints: [{ id: endpointId, name: "edge", addressMode: "cloud" as const, priority: 1, lifecycle: "enabled" as const }], cloudLinks: [{ endpointId, family: "4" as const, slotId: "00000000-0000-4000-8000-000000000011", accountId: "00000000-0000-4000-8000-000000000012", externalAccountId: "123456789012", service: "ec2" as const, region: "us-east-1", instanceId: "i-original", interfaceId: "eni-original" }] };
+    expect(() => validateRestorablePolicySnapshot(snapshot, poolId)).not.toThrow();
+  });
+
   it("recognizes cloud snapshots and rejects them before starting a mutation", async () => {
     const snapshot = { ...restorableSnapshot([]), endpoints: [{
       id: endpointId,
@@ -120,7 +125,7 @@ describe("PoolsService policy rollback", () => {
     const service = new PoolsService(database as never, {} as never);
     vi.spyOn(service as any, "findOwnedPool").mockResolvedValue({ id: poolId });
 
-    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud.*暂不支持/i);
+    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud/i);
     expect(transaction).not.toHaveBeenCalled();
   });
 
@@ -169,7 +174,7 @@ describe("PoolsService policy rollback", () => {
     const service = new PoolsService(database as never, {} as never);
     vi.spyOn(service as any, "findOwnedPool").mockResolvedValue({ id: poolId });
 
-    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud.*暂不支持/i);
+    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud/i);
     expect(tx.execute).toHaveBeenCalledOnce();
     expect(update).not.toHaveBeenCalled();
   });
