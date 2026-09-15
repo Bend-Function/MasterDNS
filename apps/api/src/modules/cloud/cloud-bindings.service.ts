@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { captureCloudPolicyLinks, auditLogs, bindingAssignments, cloudAccounts, cloudAddresses, cloudEndpointLinks, cloudInstances, cloudInterfaces, cloudScanScopes, dnsRecords, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, operationSteps, policyVersions, providerAccounts, zones } from "@masterdns/db";
+import { captureCloudPolicyLinks, auditLogs, bindingAssignments, cloudAccounts, cloudAddresses, cloudEndpointLinks, cloudInstances, cloudInterfaces, cloudScanScopes, dnsRecords, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, operationSteps, policyVersions, reconcileIntents, providerAccounts, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -47,6 +48,8 @@ export class CloudBindingsService {
             .innerJoin(cloudAddresses, eq(cloudAddresses.id, managedAddressSlots.currentAddressId))
             .where(eq(managedAddressSlots.id, input.slotId)).for("update");
           if (!source) throw new ConflictException("Cloud slot has no observed host address");
+          const [authorization] = await tx.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, source.instance.id)).for("share");
+          if (!authorization?.managed) throw new ConflictException("Cloud instance is not managed");
           if ((account.regions !== null && !account.regions.includes(source.instance.region)) || source.instance.metadata.present === false || source.iface.scanGeneration !== source.generation || source.address.scanGeneration !== source.generation) throw new ConflictException("Cloud slot address is no longer present in current inventory");
           if (source.slot.family !== (input.recordType === "A" ? "4" : "6")) throw new BadRequestException("Record type does not match slot family");
           const [existingBinding] = await tx.select({ id: domainBindings.id }).from(domainBindings).where(and(eq(domainBindings.zoneId, input.zoneId), eq(domainBindings.fqdn, fqdn), eq(domainBindings.recordType, input.recordType))).limit(1);
@@ -84,7 +87,7 @@ export class CloudBindingsService {
           }
           // Observed addresses are not endpoint current/candidate addresses. Only the external
           // versioned verification path may promote one, including after an explicit takeover.
-          const [updatedPool] = await tx.update(endpointPools).set({ policyRevision: sql`${endpointPools.policyRevision} + 1`, updatedAt: new Date() }).where(eq(endpointPools.id, pool.id)).returning();
+          const [updatedPool] = await tx.update(endpointPools).set({ policyRevision: sql`${endpointPools.policyRevision} + 1`, decisionRevision: sql`${endpointPools.decisionRevision} + 1`, updatedAt: new Date() }).where(eq(endpointPools.id, pool.id)).returning();
           const [endpointRows, addresses, bindingRows, checks] = await Promise.all([
             tx.select().from(endpoints).where(eq(endpoints.poolId, pool.id)),
             tx.select({ address: endpointAddresses }).from(endpointAddresses).innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id)).where(eq(endpoints.poolId, pool.id)),
@@ -92,6 +95,7 @@ export class CloudBindingsService {
             tx.select().from(healthCheckConfigs).where(or(eq(healthCheckConfigs.poolId, pool.id), inArray(healthCheckConfigs.endpointId, tx.select({ id: endpoints.id }).from(endpoints).where(eq(endpoints.poolId, pool.id))), inArray(healthCheckConfigs.domainBindingId, tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, pool.id))))),
           ]);
           await tx.insert(policyVersions).values({ poolId: pool.id, version: updatedPool!.policyRevision, actorUserId: actor.id, reason: "cloud_binding.create", snapshot: { cloudLinks: await captureCloudPolicyLinks(tx, pool.id), pool: updatedPool, endpoints: endpointRows, addresses: addresses.map((row) => row.address), bindings: bindingRows, healthChecks: checks } });
+          await tx.insert(reconcileIntents).values({ eventId: randomUUID(), poolId: pool.id, policyRevision: updatedPool!.policyRevision, decisionRevision: updatedPool!.decisionRevision, trigger: "configuration", source: "user", force: false });
           await tx.insert(auditLogs).values({ ownerUserId: ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_binding.create", resourceType: "domain_binding", resourceId: binding.id, afterSnapshot: { binding, endpoint, slotId: source.slot.id } });
           lease.assertOwned();
           return { pool: updatedPool!, endpoint, binding, awaitingExternalVerification: true };

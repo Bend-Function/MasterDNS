@@ -23,6 +23,9 @@ import {
   rotationSteps,
   rotationStepObservations,
   lockRotationContext,
+  lockRotationHealth,
+  healthRevisionMatches,
+  rotationAuthorizationError,
   type RotationContext,
   type RotationTransaction,
 } from "@masterdns/db";
@@ -30,7 +33,7 @@ import type { SlotRef } from "@masterdns/contracts";
 import { DatabaseService } from "../database.service.js";
 import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease } from "./rotation-lock.js";
-import { livePublicationMatches, publicationAuthorizationError } from "./rotation-publication.service.js";
+import { livePublicationMatches } from "./rotation-publication.service.js";
 type Resource = typeof rotationResources.$inferSelect;
 const noEffect = new Set([
   "permission_denied",
@@ -131,14 +134,17 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       });
       const dispatched = await this.database.db.transaction(async (tx) => {
         const current = await lockRotationContext(tx, c.slot.id);
+        // Gate only new writes; dispatched effects still need observation after pause/revocation.
+        const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId)).for("update");
+        if (!incident || incident.pausedByUserId || incident.status !== "active") return;
         const physical = await verifyRotationLease(tx, lease);
-        if (!physical || physical.unresolvedStepId) return;
+        if (!physical || physical.unresolvedStepId || (physical.incidentId && physical.incidentId !== incident.id)) return;
         const [resource] = await tx.select().from(rotationResources).where(eq(rotationResources.id, r.id)).for("update");
         if (!resource) return;
         const now = await databaseNow(tx);
         if (current.account.credentialCiphertext !== c.account.credentialCiphertext || current.physicalKey !== c.physicalKey)
           throw new Error("cleanup_identity_changed");
-        await this.eligible(tx, current, resource, now);
+        await this.eligible(tx, current, incident, resource, now);
         if (!livePublicationMatches(current, live)) throw new Error("cleanup_replacement_not_live");
         // IPv6 may remain on this exact ENI until unassignment. Allocations must be detached;
         // provider execute additionally reads the allocation's account-wide attachment/tags/ARN.
@@ -212,9 +218,13 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       await this.database.db.transaction((tx) => releaseRotationLease(tx, lease));
     }
   }
-  private async eligible(tx: RotationTransaction, c: RotationContext, r: Resource, now: Date) {
-    const error = publicationAuthorizationError(c);
+  private async eligible(tx: RotationTransaction, c: RotationContext, incident: typeof rotationIncidents.$inferSelect, r: Resource, now: Date) {
+    const error = rotationAuthorizationError(c);
     if (error) throw new Error(error);
+    const health = await lockRotationHealth(tx, c);
+    if (incident.physicalKey !== c.physicalKey || incident.authorizationRevision !== c.authorization!.revision ||
+      incident.policyRevision !== c.policy!.revision || incident.addressVersion !== c.addressVersion || !healthRevisionMatches(incident, health))
+      throw new Error("cleanup_incident_changed");
     if (!r.cleanupDueAt || r.cleanupDueAt > now) throw new Error("cleanup_grace_pending");
     if (r.origin !== "system" && !c.authorization!.allowReleaseAddress) throw new Error("original_address_release_not_authorized");
     if (r.origin === "system" && !r.ownershipAttemptId) throw new Error("resource_ownership_ambiguous");

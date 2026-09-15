@@ -4,13 +4,16 @@ import { expect, it } from "vitest";
 import * as db from "@masterdns/db";
 import { fixture } from "./rotation-test-utils.js";
 import { RotationCleanupService } from "./rotation-cleanup.service.js";
-async function cleanupFixture(origin: "system" | "user" = "system", family: "4" | "6" = "4") {
+async function cleanupFixture(origin: "system" | "user" = "system", family: "4" | "6" = "4", oldAddress?: string) {
   const f = await fixture(family);
   await f.service.recover();
   await f.d
     .update(db.rotationPublications)
     .set({ status: "applied", appliedAt: new Date() })
     .where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: true });
+  await f.d.update(db.instanceAuthorizations).set({ allowIpv4Rotation: family === "4", allowIpv6Rotation: family === "6" })
+    .where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
   const segment = randomUUID(),
     attempt = randomUUID();
   const [incident] = await f.d
@@ -36,7 +39,7 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
     })
     .returning();
   await f.d.insert(db.rotationBudgetSegments).values({ id: segment, incidentId: incident!.id, maxAttempts: 3 });
-  const old = family === "4" ? "192.0.2.1" : "2001:db8::1",
+  const old = oldAddress ?? (family === "4" ? "192.0.2.1" : "2001:db8::1"),
     before = structuredClone(f.live);
   before.interfaces[0]!.addresses = [
     {
@@ -69,9 +72,9 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
       cleanupAddressVersion: 1,
     })
     .returning();
-  const state = { writes: 0, observations: 0, lost: false, attachedElsewhere: false };
+  const state = { writes: 0, observations: 0, observationStatus: "applied" as "applied" | "pending", lost: false, attachedElsewhere: false, beforeInspect: undefined as (() => Promise<void>) | undefined };
   const adapter = {
-    inspect: async () => f.live,
+    inspect: async () => { await state.beforeInspect?.(); return f.live; },
     execute: async () => {
       state.writes++;
       if (state.attachedElsewhere) throw new Error("resource_ownership_ambiguous");
@@ -80,7 +83,7 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
     },
     observeDetails: async () => {
       state.observations++;
-      return { status: "applied" as const, allocationId: "eipalloc-old" };
+      return { status: state.observationStatus, allocationId: "eipalloc-old" };
     },
   };
   const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => adapter } as never);
@@ -292,4 +295,64 @@ it("persists cleanup failure markers for the durable notification scanner", asyn
   });
   await f.cleanup.run(f.resource.id, new Date());
   expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBeNull();
+});
+
+const admissionChanges = ["pause", "authorization", "rotation policy", "health policy", "health config", "probe group", "address version"] as const;
+async function changeAdmission(f: Awaited<ReturnType<typeof cleanupFixture>>, change: typeof admissionChanges[number]) {
+  await f.d.transaction(async tx => {
+    await db.lockRotationContext(tx, f.slot.id);
+    if (change === "pause") await tx.update(db.rotationIncidents).set({ status: "paused", pausedByUserId: f.account.ownerUserId }).where(eq(db.rotationIncidents.id, f.incident.id));
+    if (change === "authorization") await tx.update(db.instanceAuthorizations).set({ revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+    if (change === "rotation policy") await tx.update(db.rotationPolicies).set({ revision: 2 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+    if (change === "health policy") await tx.update(db.addressHealthPolicies).set({ revision: 2 }).where(eq(db.addressHealthPolicies.id, f.policy.id));
+    if (change === "health config") await tx.update(db.healthCheckConfigs).set({ revision: 2 }).where(eq(db.healthCheckConfigs.id, f.policy.configId));
+    if (change === "probe group") await tx.update(db.probeGroups).set({ revision: 2 }).where(eq(db.probeGroups.id, f.policy.groupId!));
+    if (change === "address version") await tx.update(db.rotationIncidents).set({ addressVersion: 2 }).where(eq(db.rotationIncidents.id, f.incident.id));
+  });
+}
+it.each(admissionChanges.flatMap(change => (["4", "6"] as const).map(family => ({ change, family }))))(
+  "blocks new IPv$family cleanup when $change changes during cloud inspection", async ({ change, family }) => {
+    const f = await cleanupFixture("system", family, family === "6" ? `2001:db8:${randomUUID().slice(0, 4)}::1` : undefined);
+    f.state.beforeInspect = () => changeAdmission(f, change);
+    await f.cleanup.run(f.resource.id, new Date());
+    expect(f.state.writes).toBe(0);
+    expect(await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId))).toEqual([]);
+    expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStepId).toBeNull();
+    expect(await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ id: f.incident.currentSegmentId, attemptsUsed: 0 }]);
+  },
+);
+it("resumes cleanup against the original attempt and ownership snapshot", async () => {
+  const f = await cleanupFixture("user");
+  await f.d.update(db.instanceAuthorizations).set({ allowReleaseAddress: true, revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await changeAdmission(f, "pause");
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(0);
+  await f.d.transaction(async tx => db.resumeRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), f.incident.id, f.account.ownerUserId));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource).toMatchObject({ attemptId: f.resource.attemptId, snapshot: f.resource.snapshot, cleanupStatus: "released" });
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!)))[0]!.plan.arguments.ownershipSnapshot).toMatchObject({ address: f.resource.address, allocationId: f.resource.allocationId });
+});
+it.each(["pause", "revoke", "config"] as const)("observes an uncertain cleanup after %s without another cloud write", async change => {
+  const f = await cleanupFixture();
+  f.state.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  const [before] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(before!.cleanupStepId);
+  if (change === "pause") await changeAdmission(f, "pause");
+  if (change === "revoke") await f.d.update(db.instanceAuthorizations).set({ managed: false, revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  if (change === "config") await changeAdmission(f, "health config");
+  f.state.observationStatus = "pending";
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(before!.cleanupStepId);
+  f.state.observationStatus = "applied";
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect(f.state.observations).toBe(2);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: before!.cleanupStepId });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  expect(await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ id: f.incident.currentSegmentId, attemptsUsed: 0 }]);
 });
