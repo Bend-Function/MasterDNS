@@ -170,7 +170,7 @@ describe("Lightsail read adapter", () => {
 
     await expect(adapter.inspectScoped(
       { accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn },
-      { instanceName: "web-one", staticIpName: "web-static" },
+      { mode: "initial", instanceName: "web-one", original: { kind: "static", name: "web-static", address: "203.0.113.4" } },
     )).resolves.toMatchObject({ nativeName: "web-one", interfaces: [{ addresses: expect.arrayContaining([
       expect.objectContaining({ address: "203.0.113.4", allocationId: "web-static" }),
     ]) }] });
@@ -201,7 +201,7 @@ describe("Lightsail read adapter", () => {
 
     await expect(adapter.inspectScoped(
       { accountId: "local-account", service: "lightsail", region: "us-east-1", instanceId: stableArn },
-      { instanceName: "web-one", staticIpName: "web-static" },
+      { mode: "initial", instanceName: "web-one", original: { kind: "static", name: "web-static", address: "203.0.113.4" } },
     )).rejects.toMatchObject({ code: "remote_identity_changed" });
   });
 

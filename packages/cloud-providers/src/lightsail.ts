@@ -17,6 +17,19 @@ import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-
 import { CloudError, normalizeAwsError } from "./errors.js";
 import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
 
+type ScopedOriginal =
+  | { kind: "dynamic"; address: string }
+  | { kind: "static"; name: string; address: string; resourceId?: string };
+
+export type LightsailInspectionScope = {
+  mode: "initial" | "transition";
+  instanceName: string;
+  original: ScopedOriginal;
+  candidate?: { name: string; address: string; resourceId: string };
+  allowDetachedOriginal?: boolean;
+  allowCandidateAttached?: boolean;
+};
+
 export class LightsailCloudAdapter implements CloudAdapter {
   private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
   private readonly stsClient: STSClient;
@@ -129,22 +142,45 @@ export class LightsailCloudAdapter implements CloudAdapter {
     }
   }
 
-  async inspectScoped(ref: CloudRef, scope: { instanceName: string; staticIpName?: string }): Promise<CloudInventory> {
+  async inspectScoped(ref: CloudRef, scope: LightsailInspectionScope): Promise<CloudInventory> {
     if (ref.accountId !== this.accountId || ref.service !== "lightsail") throw new CloudError("resource_not_found", false);
     try {
       const instanceResponse = await this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName: scope.instanceName }));
       const instance = instanceResponse.instance;
       if (!instance || instance.name !== scope.instanceName || instance.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
       let staticIps: StaticIp[] = [];
-      if (scope.staticIpName !== undefined) {
-        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.staticIpName }));
-        const staticIp = response.staticIp as StaticIp | undefined;
-        if (!staticIp || !staticIp.arn || staticIp.name !== scope.staticIpName || staticIp.attachedTo !== scope.instanceName
-          || staticIp.ipAddress !== instance.publicIpAddress || instance.isStaticIp !== true) throw new CloudError("remote_identity_changed", false);
-        staticIps = [staticIp];
-      } else if (instance.isStaticIp !== false) {
-        throw new CloudError("remote_identity_changed", false);
+      let originalStatic: StaticIp | undefined;
+      if (scope.original.kind === "static") {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.original.name }));
+        originalStatic = response.staticIp as StaticIp | undefined;
+        if (!originalStatic || !originalStatic.arn || !sameLightsailIdentity(instance.arn, originalStatic.arn, "StaticIp")
+          || originalStatic.name !== scope.original.name || originalStatic.ipAddress !== scope.original.address
+          || (scope.original.resourceId !== undefined && originalStatic.arn !== scope.original.resourceId)
+          || (originalStatic.attachedTo !== undefined && originalStatic.attachedTo !== scope.instanceName)) throw new CloudError("remote_identity_changed", false);
+        staticIps.push(originalStatic);
       }
+      let candidateStatic: StaticIp | undefined;
+      if (scope.candidate !== undefined) {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.candidate.name }));
+        candidateStatic = response.staticIp as StaticIp | undefined;
+        if (!candidateStatic || !candidateStatic.arn || !sameLightsailIdentity(instance.arn, candidateStatic.arn, "StaticIp")
+          || candidateStatic.name !== scope.candidate.name || candidateStatic.arn !== scope.candidate.resourceId
+          || candidateStatic.ipAddress !== scope.candidate.address
+          || (candidateStatic.attachedTo !== undefined && candidateStatic.attachedTo !== scope.instanceName)) throw new CloudError("remote_identity_changed", false);
+        staticIps.push(candidateStatic);
+      }
+
+      const originalActive = scope.original.kind === "static" && originalStatic?.attachedTo === scope.instanceName
+        && instance.isStaticIp === true && instance.publicIpAddress === scope.original.address && candidateStatic?.attachedTo === undefined;
+      const originalDynamic = scope.original.kind === "dynamic" && instance.isStaticIp === false
+        && instance.publicIpAddress === scope.original.address && candidateStatic?.attachedTo === undefined;
+      const detachedOriginal = scope.mode === "transition" && scope.allowDetachedOriginal === true && scope.original.kind === "static"
+        && originalStatic?.attachedTo === undefined && instance.isStaticIp === false && candidateStatic?.attachedTo === undefined;
+      const candidateActive = scope.mode === "transition" && scope.allowCandidateAttached === true && candidateStatic?.attachedTo === scope.instanceName
+        && instance.isStaticIp === true && instance.publicIpAddress === scope.candidate?.address
+        && (scope.original.kind === "dynamic" || originalStatic?.attachedTo === undefined);
+      if (!originalActive && !originalDynamic && !detachedOriginal && !candidateActive) throw new CloudError("remote_identity_changed", false);
+
       const inventory = mapLightsailInstance(this.accountId, ref.region, instance, staticIps);
       if (inventory === undefined) throw new CloudError("resource_not_found", false);
       return inventory;
@@ -172,4 +208,11 @@ export class LightsailCloudAdapter implements CloudAdapter {
   async observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
     return (await this.observeDetails(step)).status;
   }
+}
+
+function sameLightsailIdentity(instanceArn: string, resourceArn: string, resourceType: string): boolean {
+  const instance = instanceArn.split(":");
+  const resource = resourceArn.split(":");
+  return instance.length === 6 && resource.length === 6 && instance.slice(0, 5).every((part, index) => part === resource[index])
+    && resource[5]?.startsWith(`${resourceType}/`) === true;
 }

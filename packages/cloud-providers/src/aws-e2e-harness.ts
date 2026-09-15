@@ -8,6 +8,8 @@ import { isDeepStrictEqual } from "node:util";
 import type { CloudStep, SlotRef } from "@masterdns/contracts";
 
 import type { AwsCredentials, CloudAdapter, CloudInventory, CloudObservation, CloudStepResult } from "./provider.js";
+import type { LightsailInspectionScope } from "./lightsail.js";
+import { rotationResourceName } from "./resource-ownership.js";
 import { planCloudRotation, rotationArguments } from "./rotation-plan.js";
 
 const requiredEnvironment = [
@@ -86,7 +88,7 @@ export type AwsE2eResult =
 type RunDependencies = {
   adapter: CloudAdapter;
   journal?: AwsE2eJournalStore;
-  inspect?: (ref: SlotRef) => Promise<CloudInventory>;
+  inspect?: (ref: SlotRef, scope?: LightsailInspectionScope) => Promise<CloudInventory>;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
 };
@@ -229,17 +231,17 @@ export async function runAwsE2e(config: AwsE2eConfig, dependencies: RunDependenc
 
 async function runAwsE2eWithLease(config: AwsE2eConfig, dependencies: RunDependencies, lease?: AwsE2eJournalLease): Promise<AwsE2eResult> {
   let journal = config.write ? await lease!.load() : undefined;
-  if (journal) {
+  if (journal !== undefined) {
     journal = validateJournal(journal);
     assertSameScope(journal.scope, config.scope, "journal_scope_mismatch");
     if (!isDeepStrictEqual(journal.lightsailScope, config.lightsailScope)) throw new Error("journal_scope_mismatch");
   }
 
   await assertIdentity(dependencies.adapter, config.scope.accountId);
-  const current = await inspect(config, dependencies);
+  const current = await inspect(config, dependencies, journal);
   assertInventoryScope(config.scope, current, journal === undefined);
 
-  if (!journal) {
+  if (journal === undefined) {
     const plan = planCloudRotation(config.scope, current, { allowStop: false, attemptId: createAttemptId() });
     validatePlan(plan, config.scope);
     if (!config.write) return { outcome: "read_only", scope: config.scope, state: current.state, plannedActions: plan.map((step) => step.action) };
@@ -272,7 +274,7 @@ async function runAwsE2eWithLease(config: AwsE2eConfig, dependencies: RunDepende
 
     if (entry.state === "planned") {
       await assertIdentity(dependencies.adapter, config.scope.accountId);
-      const beforeMutation = await inspect(config, dependencies);
+      const beforeMutation = await inspect(config, dependencies, journal);
       assertInventoryScope(config.scope, beforeMutation, false);
       entry.state = "dispatched";
       journal.phase = "running";
@@ -304,7 +306,7 @@ async function runAwsE2eWithLease(config: AwsE2eConfig, dependencies: RunDepende
 
   journal.phase = "completed";
   await lease!.save(journal);
-  const finalInventory = await inspect(config, dependencies);
+  const finalInventory = await inspect(config, dependencies, journal);
   assertInventoryScope(config.scope, finalInventory, false);
   return resultFromJournal("completed", journal, finalInventory.state);
 }
@@ -355,6 +357,14 @@ function validateJournal(value: unknown): AwsE2eJournal {
   if ((journal.scope.service === "lightsail" && !isLightsailScope(journal.lightsailScope))
     || (journal.scope.service === "ec2" && journal.lightsailScope !== undefined)) throw new Error("invalid_aws_e2e_journal");
   assertInventoryScope(journal.scope, journal.original, true);
+  if (journal.scope.service === "lightsail") {
+    const originalAddress = journal.original.interfaces.find((networkInterface) => networkInterface.id === journal.scope.interfaceId)
+      ?.addresses.find((address) => address.address === journal.scope.address && address.family === journal.scope.family);
+    const staticName = journal.lightsailScope!.staticIpName;
+    if (!originalAddress || (staticName !== undefined
+      ? originalAddress.allocationId !== staticName || !originalAddress.resourceId
+      : originalAddress.allocationId !== undefined || originalAddress.resourceId !== undefined)) throw new Error("invalid_aws_e2e_journal");
+  }
   const steps = journal.steps.map((entry) => {
     if (!isRecord(entry) || !["planned", "dispatched", "received", "pending", "applied", "needs_review"].includes(String(entry.state)) || !isRecord(entry.step)) {
       throw new Error("invalid_aws_e2e_journal");
@@ -491,9 +501,45 @@ function isLightsailName(value: string): boolean {
   return /^[A-Za-z0-9][A-Za-z0-9_-]{0,254}$/.test(value);
 }
 
-function inspect(config: AwsE2eConfig, dependencies: RunDependencies): Promise<CloudInventory> {
-  if (config.scope.service === "lightsail" && (!config.lightsailScope || !dependencies.inspect)) throw new Error("lightsail_scoped_inspection_required");
-  return dependencies.inspect?.(config.scope) ?? dependencies.adapter.inspect(config.scope);
+function inspect(config: AwsE2eConfig, dependencies: RunDependencies, journal?: AwsE2eJournal): Promise<CloudInventory> {
+  if (config.scope.service !== "lightsail") return dependencies.inspect?.(config.scope) ?? dependencies.adapter.inspect(config.scope);
+  const scope = lightsailInspectionScope(config, journal);
+  if (dependencies.inspect) return dependencies.inspect(config.scope, scope);
+  const adapter = dependencies.adapter as CloudAdapter & {
+    inspectScoped?: (ref: SlotRef, scope: LightsailInspectionScope) => Promise<CloudInventory>;
+  };
+  if (!adapter.inspectScoped) throw new Error("lightsail_scoped_inspection_required");
+  return adapter.inspectScoped(config.scope, scope);
+}
+
+function lightsailInspectionScope(config: AwsE2eConfig, journal?: AwsE2eJournal): LightsailInspectionScope {
+  if (!config.lightsailScope) throw new Error("lightsail_scoped_inspection_required");
+  if (journal === undefined) return {
+    mode: "initial",
+    instanceName: config.lightsailScope.instanceName,
+    original: config.lightsailScope.staticIpName
+      ? { kind: "static", name: config.lightsailScope.staticIpName, address: config.scope.address }
+      : { kind: "dynamic", address: config.scope.address },
+  };
+  const originalAddress = journal.original.interfaces.find((networkInterface) => networkInterface.id === config.scope.interfaceId)
+    ?.addresses.find((address) => address.address === config.scope.address && address.family === config.scope.family);
+  if (!originalAddress) throw new Error("invalid_aws_e2e_journal");
+  const allocation = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.allocate" && entry.state === "applied");
+  const candidate = allocation?.receipt;
+  if (allocation && (!candidate?.allocationId || candidate.allocationId !== rotationResourceName(allocation.step)
+    || !candidate.resourceId || !candidate.candidateAddress)) throw new Error("invalid_aws_e2e_journal");
+  const detach = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.detach");
+  const attach = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.attach");
+  return {
+    mode: "transition",
+    instanceName: config.lightsailScope.instanceName,
+    original: originalAddress.allocationId && originalAddress.resourceId
+      ? { kind: "static", name: originalAddress.allocationId, address: originalAddress.address, resourceId: originalAddress.resourceId }
+      : { kind: "dynamic", address: originalAddress.address },
+    ...(candidate ? { candidate: { name: candidate.allocationId!, address: candidate.candidateAddress!, resourceId: candidate.resourceId! } } : {}),
+    ...(detach && detach.state !== "planned" ? { allowDetachedOriginal: true } : {}),
+    ...(attach && attach.state !== "planned" ? { allowCandidateAttached: true } : {}),
+  };
 }
 
 function createAttemptId(): string {

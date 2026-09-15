@@ -378,6 +378,27 @@ describe("AWS E2E recovery", () => {
     })).rejects.toThrow("simulated_fsync_failure");
     expect(fake.executed).toEqual([]);
   });
+
+  it.each([null, false, 0, ""])("rejects loaded JSON value %j instead of initializing a new attempt", async (loadedValue) => {
+    const loaded = loadAwsE2eConfig(completeEnv);
+    if (loaded.outcome !== "ready") throw new Error("expected ready configuration");
+    const fake = fakeAdapter();
+    let saves = 0;
+    const journal: AwsE2eJournalStore = {
+      acquire: async () => ({
+        load: async () => loadedValue as never,
+        save: async () => { saves++; },
+        release: async () => undefined,
+      }),
+    };
+
+    await expect(runAwsE2e({ ...loaded.config, write: true, journalPath: "/tmp/aws-e2e.json" }, {
+      adapter: fake.adapter,
+      journal,
+    })).rejects.toThrow("invalid_aws_e2e_journal");
+    expect(saves).toBe(0);
+    expect(fake.executed).toEqual([]);
+  });
 });
 
 describe("file AWS E2E journal ownership", () => {
