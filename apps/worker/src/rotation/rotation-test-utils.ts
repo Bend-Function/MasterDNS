@@ -78,7 +78,7 @@ export async function fixture(family: "4" | "6" = "4") {
   await d.insert(db.instanceAuthorizations).values({ instanceId: instance!.id, managed: true });
   const [config] = await d
     .insert(db.healthCheckConfigs)
-    .values({ slotId: slot!.id, checkerType: "tcp", config: { port: 443 } })
+    .values({ slotId: slot!.id, checkerType: "tcp", config: { type: "tcp", port: 443, timeoutMs: 3000 } })
     .returning();
   const [group] = await d.insert(db.probeGroups).values({ ownerUserId: owner!.id, name: "test" }).returning();
   const [policy] = await d

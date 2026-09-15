@@ -409,16 +409,158 @@ it("blocks DNS dispatch while a physical-instance cloud step remains unresolved"
   await f.d
     .insert(db.rotationAttempts)
     .values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: f.live });
-  await f.d
-    .insert(db.rotationSteps)
-    .values({
-      id: stepId,
-      attemptId,
-      sequence: 0,
-      status: "in_flight",
-      plan: { id: stepId, action: "ec2.eip.associate", resourceKey: physicalKey, arguments: { phase: "rotation" }, destructive: true },
-    });
+  await f.d.insert(db.rotationSteps).values({
+    id: stepId,
+    attemptId,
+    sequence: 0,
+    status: "in_flight",
+    plan: { id: stepId, action: "ec2.eip.associate", resourceKey: physicalKey, arguments: { phase: "rotation" }, destructive: true },
+  });
   await f.d.update(db.rotationLeases).set({ unresolvedStepId: stepId }).where(eq(db.rotationLeases.physicalKey, physicalKey));
   await f.execute();
   expect(f.writes).toHaveLength(0);
+});
+
+import { ProbeHealthService } from "../probes/probe-health.service.js";
+import { ProbeSchedulerService } from "../probes/probe-scheduler.service.js";
+import { HealthResultService } from "../health/health-result.service.js";
+async function cloudHealthFixture() {
+  const f = await dnsFixture();
+  f.state.failSecond = false;
+  await f.service.publishSlot(f.slot.id);
+  await f.plan();
+  await f.execute();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.service.observe(publication!.id);
+  const backups = [];
+  for (const pool of f.pools) {
+    const [backup] = await f.d
+      .insert(db.endpoints)
+      .values({ poolId: pool.id, name: "healthy-backup", addressMode: "static", priority: 200, healthState: "healthy" })
+      .returning();
+    backups.push(backup!);
+    await f.d
+      .insert(db.endpointAddresses)
+      .values({ endpointId: backup!.id, family: "4", address: "192.0.2.88", source: "static", state: "current", healthState: "healthy" });
+  }
+  const [agent] = await f.d
+    .insert(db.probeAgents)
+    .values({ ownerUserId: f.account.ownerUserId, name: "external", capabilities: { ipv4: true, ipv6: true } })
+    .returning();
+  await f.d.insert(db.probeGroupMembers).values({ groupId: f.policy.groupId!, probeId: agent!.id });
+  const results = new HealthResultService({ db: f.d } as never);
+  const health = new ProbeHealthService({ db: f.d } as never, results);
+  const scheduler = new ProbeSchedulerService({ db: f.d } as never, health);
+  let sequence = 0;
+  const start = Date.now();
+  const round = async (decision: "success" | "failure" | "unknown") => {
+    const r = await scheduler.schedulePolicy(f.policy.id, new Date(start + sequence++ * 15000));
+    expect(r).toBeDefined();
+    if (decision !== "unknown") {
+      const [task] = await f.d.select().from(db.probeTasks).where(eq(db.probeTasks.roundId, r!.id));
+      await f.d.insert(db.probeObservations).values({
+        taskId: task!.id,
+        roundId: r!.id,
+        probeId: agent!.id,
+        leaseId: randomUUID(),
+        addressVersion: r!.addressVersion,
+        configVersion: r!.configVersion,
+        status: "accepted",
+        outcome: decision,
+        latencyMs: 1,
+        measuredAt: new Date(),
+        receivedAt: new Date(r!.deadline.getTime() - 1),
+      });
+    }
+    await health.closeRound(r!.id, r!.deadline);
+    return r!;
+  };
+  return { ...f, backups, round, results, health };
+}
+it("atomically fans three current-slot failures into both Pools and normal backup selection, preserving keep-current recovery", async () => {
+  const f = await cloudHealthFixture();
+  await f.round("failure");
+  await f.round("failure");
+  expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, f.endpoints[0]!.id)))[0]!.healthState).not.toBe("unhealthy");
+  const closed = await f.round("failure");
+  for (const endpoint of f.endpoints) {
+    expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("unhealthy");
+    expect(await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, endpoint.poolId))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ trigger: "failure", endpointId: endpoint.id })]),
+    );
+  }
+  expect((await f.d.select().from(db.probeRounds).where(eq(db.probeRounds.id, closed.id)))[0]!.status).toBe("completed");
+  await f.plan();
+  await f.execute();
+  expect(f.remote.get("zone-0")!.content).toBe("192.0.2.88");
+  expect(f.remote.get("zone-1")!.content).toBe("192.0.2.88");
+  await f.round("success");
+  await f.round("success");
+  await f.round("success");
+  await f.plan();
+  await f.execute();
+  expect(f.remote.get("zone-0")!.content).toBe("192.0.2.88");
+  expect(f.remote.get("zone-1")!.content).toBe("192.0.2.88");
+});
+it("does not fan candidate outcomes into the published endpoint and unknown does not cause failover", async () => {
+  const f = await cloudHealthFixture();
+  await f.round("unknown");
+  const intentsBefore = (await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, f.pools[0]!.id))).length;
+  const [candidate] = await f.d
+    .insert(db.cloudAddresses)
+    .values({ interfaceId: f.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.44", origin: "system", scanGeneration: 1 })
+    .returning();
+  await f.d
+    .update(db.managedAddressSlots)
+    .set({ candidateAddressId: candidate!.id, candidateVersion: 2 })
+    .where(eq(db.managedAddressSlots.id, f.slot.id));
+  await f.round("failure");
+  await f.round("failure");
+  await f.round("failure");
+  for (const endpoint of f.endpoints)
+    expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("healthy");
+  await f.round("success");
+  await f.round("success");
+  await f.round("success");
+  for (const endpoint of f.endpoints)
+    expect(
+      (await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, endpoint.id)))[0]!.consecutiveSuccesses,
+    ).toBe(0);
+  expect((await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, f.pools[0]!.id))).length).toBe(intentsBefore);
+});
+
+it("rolls back the round and every Pool if current-slot health fanout cannot finish atomically", async () => {
+  const f = await cloudHealthFixture();
+  await f.round("failure");
+  await f.round("failure");
+  const apply = f.results.applyObserved.bind(f.results);
+  let calls = 0;
+  const spy = vi.spyOn(f.results, "applyObserved").mockImplementation(async (...args) => {
+    if (++calls === 2) throw new Error("injected_pool_write_failure");
+    return apply(...args);
+  });
+  await expect(f.round("failure")).rejects.toThrow("injected_pool_write_failure");
+  spy.mockRestore();
+  const [state] = await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  expect(state!.consecutiveFailures).toBe(2);
+  for (const endpoint of f.endpoints)
+    expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("degraded");
+  const pending = (await f.d.select().from(db.probeRounds).where(eq(db.probeRounds.slotId, f.slot.id))).find(
+    (r) => r.status === "pending",
+  )!;
+  expect(pending).toBeDefined();
+  await f.health.closeRound(pending.id, pending.deadline);
+  for (const endpoint of f.endpoints)
+    expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("unhealthy");
+});
+
+it("does not turn an unknown round's historical unhealthy slot state into new Pool failover", async () => {
+  const f = await cloudHealthFixture();
+  await f.d
+    .update(db.addressHealthStates)
+    .set({ healthState: "unhealthy", latestDecision: "failure", consecutiveFailures: 3, consecutiveSuccesses: 0 })
+    .where(eq(db.addressHealthStates.slotId, f.slot.id));
+  await f.round("unknown");
+  for (const endpoint of f.endpoints)
+    expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("healthy");
 });

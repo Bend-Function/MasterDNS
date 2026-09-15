@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { applyHealthResult } from "@masterdns/automation";
 import type { HealthState, PoolReconcileJob } from "@masterdns/contracts";
-import { addressHealthPolicies, addressHealthStates, healthTargetWhere, bindingEndpointHealth, ddnsAgents, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthCheckResults, reconcileIntents, type MasterDnsDatabase } from "@masterdns/db";
+import { cloudEndpointLinks, lockRotationContext, lockRotationHealth, addressHealthPolicies, addressHealthStates, healthTargetWhere, bindingEndpointHealth, ddnsAgents, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthCheckResults, reconcileIntents, type MasterDnsDatabase } from "@masterdns/db";
 import { and, eq, ne, sql } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 type Transaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
@@ -21,14 +21,50 @@ export class HealthResultService {
     if (!endpoint || !pool || (config.endpointId !== endpoint.id && config.poolId !== pool.id)) return;
     return this.applyObserved({ address, config, endpoint, pool }, { success: input.decision === "success", latencyMs: 0, checkedAt: input.checkedAt });
   }
-  async applyObserved(target: HealthTarget, result: HealthResult, transaction?: Transaction, authoritative?: { next: { state: HealthState; consecutiveSuccesses: number; consecutiveFailures: number }; decision: "success" | "failure" | "unknown"; roundId: string; successThreshold: number }) {
+  async applyCloudSlotRound(slotId: string, roundId: string, tx: Transaction) {
+    const cloud = await lockRotationContext(tx, slotId);
+    if (cloud.slot.candidateAddressId || !cloud.slot.currentAddressId || cloud.slot.currentVersion === 0) return;
+    const health = await lockRotationHealth(tx, cloud);
+    if (!health.matches || !health.state?.lastCheckedAt || health.state.lastRoundId !== roundId || !health.config || !health.policy) return;
+    const targets = await tx.select({ endpoint: endpoints, pool: endpointPools, address: endpointAddresses })
+      .from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId))
+      .innerJoin(endpointPools, eq(endpointPools.id, endpoints.poolId))
+      .innerJoin(endpointAddresses, and(eq(endpointAddresses.endpointId, endpoints.id), eq(endpointAddresses.family, cloudEndpointLinks.family), eq(endpointAddresses.state, "current")))
+      .where(and(eq(cloudEndpointLinks.slotId, slotId), eq(endpointPools.ownerUserId, cloud.account.ownerUserId), eq(endpoints.addressMode, "cloud"), eq(endpointAddresses.source, "cloud"), eq(endpointAddresses.address, cloud.address!.address)));
+    // Account → instance → slot → sorted Pools → endpoints, matching publication.
+    // Persist all current-address health and normal reconcile intents before round completion.
+    for (const poolId of [...new Set(targets.map(t => t.pool.id))].sort()) await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+    for (const target of targets.sort((a, b) => a.pool.id.localeCompare(b.pool.id) || a.endpoint.id.localeCompare(b.endpoint.id))) {
+      const insufficient = health.state.latestDecision === "unknown"
+        || (health.state.healthState === "healthy" && health.state.consecutiveSuccesses < health.policy.successThreshold)
+        || (health.state.healthState === "unhealthy" && health.state.consecutiveFailures < health.policy.failureThreshold);
+      const state = insufficient ? target.address.healthState : health.state.healthState;
+      await this.applyObserved({ ...target, config: health.config }, { success: health.state.latestDecision === "success", latencyMs: 0, checkedAt: health.state.lastCheckedAt }, tx, {
+        next: { state, consecutiveSuccesses: health.state.consecutiveSuccesses, consecutiveFailures: health.state.consecutiveFailures },
+        decision: health.state.latestDecision, roundId, successThreshold: health.policy.successThreshold,
+        cloudSlot: { slotId, addressId: cloud.slot.currentAddressId, addressVersion: cloud.slot.currentVersion },
+      });
+    }
+  }
+  async applyObserved(target: HealthTarget, result: HealthResult, transaction?: Transaction, authoritative?: { next: { state: HealthState; consecutiveSuccesses: number; consecutiveFailures: number }; decision: "success" | "failure" | "unknown"; roundId: string; successThreshold: number; cloudSlot?: { slotId: string; addressId: string; addressVersion: number } }) {
     const eventId = randomUUID();
     const apply = async (tx: Transaction) => {
+      const slotEvidence = authoritative?.cloudSlot;
+      const cloud = slotEvidence ? await lockRotationContext(tx, slotEvidence.slotId) : undefined;
+      if (cloud) {
+        const health = await lockRotationHealth(tx, cloud);
+        const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, target.endpoint.id), eq(cloudEndpointLinks.family, target.address.family)));
+        if (cloud.slot.candidateAddressId || cloud.slot.currentAddressId !== slotEvidence!.addressId
+          || cloud.slot.currentVersion !== slotEvidence!.addressVersion || cloud.address?.address !== target.address.address
+          || link?.slotId !== cloud.slot.id || target.pool.ownerUserId !== cloud.account.ownerUserId
+          || !health.matches || health.state?.lastRoundId !== authoritative!.roundId || health.config?.id !== target.config.id
+          || health.state.latestDecision !== authoritative!.decision) return null;
+      }
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${target.pool.id}))`);
       await tx.execute(sql`select id from endpoints where id = ${target.endpoint.id} for update`);
       await tx.execute(sql`select id from endpoint_addresses where id = ${target.address.id} for update`);
       const [current] = await tx.select().from(endpoints).where(eq(endpoints.id, target.endpoint.id)).limit(1);
-      if (!current || (current.addressMode === "cloud" && !target.binding)) return null;
+      if (!current || (current.addressMode === "cloud" && !target.binding && !cloud) || (cloud && current.addressMode !== "cloud")) return null;
       const [currentAddress] = await tx.select().from(endpointAddresses).where(eq(endpointAddresses.id, target.address.id)).limit(1);
       if (!currentAddress || !isAddressStillIntended(target.address, currentAddress, current.addressMode)) return null;
       const [currentConfig] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, target.config.id)).limit(1);
@@ -40,7 +76,7 @@ export class HealthResultService {
         localPolicy = policy;
       }
       const [currentPool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, target.pool.id)).limit(1);
-      if (!currentPool) return null;
+      if (!currentPool || (cloud && currentPool.ownerUserId !== cloud.account.ownerUserId)) return null;
       const [bindingHealth] = target.binding
         ? await tx.select().from(bindingEndpointHealth).where(and(
           eq(bindingEndpointHealth.domainBindingId, target.binding.id),
