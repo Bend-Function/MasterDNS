@@ -166,15 +166,17 @@ export class RotationStore {
       if (action.kind === "publish" && action.mode === "dispatch" && run.h.success && c.slot.candidateAddressId) {
         await tx.insert(rotationPublications).values({ slotId: c.slot.id, addressVersion: c.slot.candidateVersion, addressId: c.slot.candidateAddressId, incidentId: id }).onConflictDoNothing();
         await tx.update(rotationIncidents).set({ phase: "publish", status: "active", errorCode: null, nextRunAt: new Date(run.h.now.getTime() + 30000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
-        if (run.attempt) await tx.update(rotationAttempts).set({ status: "verified" }).where(eq(rotationAttempts.id, run.attempt.id));
+        if (run.attempt) await tx.update(rotationAttempts).set({ status: run.attempt.charged ? "verified" : "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
       } else if (action.kind === "complete" && run.h.success && !run.attempt?.charged && !c.slot.candidateAddressId && c.slot.currentVersion > 0) {
         await tx.update(rotationIncidents).set({ phase: "complete", status: "complete", errorCode: null, completedAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
         await tx.update(rotationLeases).set({ incidentId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.incidentId, id)));
+        if (run.attempt) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
         await rotationAudit(tx, incident, "rotation.current_recovered");
       } else if (action.kind === "pause") await this.pauseIn(tx, incident, action.reason, run.h.now);
       else await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode, nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
     });
   }
+  async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`clock_timestamp() + interval '30 seconds'` }).where(eq(rotationIncidents.id, id)); }
   async pause(id: string, code: string) { await this.transaction(id, async (tx, _c, incident) => this.pauseIn(tx, incident, code, await databaseNow(tx))); }
   private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));

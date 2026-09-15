@@ -29,7 +29,7 @@ it("serializes concurrent physical-instance claims and fences a stale holder aft
 });
 
 import { vi } from "vitest";
-import { CloudError, Ec2CloudAdapter, type CloudAdapter, type CloudInventory, type CloudStepResult } from "@masterdns/cloud-providers";
+import { CloudError, Ec2CloudAdapter, LightsailCloudAdapter, type CloudAdapter, type CloudInventory, type CloudStepResult } from "@masterdns/cloud-providers";
 import { addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { RotationStore } from "./rotation-store.js";
@@ -215,7 +215,7 @@ it("recovers durable due work after a lost queue wakeup without creating a secon
   expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(1);
 });
 it("completes a recovered current address before any effect without charging or publishing a fake candidate", async () => {
-  const f = await fixture(); await evidence(f, "success"); await drive(f, 1);
+  const f = await fixture(); await drive(f, 1); await evidence(f, "success"); await drive(f, 1);
   expect(f.state.writes).toHaveLength(0);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", phase: "complete" });
   expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toHaveLength(0);
@@ -231,4 +231,68 @@ it("finishes a resolved partial plan under its original segment before activatin
   expect(incident).toMatchObject({ phase: "candidate", currentSegmentId: resumed.pendingSegmentId, pendingSegmentId: null });
   expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.id, resumed.pendingSegmentId!)))[0]!.attemptsUsed).toBe(0);
   expect(f.state.writes).toHaveLength(2);
+});
+it("persists a pending Lightsail allocation ARN and carries its identity separately into the attach receipt", async () => {
+  const f = await fixture();
+  await connection.db.update(cloudInstances).set({ service: "lightsail" }).where(eq(cloudInstances.id, f.instance.id));
+  await connection.db.update(cloudInterfaces).set({ externalId: "primary" }).where(eq(cloudInterfaces.id, f.iface.id));
+  await connection.db.insert(cloudScanScopes).values({ accountId: f.account.id, service: "lightsail", region: "us-east-1", generation: 1 });
+  await connection.db.update(cloudAddresses).set({ remoteAllocationId: null }).where(eq(cloudAddresses.id, f.address.id));
+  await connection.db.update(rotationIncidents).set({ physicalKey: JSON.stringify(["aws", "123456789012", "lightsail", "us-east-1", f.instance.externalId]) }).where(eq(rotationIncidents.id, f.incident.id));
+  const instance = { arn: f.instance.externalId, name: "native", publicIpAddress: f.address.address, ipAddressType: "dualstack", isStaticIp: false };
+  let allocation: { name: string; arn: string; ipAddress: string; attachedTo?: string } | undefined;
+  let ready = false; const writes: string[] = [];
+  const sdk = new LightsailCloudAdapter(f.account.id, { kind: "access_key", accessKeyId: "fake", secretAccessKey: "fake" }, {
+    stsSend: async () => ({ Account: "123456789012" }),
+    lightsailSend: async command => {
+      const action = command.constructor.name;
+      if (action === "GetInstancesCommand") return { instances: [instance] };
+      if (action === "GetInstanceCommand") return { instance };
+      if (action === "GetStaticIpsCommand") return { staticIps: allocation ? [allocation] : [] };
+      if (action === "GetStaticIpCommand") { if (!allocation) throw { name: "NotFoundException" }; return { staticIp: allocation }; }
+      if (action === "GetOperationCommand") return { operation: { id: command.input.operationId, status: ready ? "Succeeded" : "Started" } };
+      writes.push(action);
+      if (action === "AllocateStaticIpCommand") { allocation = { name: command.input.staticIpName, arn: "arn:aws:lightsail:us-east-1:123456789012:StaticIp/immutable", ipAddress: "198.51.100.8" }; return { operations: [{ id: "allocation-operation" }] }; }
+      if (action === "AttachStaticIpCommand") { allocation!.attachedTo = instance.name; instance.isStaticIp = true; instance.publicIpAddress = allocation!.ipAddress; return { operations: [{ id: "attach-operation" }] }; }
+      throw new Error("Unexpected cloud command");
+    },
+  });
+  f.runtime.adapter = async () => sdk;
+  await drive(f, 3);
+  const [attempt] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+  let steps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt!.id)).orderBy(rotationSteps.sequence);
+  expect(steps[0]).toMatchObject({ status: "pending", receipt: { resourceId: allocation!.arn, operationIds: ["allocation-operation"] } });
+  ready = true; await drive(f, 3);
+  steps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt!.id)).orderBy(rotationSteps.sequence);
+  expect(steps[1]).toMatchObject({ status: "applied", plan: { arguments: { candidateReceipt: { resourceId: allocation!.arn, operationIds: ["allocation-operation"] } } }, receipt: { resourceId: allocation!.arn, operationIds: ["attach-operation"] } });
+  expect(writes).toEqual(["AllocateStaticIpCommand", "AttachStaticIpCommand"]);
+});
+it.each(["disabled", "region", "credentials", "identity"] as const)("rejects final account %s changes before a cloud write", async change => {
+  const f = await fixture(); await drive(f, 1);
+  f.runtime.adapter = async () => {
+    const fields = change === "disabled" ? { enabled: false } : change === "region" ? { regions: ["ap-southeast-2"] } : change === "credentials" ? { credentialCiphertext: "new-credential" } : { externalAccountId: "999999999999" };
+    await connection.db.update(cloudAccounts).set(fields).where(eq(cloudAccounts.id, f.account.id)); return f.adapter;
+  };
+  await drive(f, 1); expect(f.state.writes).toHaveLength(0);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(0);
+});
+it("waits for the actual-attempt cooldown and cannot turn insufficient fresh evidence into another candidate", async () => {
+  const f = await fixture(); await drive(f, 5); await evidence(f, "failure"); await drive(f, 1);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
+  await evidence(f, "success");
+  await connection.db.update(addressHealthStates).set({ consecutiveSuccesses: 1 }).where(eq(addressHealthStates.id, f.health.id));
+  await drive(f, 1);
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toHaveLength(0);
+  expect(f.state.writes).toHaveLength(2);
+});
+it("preserves the same uncharged attempt for a due explicit throttling retry", async () => {
+  const f = await fixture(); f.state.error = new CloudError("rate_limited", true); await drive(f, 2);
+  const [before] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+  expect(before!.charged).toBe(false);
+  f.state.error = undefined; await drive(f, 1); expect(f.state.writes).toHaveLength(1);
+  await connection.db.update(rotationSteps).set({ retryAt: new Date(0) }).where(eq(rotationSteps.id, f.state.writes[0]!));
+  await drive(f, 1);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toMatchObject([{ id: before!.id, charged: true }]);
+  expect(f.state.writes).toEqual([f.state.writes[0], f.state.writes[0]]);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
 });

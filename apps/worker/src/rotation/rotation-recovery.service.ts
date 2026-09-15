@@ -1,5 +1,5 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, asc, eq, ne, notExists, or, sql } from "drizzle-orm";
 import { addressHealthStates, createRotationIncident, lockRotationContext, rotationIncidents, rotationPolicies } from "@masterdns/db";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
@@ -15,7 +15,7 @@ export class RotationRecoveryService implements OnModuleInit, OnModuleDestroy {
     // Redis is only a wake-up channel. DB evidence and incident deadlines are the
     // source of truth across lost jobs, retries and process restarts.
     const failures = await this.database.db.select({ slotId: rotationPolicies.slotId, lastRoundId: addressHealthStates.lastRoundId, addressVersion: addressHealthStates.addressVersion }).from(rotationPolicies)
-      .innerJoin(addressHealthStates, eq(addressHealthStates.slotId, rotationPolicies.slotId)).where(and(eq(rotationPolicies.enabled, true), eq(addressHealthStates.latestDecision, "failure"), eq(addressHealthStates.healthState, "unhealthy"), sql`${addressHealthStates.evidenceExpiresAt} > clock_timestamp()`)).limit(200);
+      .innerJoin(addressHealthStates, eq(addressHealthStates.slotId, rotationPolicies.slotId)).where(and(eq(rotationPolicies.enabled, true), eq(addressHealthStates.latestDecision, "failure"), eq(addressHealthStates.healthState, "unhealthy"), sql`${addressHealthStates.evidenceExpiresAt} > clock_timestamp()`, notExists(this.database.db.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(eq(rotationIncidents.slotId, rotationPolicies.slotId), or(ne(rotationIncidents.status, "complete"), eq(rotationIncidents.sourceEventId, sql`'health-' || ${addressHealthStates.lastRoundId} || '-' || ${addressHealthStates.addressVersion}`))))))).limit(200);
     for (const failure of failures) {
       try { await this.database.db.transaction(async tx => {
         const c = await lockRotationContext(tx, failure.slotId);
@@ -24,7 +24,7 @@ export class RotationRecoveryService implements OnModuleInit, OnModuleDestroy {
         if (!(error instanceof Error && ["confirmed_failure_required", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "external_health_required"].includes(error.message))) throw error;
       }
     }
-    const due = await this.database.db.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(ne(rotationIncidents.status, "complete"), sql`${rotationIncidents.nextRunAt} <= clock_timestamp()`)).limit(200);
+    const due = await this.database.db.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(ne(rotationIncidents.status, "complete"), sql`${rotationIncidents.nextRunAt} <= clock_timestamp()`)).orderBy(asc(rotationIncidents.nextRunAt)).limit(200);
     await Promise.all(due.map(row => this.queues.rotation.add("rotate", { incidentId: row.id }, { jobId: `rotation-${row.id}`, removeOnComplete: true, removeOnFail: true })));
     return due.length;
   }

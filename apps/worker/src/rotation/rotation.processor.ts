@@ -4,7 +4,6 @@ import { queueNames, type RotationJob } from "@masterdns/contracts";
 import { CloudError } from "@masterdns/cloud-providers";
 import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
-import { env } from "../env.js";
 import { RotationStore } from "./rotation-store.js";
 
 // These are explicit authentication/admission rejections. Transport failures and
@@ -16,7 +15,7 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(RotationProcessor.name);
   constructor(private readonly store: RotationStore, private readonly runtime: CloudRuntimeService, private readonly queues: QueueRuntimeService) {}
   onModuleInit() {
-    this.worker = new Worker<RotationJob>(queueNames.rotation, job => this.run(job.data.incidentId), { connection: { url: env.REDIS_URL }, concurrency: 8 });
+    this.worker = new Worker<RotationJob>(queueNames.rotation, job => this.run(job.data.incidentId), { connection: this.queues.redis, concurrency: 8 });
     this.worker.on("error", error => this.logger.error(error.message));
   }
   async onModuleDestroy() { await this.worker?.close(); }
@@ -25,7 +24,7 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
     try {
       const run = await this.store.read(incidentId, lease);
       const action = run.action;
-      if (run.incident.phase === "publish" || run.incident.phase === "cleanup") return; // Durable P10 boundary, never no-op success.
+      if (run.incident.phase === "publish" || run.incident.phase === "cleanup") { await this.store.defer(incidentId); return; } // Durable P10 boundary, never no-op success.
       if (action.kind !== "execute" && action.kind !== "observe") { await this.store.settle(incidentId, lease); return; }
       const identity = { credentialCiphertext: run.c.account.credentialCiphertext, externalAccountId: run.c.account.externalAccountId };
       const adapter = await this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" });
