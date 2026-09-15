@@ -6,7 +6,7 @@ import type { CloudStep, SlotRef } from "@masterdns/contracts";
 const ref = { accountId: "local", service: "lightsail" as const, region: "us-east-1", instanceId: "arn:aws:lightsail:us-east-1:123:Instance/stable" };
 const slot: SlotRef = { ...ref, slotId: "v4", interfaceId: "primary", address: "198.51.100.1", family: 4 };
 const inventory: CloudInventory = { ref, nativeName: "one", name: "one", state: "running", ipv6Only: false, interfaces: [{ id: "primary", addresses: [{ address: slot.address, family: 4, primary: true, allocationId: "old-static", resourceId: "arn:static:old" }] }] };
-const instance = { arn: ref.instanceId, name: "one", state: { name: "running" }, ipAddressType: "dualstack", publicIpAddress: slot.address, ipv6Addresses: ["2001:db8::1"] };
+const instance = { arn: ref.instanceId, name: "one", isStaticIp: true, state: { name: "running" }, ipAddressType: "dualstack", publicIpAddress: slot.address, ipv6Addresses: ["2001:db8::1"] };
 const plan = (s = slot, i = inventory): CloudStep[] => providers.planCloudRotation(s, i, { allowStop: false, attemptId: "attempt-1" }).map(step => ({
   ...step,
   arguments: { ...step.arguments, ...(step.action.endsWith("detach") || step.action.endsWith("attach") ? {
@@ -75,7 +75,10 @@ it("allocates a deterministic static name and persists every asynchronous operat
   const writes: any[] = [];
   const cloud = adapter(async c => {
     if (c.constructor.name === "GetInstanceCommand") return { instance };
-    if (c.constructor.name === "GetStaticIpCommand") throw Object.assign(new Error("missing"), { name: "NotFoundException" });
+    if (c.constructor.name === "GetStaticIpCommand") {
+      if (c.input.staticIpName === "old-static") return { staticIp: { name: "old-static", arn: "arn:static:old", ipAddress: slot.address, attachedTo: "one" } };
+      throw Object.assign(new Error("missing"), { name: "NotFoundException" });
+    }
     writes.push(c); return { operations: [{ id: "op-1", status: "Started" }, { id: "op-2", status: "Started" }] };
   });
   await expect(cloud.execute(plan()[0]!)).resolves.toMatchObject({ allocationId: "masterdns-attempt-1", operationId: "op-1", operationIds: ["op-1", "op-2"] });
@@ -159,7 +162,10 @@ it("does not infer completed asynchronous execution when the receipt has no oper
   const step = plan()[0]!;
   const cloud = adapter(async c => {
     if (c.constructor.name === "GetInstanceCommand") return { instance };
-    if (c.constructor.name === "GetStaticIpCommand") throw Object.assign(new Error("missing"), { name: "NotFoundException" });
+    if (c.constructor.name === "GetStaticIpCommand") {
+      if (c.input.staticIpName === "old-static") return { staticIp: { name: "old-static", arn: "arn:static:old", ipAddress: slot.address, attachedTo: "one" } };
+      throw Object.assign(new Error("missing"), { name: "NotFoundException" });
+    }
     return { operations: [] };
   });
   await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
@@ -310,4 +316,37 @@ it("refuses to attach a same-name candidate without a persisted allocation ident
   await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
   await expect(cloud.observe(step)).resolves.toBe("ambiguous");
   expect(writes).toEqual([]);
+});
+
+it.each([
+  { label: "detached", attachedTo: undefined, arn: "arn:static:old", ipAddress: slot.address, currentIp: slot.address },
+  { label: "moved", attachedTo: "other", arn: "arn:static:old", ipAddress: slot.address, currentIp: slot.address },
+  { label: "recreated", attachedTo: "one", arn: "arn:static:other", ipAddress: slot.address, currentIp: slot.address },
+  { label: "address changed", attachedTo: "one", arn: "arn:static:old", ipAddress: "198.51.100.77", currentIp: slot.address },
+  { label: "instance address changed", attachedTo: "one", arn: "arn:static:old", ipAddress: slot.address, currentIp: "198.51.100.77" },
+])("refuses a fresh Lightsail allocation when the original is $label", async ({ attachedTo, arn, ipAddress, currentIp }) => {
+  const allocations: string[] = [];
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "GetInstanceCommand") return { instance: { ...instance, isStaticIp: true, publicIpAddress: currentIp } };
+    if (c.constructor.name === "GetStaticIpCommand") {
+      if (c.input.staticIpName !== "old-static") throw Object.assign(new Error("absent"), { name: "NotFoundException" });
+      return { staticIp: { name: "old-static", arn, ipAddress, attachedTo } };
+    }
+    allocations.push(c.constructor.name); return { operations: [{ id: "unexpected", status: "Started" }] };
+  });
+  await expect(cloud.execute(plan()[0]!)).rejects.toBeInstanceOf(providers.CloudError);
+  expect(allocations).toEqual([]);
+});
+
+it("recovers the receipted Lightsail allocation after original detachment without allocating again", async () => {
+  const step = plan()[0]!;
+  step.arguments.receipt = { allocationId: "masterdns-attempt-1", resourceId: "arn:static:candidate", candidateAddress: "198.51.100.2" };
+  const allocations: string[] = [];
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "GetInstanceCommand") return { instance: { ...instance, isStaticIp: false, publicIpAddress: "198.51.100.77" } };
+    if (c.constructor.name === "GetStaticIpCommand") return { staticIp: { name: "masterdns-attempt-1", arn: "arn:static:candidate", ipAddress: "198.51.100.2" } };
+    allocations.push(c.constructor.name); return {};
+  });
+  await expect(cloud.execute(step)).resolves.toMatchObject({ resourceId: "arn:static:candidate" });
+  expect(allocations).toEqual([]);
 });
