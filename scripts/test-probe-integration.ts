@@ -6,8 +6,9 @@ const api = resolve(__dirname, '../apps/api');
 const apiRequire = createRequire(resolve(api, 'package.json'));
 const focused = process.argv.includes('--closed-loop');
 const files = focused ? ['../../tests/integration/probe-rotation.test.ts'] : ['test/probe-binary-integration.ts', '../../tests/integration/probe-rotation.test.ts'];
-for (const file of files) {
-  const result = spawnSync(process.execPath, ['--import', apiRequire.resolve('tsx'), file], {
+const checks = [['--test', 'test/integration-process.test.ts', 'test/rotation-remote.test.ts'], ...files.map(file => [file])];
+for (const args of checks) {
+  const result = spawnSync(process.execPath, ['--import', apiRequire.resolve('tsx'), ...args], {
     cwd: api,
     stdio: 'inherit',
     env: { ...process.env, TSX_TSCONFIG_PATH: resolve(api, 'test/tsconfig.integration.json') },

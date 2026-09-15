@@ -6,6 +6,8 @@ export async function remoteControlPlane() {
   const instances = new Map<string, any>();
   const allocations: any[] = [];
   const events: string[] = [];
+  const mutations: Array<{ name: string; input: any }> = [];
+  const reads = new Set(['GetCallerIdentityCommand', 'DescribeInstancesCommand', 'DescribeNetworkInterfacesCommand', 'DescribeAddressesCommand', 'dns.list', 'dns.get', 'checkpoint.cleanup']);
   const records = new Map<string, any>();
   let recordSequence = 0;
   let crashOccurrence = 1;
@@ -49,6 +51,8 @@ export async function remoteControlPlane() {
     try {
       let body = ''; for await (const chunk of req) body += chunk;
       const { name, input } = JSON.parse(body);
+      // Journal attempted writes before fake admission, failpoints or effects, including rejected requests.
+      if (!reads.has(name)) mutations.push({ name, input: structuredClone(input) });
       const shouldCrash = name === crashAt && --crashOccurrence === 0;
       if (shouldCrash && crashBeforeEffect) { crashAt = undefined; crashed?.(); return; }
       let result;
@@ -65,7 +69,7 @@ export async function remoteControlPlane() {
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   const address = server.address(); assert(address && typeof address !== 'string');
-  return { url: `http://127.0.0.1:${address.port}`, add, instances, allocations, records, events,
+  return { url: `http://127.0.0.1:${address.port}`, add, instances, allocations, records, events, mutations,
     get writesToUnmanaged() { return writesToUnmanaged; },
     failAt(name: string, occurrence = 1, beforeEffect = false) { crashAt = name; crashOccurrence = occurrence; crashBeforeEffect = beforeEffect; return new Promise<void>(resolve => { crashed = resolve; }); },
     close: async () => { server.closeAllConnections(); await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())); },

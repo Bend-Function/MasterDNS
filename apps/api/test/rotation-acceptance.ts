@@ -1,6 +1,5 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { Redis } from 'ioredis';
@@ -8,27 +7,24 @@ import { desc, eq } from 'drizzle-orm';
 import { addressHealthPolicies, addressHealthStates, captureCloudPolicyLinks, prepareCloudPolicyRestore, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, cloudEndpointLinks, domainBindings, endpointPools, endpoints, endpointAddresses, bindingAssignments, providerAccounts, zones, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, probeObservations, probeRounds, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPolicies, rotationPublications, rotationResources, operationSteps, operations, dnsRecords, rotationSteps } from '@masterdns/db';
 import { createIntegrationHarness, cleanup, until } from './rotation-harness.js';
 import { assertRecoveredCloudEffect } from '../../../tests/integration/rotation-recovery.test.js';
+import { runProcess, redact } from './integration-process.js';
 import { remoteControlPlane } from './rotation-remote.js';
+
+const OLD_DNS_TTL = 120;
+const NEW_DNS_TTL = 60;
+const CLEANUP_GRACE_SECONDS = 60;
 
 let harness!: Awaited<ReturnType<typeof createIntegrationHarness>>;
 let remote!: Awaited<ReturnType<typeof remoteControlPlane>>;
-const activeChildren = new Set<ReturnType<typeof spawn>>();
 async function child(action: string, incidentId?: string, turns = 1, crash?: string, extra: Record<string, unknown> = {}) {
   const settings = { ...extra, action, incidentId, turns, databaseUrl: harness.databaseUrl, redisUrl: harness.redisUrl, remoteUrl: remote.url };
   const env = { PATH: process.env.PATH, HOME: process.env.HOME, TSX_TSCONFIG_PATH: new URL('./tsconfig.integration.json', import.meta.url).pathname, MASTERDNS_INTEGRATION_CHILD: JSON.stringify(settings) };
   const failpoint = crash ? remote.failAt(crash, crash === 'dns.create' ? 2 : 1, crash === 'dns.create') : undefined;
-  // Spawn the Node process itself so SIGKILL cannot leave a pnpm/tsx grandchild alive.
-  const processChild = spawn(process.execPath, ['--import', 'tsx', 'test/rotation-child.ts'], { cwd: new URL('../', import.meta.url), env, stdio: ['ignore', 'pipe', 'pipe'] });
-  activeChildren.add(processChild);
-  let output = ''; processChild.stdout.on('data', chunk => { output += chunk; }); processChild.stderr.on('data', chunk => { output += chunk; });
-  const closed = new Promise<{ code: number | null; signal: string | null }>((resolve, reject) => { processChild.once('error', reject); processChild.once('close', (code, signal) => { activeChildren.delete(processChild); resolve({ code, signal }); }); });
-  const timer = setTimeout(() => processChild.kill('SIGKILL'), 40_000);
-  try {
-    if (failpoint) { await Promise.race([failpoint, closed.then(() => { throw new Error(`Child exited before ${crash}: ${output}`); })]); processChild.kill('SIGKILL'); }
-    const result = await closed;
-    for (const secret of [harness.databaseUrl, new URL(harness.databaseUrl).password].filter(Boolean)) assert(!output.includes(secret), 'worker output contains a database credential');
-    if (crash) assert.equal(result.signal, 'SIGKILL'); else assert.equal(result.code, 0, output);
-  } finally { clearTimeout(timer); }
+  // Spawn Node directly; the shared capture owns termination, redaction and secret detection.
+  await runProcess(process.execPath, ['--import', 'tsx', 'test/rotation-child.ts'], { secrets: [...harness.secrets, harness.databaseUrl], output: harness.output }, {
+    cwd: new URL('../', import.meta.url), env, timeoutMs: 40_000,
+    ...(failpoint ? { failpoint: { label: crash!, reached: failpoint } } : {}),
+  });
 }
 async function fixture(initial = false, release = false) {
   const { db, actor, group } = harness;
@@ -49,7 +45,18 @@ async function fixture(initial = false, release = false) {
   await db.insert(cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId: slot!.id, family: '4' });
   const [provider] = await db.insert(providerAccounts).values({ ownerUserId: actor.id, provider: 'cloudflare', name: randomUUID(), credentialCiphertext: 'test-only', credentialIv: 'test-only', credentialTag: 'test-only' }).returning();
   const [zone] = await db.insert(zones).values({ providerAccountId: provider!.id, externalId: randomUUID(), nameAscii: 'isolated.test' }).returning();
-  const bindings = await db.insert(domainBindings).values(['one', 'two'].map(name => ({ poolId: pool!.id, zoneId: zone!.id, fqdn: `${name}.isolated.test`, recordType: 'A', ttl: 2 }))).returning();
+  const bindings = await db.insert(domainBindings).values(['one', 'two'].map(name => ({ poolId: pool!.id, zoneId: zone!.id, fqdn: `${name}.isolated.test`, recordType: 'A', ttl: NEW_DNS_TTL }))).returning();
+  if (release) {
+    // Independent old published state: the pending binding requests a shorter, valid new TTL.
+    await db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: '4', address: old, source: 'cloud', state: 'current', healthState: 'healthy' });
+    await db.update(endpoints).set({ healthState: 'healthy' }).where(eq(endpoints.id, endpoint!.id));
+    for (const binding of bindings) {
+      const recordId = `old-dns-${binding.id}`;
+      remote.records.set(recordId, { id: recordId, zone_id: zone!.externalId, type: 'A', name: binding.fqdn, content: old, ttl: OLD_DNS_TTL });
+      const [record] = await db.insert(dnsRecords).values({ zoneId: zone!.id, externalId: recordId, type: 'A', name: binding.fqdn, content: old, ttl: OLD_DNS_TTL, management: 'managed', managedByPoolId: pool!.id, remoteHash: 'seeded-before-rotation' }).returning();
+      await db.insert(bindingAssignments).values({ domainBindingId: binding.id, endpointId: endpoint!.id, dnsRecordId: record!.id, desired: true, applied: true, reason: 'existing-publication' });
+    }
+  }
   remote.add(instance!.externalId, iface!.externalId, old, candidate);
   remote.instances.get(instance!.externalId).slotId = slot!.id;
   return { stopTcp: targets.stopTcp, pool: pool!, endpoint: endpoint!, zone: zone!, bindings, slot: slot!, policy: policy!, config: config!, instance: instance!, old, candidate };
@@ -118,12 +125,22 @@ async function main() {
       assert.equal([...remote.records.values()].filter(r => r.zone_id === f.zone.externalId).length, 1);
       const [op] = await db.select().from(operations).where(eq(operations.resourceId, f.pool.id)); assert(op);
       const steps = await db.select().from(operationSteps).where(eq(operationSteps.operationId, op.id));
-      assert.equal(steps.filter(s => s.status === 'succeeded').length, 1);
+      const succeeded = steps.filter(s => s.status === 'succeeded'); assert.equal(succeeded.length, 1);
+      const originalSuccess = { id: succeeded[0]!.id, status: succeeded[0]!.status, attempts: succeeded[0]!.attempts };
+      const missing = steps.find(s => s.status !== 'succeeded')!;
+      const requestsBeforeRestart = remote.mutations.length;
       const [p] = await db.select().from(rotationPublications).where(eq(rotationPublications.slotId, f.slot.id)); assert.notEqual(p!.status, 'applied');
       const redis = new Redis(harness.redisUrl);
       try { for (const key of [`masterdns:operation-lock:${op.id}`, `masterdns:zone-lock:${f.zone.id}`]) await redis.pexpire(key, 1); } finally { await redis.quit(); }
       await delay(5);
       await child('publish', incidentId, 1, undefined, { slotId: f.slot.id });
+      const [sameStep] = await db.select().from(operationSteps).where(eq(operationSteps.id, originalSuccess.id)); assert(sameStep);
+      assert.deepEqual({ id: sameStep.id, status: sameStep.status, attempts: sameStep.attempts }, originalSuccess);
+      const retriedWrites = remote.mutations.slice(requestsBeforeRestart);
+      assert.equal(retriedWrites.length, 1, 'restart must attempt only the missing DNS write, including rejected requests');
+      assert.equal(retriedWrites[0]!.name, 'dns.create');
+      assert.equal(retriedWrites[0]!.input.zone_id, f.zone.externalId);
+      assert.equal(retriedWrites[0]!.input.name, (missing.input.record as { name: string }).name);
       assert.equal([...remote.records.values()].filter(r => r.zone_id === f.zone.externalId).length, 2);
       assert.equal(remote.events.filter(e => e === 'cloud_allocated').length, cloudBefore);
       console.log('PASS: SIGKILL after first DNS step retains its success and restarts the remaining step without duplicate create/allocation');
@@ -164,7 +181,11 @@ async function main() {
   assert(cleanupCase);
   const [old] = (await db.select().from(rotationResources).where(eq(rotationResources.incidentId, cleanupCase.incident.id))).filter(r => r.role === 'original'); assert(old?.cleanupDueAt);
   assert.equal(old.cleanupStatus, 'pending');
-  assert(old.cleanupDueAt.getTime() >= cleanupCase.publication.appliedAt!.getTime() + (cleanupCase.publication.previousMaxTtl + 60) * 1000);
+  assert.equal(cleanupCase.publication.previousMaxTtl, OLD_DNS_TTL, 'the old published TTL wins over the shorter new binding TTL');
+  assert.equal(old.cleanupDueAt.getTime(), cleanupCase.publication.appliedAt!.getTime() + (OLD_DNS_TTL + CLEANUP_GRACE_SECONDS) * 1000);
+  const retainedAllocation = structuredClone(remote.allocations.find(a => a.PublicIp === cleanupCase.f.candidate)); assert(retainedAllocation);
+  const retainedInterface = structuredClone(remote.instances.get(cleanupCase.f.instance.externalId).eni);
+  const cleanupRequestsStart = remote.mutations.length;
   await child('cleanup'); assert.equal(remote.events.filter(e => e === 'cloud_released').length, 0, 'grace period prevents early cleanup after restart');
   const initial = await fixture(true);
   for (let i = 0; i < 3; i++) await round(initial, 'success');
@@ -194,7 +215,11 @@ async function main() {
   assert.equal((await db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, initial.slot.id))).length, 0);
   console.log('PASS: three actual failures during same-address restore revalidation atomically fan out to Pool health and publish the independently verified backup with rotation off');
   console.log('Waiting for the persisted old DNS TTL + 60 second cleanup grace');
-  await delay(Math.max(0, old.cleanupDueAt.getTime() - Date.now() + 100));
+  while (Date.now() <= old.cleanupDueAt.getTime()) {
+    const remaining = old.cleanupDueAt.getTime() - Date.now() + 100;
+    console.log(`Cleanup grace remaining: ${Math.ceil(remaining / 1000)} seconds`);
+    await delay(Math.min(remaining, 30_000));
+  }
   await child('cleanup', undefined, 1, 'ReleaseAddressCommand');
   assert.equal(remote.events.filter(e => e === 'cloud_released').length, 1);
   await db.update(rotationLeases).set({ expiresAt: new Date(0) }).where(eq(rotationLeases.physicalKey, cleanupCase.incident.physicalKey));
@@ -203,13 +228,18 @@ async function main() {
   assert.equal((await db.select().from(rotationIncidents).where(eq(rotationIncidents.id, cleanupCase.incident.id)))[0]!.status, 'complete');
   assert.equal(remote.events.filter(e => e === 'cloud_released').length, 1);
   assert.equal((await db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, cleanupCase.incident.id)))[0]!.attemptsUsed, 1);
+  const releaseRequests = remote.mutations.filter(m => m.name === 'ReleaseAddressCommand' || m.name.includes('Unassign'));
+  assert.deepEqual(releaseRequests.map(m => ({ name: m.name, allocation: m.input.AllocationId })), [{ name: 'ReleaseAddressCommand', allocation: old.allocationId }]);
+  const cleanupCloudRequests = remote.mutations.slice(cleanupRequestsStart).filter(m => !m.name.startsWith('dns.'));
+  assert.deepEqual(cleanupCloudRequests, releaseRequests, 'no other cloud mutation may be attempted during cleanup');
+  assert.deepEqual(remote.allocations.find(a => a.AllocationId === retainedAllocation.AllocationId), retainedAllocation, 'the current allocation remains attached and intact');
+  assert.deepEqual(remote.instances.get(cleanupCase.f.instance.externalId).eni, retainedInterface, 'the current interface/address remains intact');
   assert.equal(remote.writesToUnmanaged, 0);
   console.log('PASS: restart before cleanup honors real TTL grace; SIGKILL after release observes its receipt without repeated release or budget reset');
   console.log('P12b full Agent/cloud/DNS closed loop and child crash recovery passed.');
   await harness.assertSecretFree();
 }
-try { await main(); } catch (error) { console.error(error); process.exitCode = 1; }
+try { await main(); } catch (error) { console.error(harness ? harness.redact(String(error)) : redact(String(error), [process.env.MASTERDNS_TEST_DATABASE_URL ?? ''])); process.exitCode = 1; }
 finally {
-  await Promise.all([...activeChildren].map(p => new Promise<void>(resolve => { p.once('close', () => resolve()); p.kill('SIGKILL'); })));
   try { await remote?.close(); } finally { await cleanup(); }
 }

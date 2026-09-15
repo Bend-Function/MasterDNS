@@ -21,7 +21,7 @@ The image must be cached; the harness never silently pulls it. The test database
 
 Podman containers reach the host's ephemeral Nest HTTPS listener using `host.containers.internal`. That name must resolve and route to the host. The listener binds `0.0.0.0` on a random port only for the run; probe targets have no published host ports. Each target address is authorized by an exact `/32` or `/128` in both the platform task and local Agent config. Production loopback/metadata rejection is unchanged.
 
-Private CA material and protected Agent configuration/token files live in a private temporary directory and owned containers. The Agent trusts the platform via `caFile` and the target via container-only `SSL_CERT_FILE`; no host CA installation is performed. Installation tokens enter the actual binary's `enroll` command through stdin. Database/cloud environment variables are not forwarded into containers. Subprocess output is captured, checked for generated credentials, and redacted before errors are displayed.
+Private CA material and protected Agent configuration/token files live in a private temporary directory and owned containers. The Agent trusts the platform via `caFile` and the target via container-only `SSL_CERT_FILE`; no host CA installation is performed. Installation tokens enter the actual binary's `enroll` command through stdin. Database/cloud environment variables are not forwarded into containers. Shared P12a/P12b lifecycle helpers capture subprocess output, check it for generated credentials, and redact it before errors are displayed. A focused real-child regression covers secret-bearing early exit before a failpoint as well as ordinary zero/nonzero exits.
 
 ## Assertions
 

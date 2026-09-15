@@ -1,31 +1,21 @@
 import 'reflect-metadata';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmod, copyFile, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { request } from 'node:https';
+import { chmod, mkdtemp, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { Module } from '@nestjs/common';
-import { NestFactory, Reflector } from '@nestjs/core';
-import { FastifyAdapter, type NestFastifyApplication } from '@nestjs/platform-fastify';
-import cookie from '@fastify/cookie';
+import type { NestFastifyApplication } from '@nestjs/platform-fastify';
 import { migrate } from 'drizzle-orm/postgres-js/migrator';
 import { eq } from 'drizzle-orm';
 import { ZodError } from 'zod';
-import { createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeAgents, probeObservations, probeTasks } from '@masterdns/db';
-import { healthCheckConfigSchema, resultBatchSchema, type ProbeResult, type ProbeTask } from '@masterdns/contracts';
-import { AuthGuard } from '../src/auth/auth.guard.js';
-import type { AuthUser } from '../src/auth/auth.types.js';
-import { ApiExceptionFilter } from '../src/common/api-exception.filter.js';
-import { ProbeAgentController } from '../src/modules/probes/probe-agent.controller.js';
-import { ProbeAgentAuth } from '../src/modules/probes/probe-agent-auth.js';
-import { ProbeLeasesService } from '../src/modules/probes/probe-leases.service.js';
-import { ProbeResultsService } from '../src/modules/probes/probe-results.service.js';
+import { createDatabase, endpoints, endpointAddresses, healthCheckConfigs, probeAgents, probeObservations, probeTasks } from '@masterdns/db';
+import { healthCheckConfigSchema, type ProbeResult, type ProbeTask } from '@masterdns/contracts';
 import { ProbeRoundsService } from '../src/modules/probes/probe-rounds.service.js';
-import { ProbesService } from '../src/modules/probes/probes.service.js';
+
+import { runProcess, redact as redactText, assertSecretFree } from './integration-process.js';
+import { until, prepareAgentFiles, bootstrapProbeApi, postProbeJson, enrollAgent, cleanupOwned } from './integration-lifecycle.js';
 
 const root = fileURLToPath(new URL('../../../', import.meta.url));
 const image = 'docker.io/library/node:22-alpine';
@@ -40,43 +30,9 @@ let admin: ReturnType<typeof createDatabase> | undefined;
 let connection: ReturnType<typeof createDatabase> | undefined;
 let app: NestFastifyApplication | undefined;
 
-function redact(value: string) {
-  return secrets.filter(Boolean).reduce((text, secret) => text.replaceAll(secret, '[redacted]'), value);
-}
-
-// Podman inherits only transport/runtime settings. No cloud, database or caller auth environment
-// enters either container. Tokens are supplied to enroll through stdin, never command arguments.
-async function command(program: string, args: string[], input?: string) {
-  const env = Object.fromEntries(['PATH', 'HOME', 'TMPDIR', 'XDG_RUNTIME_DIR', 'CONTAINER_HOST', 'CONTAINER_CONNECTION', 'DOCKER_HOST', 'SSH_AUTH_SOCK']
-    .flatMap(key => process.env[key] ? [[key, process.env[key]!]] : []));
-  return new Promise<string>((resolve, reject) => {
-    const child = spawn(program, args, { env, stdio: ['pipe', 'pipe', 'pipe'] });
-    let text = '';
-    const timer = setTimeout(() => child.kill('SIGKILL'), 60_000);
-    child.stdout.on('data', chunk => { text += chunk; });
-    child.stderr.on('data', chunk => { text += chunk; });
-    child.on('error', error => { clearTimeout(timer); reject(error); });
-    child.on('close', code => {
-      clearTimeout(timer);
-      output.push(text);
-      if (code === 0) resolve(text.trim());
-      else reject(new Error(`${program} ${args[0]} exited ${code}: ${redact(text)}`));
-    });
-    child.stdin.on('error', () => {});
-    child.stdin.end(input);
-  });
-}
+const redact = (value: string) => redactText(value, secrets);
+const command = (program: string, args: string[], input?: string) => runProcess(program, args, { secrets, output }, input === undefined ? {} : { input });
 const podman = (...args: string[]) => command('podman', args);
-
-async function until<T>(label: string, check: () => Promise<T | undefined | false>, timeout = 15_000): Promise<T> {
-  const deadline = Date.now() + timeout;
-  do {
-    const result = await check();
-    if (result) return result;
-    await delay(100);
-  } while (Date.now() < deadline);
-  throw new Error(`Timed out: ${label}`);
-}
 
 async function main() {
   const binary = process.env.MASTERDNS_TEST_AGENT_BINARY;
@@ -89,19 +45,7 @@ async function main() {
   await podman('image', 'exists', image);
   directory = await mkdtemp(join(tmpdir(), 'masterdns-probe-'));
   await chmod(directory, 0o700);
-  await copyFile(resolve(binary), join(directory, 'agent'));
-  await chmod(join(directory, 'agent'), 0o700);
-  await copyFile(join(root, 'tests/integration/probe-target.cjs'), join(directory, 'target.cjs'));
-  await command('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=MasterDNS integration CA', '-keyout', join(directory, 'ca.key'), '-out', join(directory, 'ca.crt')]);
-  await command('openssl', ['req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=probe-target.test', '-keyout', join(directory, 'server.key'), '-out', join(directory, 'server.csr')]);
-  await writeFile(join(directory, 'extensions'), 'subjectAltName=DNS:host.containers.internal,DNS:probe-target.test,DNS:localhost\nextendedKeyUsage=serverAuth\n');
-  await command('openssl', ['x509', '-req', '-days', '1', '-in', join(directory, 'server.csr'), '-CA', join(directory, 'ca.crt'), '-CAkey', join(directory, 'ca.key'), '-CAcreateserial', '-extfile', join(directory, 'extensions'), '-out', join(directory, 'server.crt')]);
-  for (const name of ['ca.key', 'server.key']) await chmod(join(directory, name), 0o600);
-  const key = await readFile(join(directory, 'server.key'));
-  const cert = await readFile(join(directory, 'server.crt'));
-  const ca = await readFile(join(directory, 'ca.crt'));
-  // The CA signing key stays on the host and is no longer needed after issuing this test certificate.
-  await rm(join(directory, 'ca.key'));
+  const { key, cert, ca } = await prepareAgentFiles(directory, binary, root, command);
 
   await podman('network', 'create', '--ipv6', id);
   networkCreated = true;
@@ -124,40 +68,10 @@ async function main() {
   connection = createDatabase(testUrl.toString());
   await migrate(connection.db, { migrationsFolder: join(root, 'packages/db/drizzle') });
   const db = connection.db;
-  const database = { db } as never;
-  const management = new ProbesService(database);
-  const auth = new ProbeAgentAuth(database);
-  const leases = new ProbeLeasesService(database);
-  const results = new ProbeResultsService(database);
+  const api = await bootstrapProbeApi(db, id, { key, cert });
+  app = api.app;
+  const { database, management, port, calls, submitted, actor, probe, group, pool } = api;
   const rounds = new ProbeRoundsService(database);
-  @Module({ controllers: [ProbeAgentController], providers: [
-    { provide: ProbeAgentAuth, useValue: auth }, { provide: ProbesService, useValue: management },
-    { provide: ProbeLeasesService, useValue: leases }, { provide: ProbeResultsService, useValue: results },
-  ] }) class IntegrationModule {}
-  app = await NestFactory.create<NestFastifyApplication>(IntegrationModule, new FastifyAdapter({ https: { key, cert } }), { logger: false });
-  await app.register(cookie);
-  app.setGlobalPrefix('api');
-  app.useGlobalFilters(new ApiExceptionFilter());
-  app.useGlobalGuards(new AuthGuard(new Reflector(), database));
-  const calls: string[] = [];
-  const submitted: ProbeResult[] = [];
-  app.getHttpAdapter().getInstance().addHook('preHandler', async req => {
-    calls.push(req.url);
-    if (req.url.endsWith('/results')) {
-      const batch = resultBatchSchema.safeParse(req.body);
-      if (batch.success) submitted.push(...batch.data.results);
-    }
-  });
-  await app.listen(0, '0.0.0.0');
-  const bound = app.getHttpServer().address();
-  assert(bound && typeof bound !== 'string');
-  const port = bound.port;
-  const [user] = await db.insert(users).values({ username: id, passwordHash: 'integration-only', role: 'admin' }).returning();
-  const actor = { id: user!.id, role: 'admin' } as AuthUser;
-  const probe = await management.create(actor, { name: id, maxConcurrency: 4 });
-  const group = await management.createGroup(actor, { name: id });
-  await management.setMembers(actor, group.id, [probe.id]);
-  const [pool] = await db.insert(endpointPools).values({ ownerUserId: actor.id, name: id, strategy: 'primary_backup' }).returning();
 
   async function createRound(family: 4 | 6, address: string, config: ProbeTask['config'], lifetime = 10_000, allow = true) {
     const [endpoint] = await db.insert(endpoints).values({ poolId: pool!.id, name: randomUUID() }).returning();
@@ -170,48 +84,11 @@ async function main() {
     return until('persisted binary observation', async () => (await db.select().from(probeObservations).where(eq(probeObservations.roundId, roundId)))[0]);
   }
   let runtimeToken = '';
-  async function post(path: string, body: unknown, token = runtimeToken) {
-    return new Promise<{ status: number; body: any }>((resolve, reject) => {
-      const req = request({ host: '127.0.0.1', port, servername: 'localhost', ca, method: 'POST', path: `/api/v1/probe-agent/${path}`, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) } }, res => {
-        let data = '';
-        res.on('data', chunk => { data += chunk; });
-        res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(data) }));
-      });
-      req.setTimeout(5000, () => req.destroy(new Error('HTTPS request timeout')));
-      req.on('error', reject);
-      req.end(JSON.stringify(body));
-    });
-  }
+  const post = (path: string, body: unknown, token = runtimeToken) => postProbeJson(port, ca, path, body, token, secrets);
 
-  const agent = `${id}_agent`;
-  await podman('create', '--name', agent, '--network', id, '--env', 'SSL_CERT_FILE=/test/ca.crt', image, '/test/agent', 'run', '--config', '/test/config.json');
-  containers.push(agent);
-  const config = { serverUrl: `https://host.containers.internal:${port}`, caFile: '/test/ca.crt', tokenFile: '/test/token', stateDir: '/test/state', maxConcurrency: 4, allowIpv4: true, allowIpv6: true, allowedPrivateCidrs: [] as string[] };
-  await writeFile(join(directory, 'config.json'), JSON.stringify(config), { mode: 0o600 });
-  await podman('cp', `${directory}/.`, `${agent}:/test`);
-  // Enrollment executes the supplied binary before its persistent run process starts.
-  const enroll = `${id}_enroll`;
-  await podman('create', '--name', enroll, '--network', id, image, 'sleep', 'infinity');
-  containers.push(enroll);
-  await podman('cp', `${directory}/.`, `${enroll}:/test`);
-  await podman('start', enroll);
-  const versionOutput = await podman('exec', enroll, '/test/agent', 'version');
-  // A7 prints the product and build commit; heartbeat carries only the version. Accept A6's bare version too.
-  const version = /^masterdns-agent (\S+) \([^)]+\)$/.exec(versionOutput)?.[1] ?? versionOutput;
-  console.log(`Agent version: ${versionOutput}`);
-  const install = await management.createInstallToken(actor, probe.id);
-  secrets.push(install.installToken);
-  await command('podman', ['exec', '-i', enroll, '/test/agent', 'enroll', '--config', '/test/config.json'], `${install.installToken}\n`);
-  await podman('cp', `${enroll}:/test/config.json`, join(directory, 'config.json'));
-  await podman('cp', `${enroll}:/test/token`, join(directory, 'token'));
-  runtimeToken = (await readFile(join(directory, 'token'), 'utf8')).trim();
-  secrets.push(runtimeToken);
-  assert.equal((await stat(join(directory, 'token'))).mode & 0o077, 0, 'enrollment token permissions');
-  const enrolled = JSON.parse(await readFile(join(directory, 'config.json'), 'utf8'));
-  assert.equal(enrolled.probeId, probe.id);
-  assert.equal((await post('exchange', { installToken: install.installToken }, '')).status, 401, 'install token is single use');
-  await podman('cp', join(directory, 'config.json'), `${agent}:/test/config.json`);
-  await podman('cp', join(directory, 'token'), `${agent}:/test/token`);
+  const enrollment = await enrollAgent({ id, image, directory, port, cidrs: [], containers, secrets, command, management, actor, probeId: probe.id, post });
+  const { agent, enrolled, version } = enrollment;
+  runtimeToken = enrollment.runtimeToken;
 
   await assert.rejects(createRound(4, targets[0]!.address, { type: 'tcp', port: 18080, timeoutMs: 1000 }, 10_000, false),
     (error: unknown) => error instanceof ZodError && error.issues.some(issue => issue.code === 'custom' && issue.path[0] === 'address' && issue.message.includes('private allowlist')),
@@ -299,23 +176,13 @@ async function main() {
   assert.equal((await db.select().from(probeTasks).where(eq(probeTasks.id, recorded.taskId)))[0]!.status, 'accepted');
   console.log('PASS: revoke rejects lease/results and binary exits 3 without continued polling');
   for (const container of containers) await podman('logs', container);
-  for (const secret of secrets.filter(Boolean)) assert(!output.join('\n').includes(secret), 'subprocess output contains a secret');
+  assertSecretFree(output.join('\n'), secrets);
   console.log('PASS: subprocess output contains no installation/runtime token or database credential');
   console.log('P12a protocol integration passed. The combined entry runs P12b closed-loop and crash recovery next.');
 }
 
 async function cleanup() {
-  const failures: unknown[] = [];
-  async function attempt(run: () => Promise<unknown>) { try { await run(); } catch (error) { failures.push(error); } }
-  for (const name of containers.toReversed()) await attempt(() => podman('rm', '--force', '--time', '1', name));
-  if (networkCreated) await attempt(() => podman('network', 'rm', id));
-  if (app) await attempt(() => app!.close());
-  if (connection) await attempt(() => connection!.close());
-  if (databaseCreated && admin) await attempt(() => admin!.client.unsafe(`drop database "${id}"`));
-  if (admin) await attempt(() => admin!.close());
-  if (directory) await attempt(() => rm(directory!, { recursive: true, force: true }));
-  if (failures.length) throw new Error(`Cleanup failed for owned resources ${id}: ${failures.map(String).join('; ')}`);
-  console.log('Cleanup: owned containers, network, database and temporary files removed');
+  await cleanupOwned({ containers, networkCreated, id, app, connection, admin, databaseCreated, directory }, command, secrets);
 }
 
 try { await main(); }
