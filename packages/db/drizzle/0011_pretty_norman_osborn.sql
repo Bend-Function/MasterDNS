@@ -137,7 +137,8 @@ ALTER TABLE "managed_address_slots" ADD CONSTRAINT "managed_address_slots_interf
 ALTER TABLE "managed_address_slots" ADD CONSTRAINT "managed_slots_current_host_fk" FOREIGN KEY ("current_address_id","interface_id","family","current_address_kind") REFERENCES "public"."cloud_addresses"("id","interface_id","family","kind") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 ALTER TABLE "managed_address_slots" ADD CONSTRAINT "managed_slots_candidate_host_fk" FOREIGN KEY ("candidate_address_id","interface_id","family","candidate_address_kind") REFERENCES "public"."cloud_addresses"("id","interface_id","family","kind") ON DELETE restrict ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "cloud_accounts_owner_idx" ON "cloud_accounts" USING btree ("owner_user_id");--> statement-breakpoint
-CREATE UNIQUE INDEX "cloud_addresses_identity_unique" ON "cloud_addresses" USING btree ("interface_id","kind","family","address","prefix_length");--> statement-breakpoint
+CREATE UNIQUE INDEX "cloud_addresses_host_identity_unique" ON "cloud_addresses" USING btree ("interface_id","family","address") WHERE "cloud_addresses"."kind" = 'host';--> statement-breakpoint
+CREATE UNIQUE INDEX "cloud_addresses_prefix_identity_unique" ON "cloud_addresses" USING btree ("interface_id","family","address","prefix_length") WHERE "cloud_addresses"."kind" = 'prefix';--> statement-breakpoint
 CREATE UNIQUE INDEX "cloud_endpoint_links_endpoint_family_unique" ON "cloud_endpoint_links" USING btree ("endpoint_id","family");--> statement-breakpoint
 CREATE UNIQUE INDEX "cloud_instances_identity_unique" ON "cloud_instances" USING btree ("account_id","service","region","external_id");--> statement-breakpoint
 CREATE INDEX "cloud_instances_scan_idx" ON "cloud_instances" USING btree ("account_id","service","region","scan_generation");--> statement-breakpoint

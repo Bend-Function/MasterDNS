@@ -55,7 +55,7 @@ const policySnapshotSchema = z.object({
   endpoints: z.array(z.object({
     id: z.string().uuid(),
     name: z.string().min(1).max(120),
-    addressMode: z.enum(["static", "ddns"]),
+    addressMode: z.enum(["static", "ddns", "cloud"]),
     priority: z.number().int().nonnegative(),
     lifecycle: z.enum(["enabled", "disabled", "maintenance", "draining"]),
   })),
@@ -64,7 +64,7 @@ const policySnapshotSchema = z.object({
     family: z.enum(["4", "6"]),
     address: z.string().min(1),
     state: z.enum(["candidate", "current", "previous"]),
-    source: z.enum(["static", "ddns"]),
+    source: z.enum(["static", "ddns", "cloud"]),
   })).default([]),
   bindings: z.array(z.object({
     id: z.string().uuid(),
@@ -91,6 +91,10 @@ type PolicySnapshot = z.infer<typeof policySnapshotSchema>;
 type DatabaseTransaction = Parameters<Parameters<DatabaseService["db"]["transaction"]>[0]>[0];
 
 export function validateRestorablePolicySnapshot(snapshot: PolicySnapshot, poolId: string) {
+  if (snapshot.endpoints.some((endpoint) => endpoint.addressMode === "cloud")
+    || snapshot.addresses.some((address) => address.source === "cloud")) {
+    throw new ConflictException("Cloud 节点策略回滚暂不支持；请使用云地址槽位管理流程");
+  }
   const endpointIds = new Set(snapshot.endpoints.map((endpoint) => endpoint.id));
   const bindingIds = new Set(snapshot.bindings.map((binding) => binding.id));
   for (const endpoint of snapshot.endpoints) {
@@ -416,6 +420,11 @@ export class PoolsService {
         eq(endpoints.poolId, poolId),
       )).limit(1).for("update");
       if (!lockedEndpoint) throw new NotFoundException("节点不存在");
+
+      const requestedMode: string | undefined = addressMode;
+      if (requestedMode && (requestedMode === "cloud" || lockedEndpoint.addressMode === "cloud")) {
+        throw new ConflictException("Cloud 节点地址模式只能通过云地址槽位管理流程变更");
+      }
 
       const convertingToStatic = lockedEndpoint.addressMode === "ddns" && addressMode === "static";
       let addressChanged = false;

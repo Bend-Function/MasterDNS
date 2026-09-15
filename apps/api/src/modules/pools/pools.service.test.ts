@@ -76,9 +76,54 @@ describe("PoolsService DDNS to static conversion", () => {
       forceApply: false,
     })).rejects.toBeInstanceOf(ConflictException);
   });
+
+  it("rejects generic conversion from cloud before adopting stale addresses", async () => {
+    const endpoint = { id: endpointId, poolId, addressMode: "cloud" as const, name: "edge" };
+    const updateCalls: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const insertCalls: Array<{ table: unknown; values: Record<string, unknown> }> = [];
+    const tx = createTransaction(endpoint, updateCalls, insertCalls);
+    const database = { db: { transaction: vi.fn(async (callback: (value: typeof tx) => unknown) => callback(tx)) } };
+    const service = new PoolsService(database as never, {} as never);
+    vi.spyOn(service as any, "findOwnedPool").mockResolvedValue({ id: poolId });
+    vi.spyOn(service as any, "findEndpoint").mockResolvedValue(endpoint);
+
+    await expect(service.updateEndpoint(actor, poolId, endpointId, {
+      addressMode: "static",
+      ipv4: "192.0.2.42",
+      forceApply: false,
+    })).rejects.toThrow(/cloud/i);
+    expect(updateCalls).toEqual([]);
+    expect(insertCalls).toEqual([]);
+  });
 });
 
 describe("PoolsService policy rollback", () => {
+  it("recognizes cloud snapshots and rejects them before starting a mutation", async () => {
+    const snapshot = { ...restorableSnapshot([]), endpoints: [{
+      id: endpointId,
+      name: "edge",
+      addressMode: "cloud" as const,
+      priority: 100,
+      lifecycle: "enabled" as const,
+    }] };
+    const transaction = vi.fn();
+    const database = {
+      db: {
+        transaction,
+        select: vi.fn(() => ({
+          from: vi.fn(() => ({
+            where: vi.fn(() => ({ limit: vi.fn(async () => [{ poolId, version: 1, snapshot }]) })),
+          })),
+        })),
+      },
+    };
+    const service = new PoolsService(database as never, {} as never);
+    vi.spyOn(service as any, "findOwnedPool").mockResolvedValue({ id: poolId });
+
+    await expect(service.restorePolicyVersion(actor, poolId, 1, { force: false })).rejects.toThrow(/cloud.*暂不支持/i);
+    expect(transaction).not.toHaveBeenCalled();
+  });
+
   it("retires all DDNS active addresses before restoring static addresses", async () => {
     const restoredAt = new Date("2026-07-30T12:00:00.000Z");
     const updateCalls: Array<{ table: unknown; values: Record<string, unknown> }> = [];
@@ -275,7 +320,7 @@ describe("PoolsService durable automation requests", () => {
 });
 
 function createTransaction(
-  endpoint: { id: string; poolId: string; addressMode: "ddns"; name: string },
+  endpoint: { id: string; poolId: string; addressMode: "ddns" | "cloud"; name: string },
   updateCalls: Array<{ table: unknown; values: Record<string, unknown> }>,
   insertCalls: Array<{ table: unknown; values: Record<string, unknown> }>,
 ) {

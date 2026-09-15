@@ -650,8 +650,8 @@
         }
       },
       "indexes": {
-        "cloud_addresses_identity_unique": {
-          "name": "cloud_addresses_identity_unique",
+        "cloud_addresses_host_identity_unique": {
+          "name": "cloud_addresses_host_identity_unique",
           "columns": [
             {
               "expression": "interface_id",
@@ -660,7 +660,29 @@
               "nulls": "last"
             },
             {
-              "expression": "kind",
+              "expression": "family",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "address",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {},
+          "where": "\"cloud_addresses\".\"kind\" = 'host'"
+        },
+        "cloud_addresses_prefix_identity_unique": {
+          "name": "cloud_addresses_prefix_identity_unique",
+          "columns": [
+            {
+              "expression": "interface_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
@@ -687,7 +709,8 @@
           "isUnique": true,
           "concurrently": false,
           "method": "btree",
-          "with": {}
+          "with": {},
+          "where": "\"cloud_addresses\".\"kind\" = 'prefix'"
         },
         "cloud_addresses_slot_reference_unique": {
           "name": "cloud_addresses_slot_reference_unique",

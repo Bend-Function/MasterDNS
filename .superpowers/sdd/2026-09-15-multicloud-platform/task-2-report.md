@@ -34,3 +34,24 @@ Green runs after implementation:
 ## Concerns
 
 - PostgreSQL emits existing identifier-truncation notices for three pre-P2 foreign-key names during fresh migrations; they are unrelated to this task and do not affect migration success.
+
+## Review fix round 1
+
+- Generic endpoint updates again accept only the established DDNS-to-static mode transition. Requests cannot switch into cloud mode, and the service rejects transitions out of a cloud endpoint before address or endpoint writes, preventing stale addresses or DDNS state from being adopted.
+- Policy snapshots recognize cloud endpoint/address source values. Any cloud-bearing snapshot returns `Cloud 节点策略回滚暂不支持；请使用云地址槽位管理流程` before opening the restore transaction, so old cloud IP strings cannot be restored while slot-aware restore remains deferred to P10.
+- Replaced the nullable composite cloud-address identity index with partial unique host and prefix indexes. Duplicate host identities are now rejected regardless of the null `prefix_length`.
+- Added a candidate-address prefix rejection case alongside the existing current-address case.
+
+Red evidence:
+
+- API: 3 focused failures reproduced generic cloud update acceptance/wrong DDNS error, malformed cloud snapshot reporting, and missing pre-transaction capability rejection; 59 other tests passed.
+- DB: the duplicate host insert resolved successfully instead of raising `23505`; 14 other tests passed.
+
+Green evidence:
+
+- `pnpm_config_verify_deps_before_run=false pnpm --filter @masterdns/api test`: 11 files, 62 tests passed.
+- `MASTERDNS_TEST_DATABASE_URL=postgres://masterdns_test:masterdns_test@127.0.0.1:55432/masterdns_test pnpm_config_verify_deps_before_run=false pnpm --filter @masterdns/db test`: 3 files, 15 tests passed, including 9 real PostgreSQL cloud-schema tests.
+- DB and API typechecks passed.
+- `pnpm_config_verify_deps_before_run=false pnpm db:generate`: no schema changes, confirming generated snapshot consistency.
+- Explicit 0010-to-0011 upgrade rerun passed with `oldEndpointMode=static`, enum values `{static,ddns,cloud}`, and active current/candidate uniqueness preserved.
+- `git diff --check`: passed.

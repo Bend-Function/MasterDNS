@@ -96,6 +96,22 @@ describe("cloud schema constraints", () => {
     await expect(sql`insert into managed_address_slots (interface_id, family, name, current_address_id) values (${iface!.id}, '6', 'prefix', ${prefix!.id})`).rejects.toMatchObject({ code: "23503" });
   });
 
+  it("rejects prefix addresses as slot candidate addresses", async () => {
+    const { accountId } = await seedCloud();
+    const [instance] = await sql<{ id: string }[]>`insert into cloud_instances (account_id, service, region, external_id, scan_generation) values (${accountId}, 'ec2', 'ap-southeast-1', 'i-candidate-prefix', 1) returning id`;
+    const [iface] = await sql<{ id: string }[]>`insert into cloud_interfaces (instance_id, external_id, scan_generation) values (${instance!.id}, 'eni-candidate-prefix', 1) returning id`;
+    const [prefix] = await sql<{ id: string }[]>`insert into cloud_addresses (interface_id, kind, family, address, prefix_length, origin, scan_generation) values (${iface!.id}, 'prefix', '4', '198.51.100.0', 24, 'system', 1) returning id`;
+    await expect(sql`insert into managed_address_slots (interface_id, family, name, candidate_address_id) values (${iface!.id}, '4', 'prefix', ${prefix!.id})`).rejects.toMatchObject({ code: "23503" });
+  });
+
+  it("rejects duplicate host address identities", async () => {
+    const { accountId } = await seedCloud();
+    const [instance] = await sql<{ id: string }[]>`insert into cloud_instances (account_id, service, region, external_id, scan_generation) values (${accountId}, 'ec2', 'ap-southeast-1', 'i-host-duplicate', 1) returning id`;
+    const [iface] = await sql<{ id: string }[]>`insert into cloud_interfaces (instance_id, external_id, scan_generation) values (${instance!.id}, 'eni-host-duplicate', 1) returning id`;
+    await sql`insert into cloud_addresses (interface_id, kind, family, address, origin, scan_generation) values (${iface!.id}, 'host', '4', '192.0.2.99', 'system', 1)`;
+    await expect(sql`insert into cloud_addresses (interface_id, kind, family, address, origin, scan_generation) values (${iface!.id}, 'host', '4', '192.0.2.99', 'system', 2)`).rejects.toMatchObject({ code: "23505" });
+  });
+
   it("rejects a cloud slot link for a DDNS endpoint", async () => {
     const { ownerId, accountId } = await seedCloud();
     const [pool] = await sql<{ id: string }[]>`insert into endpoint_pools (owner_user_id, name, strategy) values (${ownerId}, 'ddns-pool', 'primary_backup') returning id`;

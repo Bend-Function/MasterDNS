@@ -109,7 +109,8 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
     ...timestamps,
   }, (table) => [
-    uniqueIndex("cloud_addresses_identity_unique").on(table.interfaceId, table.kind, table.family, table.address, table.prefixLength),
+    uniqueIndex("cloud_addresses_host_identity_unique").on(table.interfaceId, table.family, table.address).where(sql`${table.kind} = 'host'`),
+    uniqueIndex("cloud_addresses_prefix_identity_unique").on(table.interfaceId, table.family, table.address, table.prefixLength).where(sql`${table.kind} = 'prefix'`),
     uniqueIndex("cloud_addresses_slot_reference_unique").on(table.id, table.interfaceId, table.family, table.kind),
     check("cloud_addresses_family_valid", sql`${table.family} in ('4', '6')`),
     check("cloud_addresses_prefix_shape", sql`(${table.kind} = 'host' and ${table.prefixLength} is null) or (${table.kind} = 'prefix' and ${table.prefixLength} is not null)`),
