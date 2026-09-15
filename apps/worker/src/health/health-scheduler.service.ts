@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import type { HealthCheckJob } from "@masterdns/contracts";
-import { domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs } from "@masterdns/db";
+import { addressHealthPolicies, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs } from "@masterdns/db";
 import { and, eq } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
@@ -29,9 +29,10 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
     if (this.scanning) return;
     this.scanning = true;
     try {
-      const [targets, configs, bindings] = await Promise.all([
+      const [targets, configs, bindings, policies] = await Promise.all([
         this.database.db.select({
           endpointId: endpoints.id,
+          addressMode: endpoints.addressMode,
           poolId: endpoints.poolId,
           intervalSeconds: endpointPools.checkIntervalSeconds,
           addressId: endpointAddresses.id,
@@ -42,10 +43,11 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
           .where(and(eq(endpoints.lifecycle, "enabled"), eq(endpointAddresses.state, "current"))),
         this.database.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.enabled, true)),
         this.database.db.select({ id: domainBindings.id, poolId: domainBindings.poolId, recordType: domainBindings.recordType }).from(domainBindings),
+        this.database.db.select().from(addressHealthPolicies),
       ]);
 
       const now = Date.now();
-      await Promise.all(buildScheduledHealthJobs(targets, configs, bindings)
+      await Promise.all(buildScheduledHealthJobs(targets, configs, bindings, policies)
         .map((scheduled) => this.enqueue(scheduled.data, scheduled.intervalSeconds, now)));
     } catch (error) {
       this.logger.error(`Health schedule scan failed: ${safeError(error)}`);
@@ -68,6 +70,7 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
 }
 
 type ScheduledTarget = {
+  addressMode?: "static" | "ddns" | "cloud";
   endpointId: string;
   poolId: string;
   intervalSeconds: number;
@@ -92,6 +95,7 @@ export function buildScheduledHealthJobs(
   targets: ScheduledTarget[],
   configs: ScheduledConfig[],
   bindings: ScheduledBinding[],
+  policies: Array<{ endpointId: string | null; family: "4" | "6"; mode: "local" | "external" | "mixed"; configId?: string; checkIntervalSeconds?: number }> = [],
 ): Array<{ data: HealthCheckJob; intervalSeconds: number }> {
   const bindingsByPool = groupBy(bindings, (binding) => binding.poolId);
   const poolConfigs = groupBy(configs.filter((config) => config.poolId), (config) => config.poolId!);
@@ -100,10 +104,12 @@ export function buildScheduledHealthJobs(
   const scheduled: Array<{ data: HealthCheckJob; intervalSeconds: number }> = [];
 
   for (const target of targets) {
-    const base = endpointConfigs.get(target.endpointId) ?? poolConfigs.get(target.poolId) ?? [];
-    for (const config of base) scheduled.push({
+    const policy = policies.find(p => p.endpointId === target.endpointId && p.family === target.family);
+    const base = policy?.mode === "local" && policy.configId ? configs.filter(config => config.id === policy.configId) : endpointConfigs.get(target.endpointId) ?? poolConfigs.get(target.poolId) ?? [];
+    const localBase = target.addressMode !== "cloud" && (!policy || policy.mode === "local");
+    for (const config of localBase ? base : []) scheduled.push({
       data: { endpointId: target.endpointId, configId: config.id, addressId: target.addressId },
-      intervalSeconds: target.intervalSeconds,
+      intervalSeconds: policy?.checkIntervalSeconds ?? target.intervalSeconds,
     });
     for (const binding of bindingsByPool.get(target.poolId) ?? []) {
       if ((binding.recordType === "AAAA" ? "6" : "4") !== target.family) continue;

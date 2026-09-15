@@ -7,3 +7,4 @@ export * from "./pools.js";
 export * from "./probe-policy.js";
 export * from "./probes.js";
 export * from "./rotation.js";
+export * from "./external-health.js";
