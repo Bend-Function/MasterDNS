@@ -195,8 +195,10 @@ async function main() {
   containers.push(enroll);
   await podman('cp', `${directory}/.`, `${enroll}:/test`);
   await podman('start', enroll);
-  const version = await podman('exec', enroll, '/test/agent', 'version');
-  console.log(`Agent version: ${version}`);
+  const versionOutput = await podman('exec', enroll, '/test/agent', 'version');
+  // A7 prints the product and build commit; heartbeat carries only the version. Accept A6's bare version too.
+  const version = /^masterdns-agent (\S+) \([^)]+\)$/.exec(versionOutput)?.[1] ?? versionOutput;
+  console.log(`Agent version: ${versionOutput}`);
   const install = await management.createInstallToken(actor, probe.id);
   secrets.push(install.installToken);
   await command('podman', ['exec', '-i', enroll, '/test/agent', 'enroll', '--config', '/test/config.json'], `${install.installToken}\n`);
