@@ -57,6 +57,7 @@
     },
     "ProbeTask": {
       "type": "object",
+      "$comment": "Consumers must also reject permanently forbidden targets and require CIDR containment for private targets as documented; these semantic IP rules are enforced by probeTaskSchema.",
       "additionalProperties": false,
       "required": ["protocol", "taskId", "roundId", "probeId", "leaseId", "addressVersion", "configVersion", "address", "family", "config", "deadline"],
       "properties": {
@@ -73,7 +74,17 @@
         "config": { "oneOf": [{ "$ref": "#/$defs/TcpCheck" }, { "$ref": "#/$defs/HttpCheck" }] },
         "deadline": { "$ref": "#/$defs/Timestamp" },
         "networkPolicy": { "$ref": "#/$defs/NetworkPolicy" }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "family": { "const": 4 } }, "required": ["family"] },
+          "then": { "properties": { "address": { "format": "ipv4" } } }
+        },
+        {
+          "if": { "properties": { "family": { "const": 6 } }, "required": ["family"] },
+          "then": { "properties": { "address": { "format": "ipv6" } } }
+        }
+      ]
     },
     "ProbeResult": {
       "type": "object",

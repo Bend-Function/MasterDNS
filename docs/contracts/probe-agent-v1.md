@@ -51,7 +51,7 @@ Response: `{ "serverTime": RFC3339, "tasks": ProbeTask[], "retryAfterMs": number
 
 `capacity` and the returned task batch are limited to 100. A task carries immutable task, round, probe, lease, address, and configuration versions. Agents must not execute work after `deadline`.
 
-Targets are public by default. A restricted/private target is valid only when `networkPolicy.allowedPrivateCIDRs` is nonempty and contains that address. This policy is produced from an administrator-authorized probe configuration. Lease requests never accept a network policy, so an agent cannot expand its own target range. Agents also enforce their local network policy.
+Targets are public by default. An RFC 1918, carrier-grade NAT, or IPv6 unique-local target is valid only when `networkPolicy.allowedPrivateCIDRs` is nonempty and contains that address. Unspecified, loopback, link-local (including cloud metadata), multicast, IPv4 future-use, and IPv4-mapped IPv6 targets are always rejected, even when an allowlist contains them. This policy is produced from an administrator-authorized probe configuration. Lease requests never accept a network policy, so an agent cannot expand its own target range. Agents also enforce their local network policy.
 
 ## Submit results
 

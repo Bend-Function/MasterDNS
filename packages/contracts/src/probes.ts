@@ -40,7 +40,9 @@ export const probeTaskSchema = z.object({
     context.addIssue({ code: "custom", path: ["address"], message: `address must be IPv${task.family}` });
   }
 
-  if (isRestrictedAddress(task.address, task.family)) {
+  if (isPermanentlyForbiddenAddress(task.address, task.family)) {
+    context.addIssue({ code: "custom", path: ["address"], message: "address is not a permitted probe target" });
+  } else if (requiresPrivateAllowlist(task.address, task.family)) {
     const allowed = task.networkPolicy?.allowedPrivateCIDRs.some((cidr) => cidrContains(cidr, task.address)) ?? false;
     if (!allowed) {
       context.addIssue({ code: "custom", path: ["address"], message: "restricted address is not explicitly allowed" });
@@ -104,11 +106,23 @@ export type ProbeResult = z.infer<typeof probeResultSchema>;
 export type LeaseResponse = z.infer<typeof leaseResponseSchema>;
 export type ResultAck = z.infer<typeof resultAckSchema>;
 
-function isRestrictedAddress(address: string, family: 4 | 6): boolean {
+function isPermanentlyForbiddenAddress(address: string, family: 4 | 6): boolean {
   const ranges = family === 4
-    ? ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4"]
-    : ["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
+    ? ["0.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "224.0.0.0/4", "240.0.0.0/4"]
+    : ["::/128", "::1/128", "fe80::/10", "ff00::/8"];
+  return isIpv4MappedIpv6(address, family) || ranges.some((cidr) => cidrContains(cidr, address));
+}
+
+function requiresPrivateAllowlist(address: string, family: 4 | 6): boolean {
+  const ranges = family === 4
+    ? ["10.0.0.0/8", "100.64.0.0/10", "172.16.0.0/12", "192.168.0.0/16"]
+    : ["fc00::/7"];
   return ranges.some((cidr) => cidrContains(cidr, address));
+}
+
+function isIpv4MappedIpv6(address: string, family: 4 | 6): boolean {
+  if (family !== 6) return false;
+  return cidrContains("::ffff:0:0/96", address);
 }
 
 function cidrContains(cidr: string, address: string): boolean {
@@ -129,7 +143,13 @@ function cidrContains(cidr: string, address: string): boolean {
 }
 
 function ipBytes(address: string): number[] | undefined {
-  if (address.includes(".")) return address.split(".").map(Number);
+  if (address.includes(".")) {
+    const ipv4 = address.slice(address.lastIndexOf(":") + 1).split(".").map(Number);
+    if (ipv4.length !== 4 || ipv4.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return undefined;
+    if (!address.includes(":")) return ipv4;
+    const hexTail = `${((ipv4[0]! << 8) | ipv4[1]!).toString(16)}:${((ipv4[2]! << 8) | ipv4[3]!).toString(16)}`;
+    return ipBytes(`${address.slice(0, address.lastIndexOf(":") + 1)}${hexTail}`);
+  }
 
   const [leftText, rightText] = address.split("::");
   const left = leftText ? leftText.split(":") : [];

@@ -85,4 +85,40 @@ describe("probe-agent/v1 contracts", () => {
       networkPolicy: { allowedPrivateCIDRs: [] },
     }).success).toBe(false);
   });
+
+  it.each([
+    ["IPv4-mapped IPv6 with dotted notation", "::ffff:127.0.0.1"],
+    ["IPv4-mapped IPv6 with hexadecimal notation", "::ffff:7f00:1"],
+    ["mapped private IPv4", "::ffff:10.0.0.1"],
+  ])("rejects %s", (_name, address) => {
+    expect(probeTaskSchema.safeParse({
+      ...(taskFixture as object),
+      address,
+      family: 6,
+      networkPolicy: { allowedPrivateCIDRs: ["::/0"] },
+    }).success).toBe(false);
+  });
+
+  it("accepts a non-mapped IPv6 address with an embedded dotted tail", () => {
+    expect(probeTaskSchema.safeParse({
+      ...(taskFixture as object),
+      address: "2001:db8::192.0.2.10",
+      family: 6,
+    }).success).toBe(true);
+  });
+
+  it.each([
+    ["IPv4 loopback", "127.0.0.1", 4, "127.0.0.0/8"],
+    ["cloud metadata/link-local IPv4", "169.254.169.254", 4, "169.254.0.0/16"],
+    ["IPv6 loopback", "::1", 6, "::1/128"],
+    ["IPv6 link-local", "fe80::1", 6, "fe80::/10"],
+    ["IPv6 multicast", "ff02::1", 6, "ff00::/8"],
+  ])("permanently rejects %s even with a matching allowlist", (_name, address, family, cidr) => {
+    expect(probeTaskSchema.safeParse({
+      ...(taskFixture as object),
+      address,
+      family,
+      networkPolicy: { allowedPrivateCIDRs: [cidr] },
+    }).success).toBe(false);
+  });
 });
