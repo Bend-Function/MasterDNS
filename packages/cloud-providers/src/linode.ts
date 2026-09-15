@@ -18,7 +18,7 @@ export function publicLinodeAddress(address: string, family: 4 | 6): boolean {
   return !(a === 0 || a === 10 || a === 127 || a >= 224 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 169 && b === 254) || (a === 100 && b >= 64 && b <= 127));
 }
 export function linodeIpResource(instanceId: string, address: string): string { return `/linode/instances/${instanceId}/ips/${address}`; }
-export function linodeCapabilities(slot: SlotRef, inventory: CloudInventory): Capability {
+export function linodeCapabilities(slot: SlotRef, inventory: CloudInventory, permission: "read" | "write" = "write"): Capability {
   const ref = inventory.ref;
   if (slot.service !== "linode" || ref.service !== "linode" || ["accountId", "instanceId", "region"].some(key => slot[key as keyof CloudRef] !== ref[key as keyof CloudRef])) return no("inventory_mismatch");
   const ni = inventory.interfaces.find(i => i.id === slot.interfaceId);
@@ -36,9 +36,10 @@ export function linodeCapabilities(slot: SlotRef, inventory: CloudInventory): Ca
   if (m.runLevel !== "default") return no("linode_boot_mode_unsupported");
   if (m.simplePublicInterface !== true) return no("linode_public_config_required");
   if (m.advancedNetworking !== false) return no("linode_advanced_networking_unsupported");
-  if (!Number.isSafeInteger(m.eventWatermark) || typeof m.externalAccountId !== "string") return no("linode_event_observation_required");
+  if (!Number.isSafeInteger(m.eventWatermark) || Number(m.eventWatermark) < 0 || typeof m.externalAccountId !== "string" || !m.externalAccountId
+    || typeof m.authenticatedUsername !== "string" || !m.authenticatedUsername) return no("linode_event_observation_required");
   const scopes = Array.isArray(m.permissionScopes) ? m.permissionScopes : [];
-  if (!scopes.includes("*") && !["linodes:read_write", "ips:read_only", "events:read_only"].every(scope => scopes.includes(scope) || scopes.includes(scope.replace("read_only", "read_write")))) return no("linode_permissions_required");
+  if (!scopes.includes("*") && ![permission === "write" ? "linodes:read_write" : "linodes:read_only", "ips:read_only", "events:read_only"].every(scope => scopes.includes(scope) || scopes.includes(scope.replace("read_only", "read_write")))) return no("linode_permissions_required");
   if (ip.allocationId !== slot.address || ip.resourceId !== linodeIpResource(slot.instanceId, slot.address)) return no("linode_address_ownership_unknown");
   return { available: true, permission: "unverified", requiresStop: true, releasesOldAddress: false, canRestoreOldAddress: false };
 }

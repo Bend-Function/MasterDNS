@@ -6,7 +6,7 @@ import { planLinodeCleanup, planLinodeRotation } from "./linode-rotation.js";
 const old = "203.0.113.10", next = "203.0.113.20";
 const slot: SlotRef = { accountId: "account", service: "linode", region: "us-east", instanceId: "42", interfaceId: "public", slotId: "slot", address: old, family: 4 };
 function fake() {
-  const state = { uuid: "customer-uuid", scopes: "linodes:read_write ips:read_only events:read_only", ips: [old], helper: true,
+  const state = { uuid: "customer-uuid", profileUsername: "not-account-id", scopes: "linodes:read_write ips:read_only events:read_only", ips: [old], helper: true,
     generation: "legacy_config", configs: 1, configId: 7, runLevel: "default", interfaces: [] as unknown[], shared: [] as unknown[], ranges: [] as unknown[], status: "running",
     events: [{ id: 10, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }], allocation: "ok", eventActor: "not-account-id", ipOwner: 42, reserved: false, rebootOutcome: "ok", releaseOutcome: "ok", denied: 0, writes: [] as Array<{ path: string; body: unknown }>, requests: [] as string[], pages: 1 };
   const ip = (address: string) => ({ address, type: "ipv4", public: true, linode_id: state.ipOwner, region: "us-east", reserved: state.reserved });
@@ -37,7 +37,7 @@ function fake() {
       }
       state.ips = state.ips.filter(address => !path.endsWith(address)); if (state.releaseOutcome === "timeout") throw new Error("lost delete response"); return respond({});
     }
-    if (path === "/profile") return respond({ username: "not-account-id" });
+    if (path === "/profile") return respond({ username: state.profileUsername });
     if (path === "/regions") return paged([{ id: "us-east" }]);
     if (path === "/linode/instances") { const page = Number(url.searchParams.get("page") ?? 1); return respond({ data: page === 1 && state.pages > 1 ? [] : [instance()], page, pages: state.pages, results: 1 }); }
     if (path === "/linode/instances/42") return respond(instance());
@@ -47,7 +47,7 @@ function fake() {
     if (path.startsWith("/networking/ips/")) return state.ips.includes(path.split("/").at(-1)!) ? respond(ip(path.split("/").at(-1)!)) : respond({}, 404);
     throw new Error(`Unexpected request ${path}`);
   };
-  return { state, adapter: new LinodeCloudAdapter("account", { kind: "linode_token", token: "secret-token" }, { fetch: fetcher }) };
+  return { state, adapter: new LinodeCloudAdapter("account", { kind: "linode_token", token: "secret-token" }, { fetch: fetcher }), reconnect: () => new LinodeCloudAdapter("account", { kind: "linode_token", token: "secret-token" }, { fetch: fetcher }) };
 }
 function withArgs(step: CloudStep, args: Record<string, unknown>): CloudStep { return { ...step, arguments: { ...step.arguments, ...args } }; }
 async function setup() { const f = fake(); const inventory = await f.adapter.inspect(slot); return { ...f, inventory, steps: planLinodeRotation(slot, inventory, { attemptId: "attempt", allowStop: true }) }; }
@@ -63,6 +63,7 @@ describe("Linode conditional rotation", () => {
   it("requires explicit reboot permission before allocation", async () => { const { adapter, state, inventory } = await setup(); expect(adapter.capabilities(slot, inventory)).toMatchObject({ available: true, requiresStop: true }); expect(() => planLinodeRotation(slot, inventory, { attemptId: "attempt", allowStop: false })).toThrow(); expect(state.writes).toEqual([]); });
   it.each(["helper", "configs", "runLevel", "interfaces", "shared", "ranges"])("rejects unsafe %s configuration", async key => { const f = fake(); Object.assign(f.state, { [key]: ({ helper: false, configs: 2, runLevel: "single", interfaces: [{ purpose: "vpc" }], shared: [{ address: old }], ranges: [{ prefix: "2600::/64" }] } as Record<string, unknown>)[key] }); const inventory = await f.adapter.inspect(slot); expect(f.adapter.capabilities(slot, inventory).available).toBe(false); });
   it("keeps reserved IPv4 lifecycle unsupported", async () => { const f = fake(); f.state.reserved = true; const inventory = await f.adapter.inspect(slot); expect(f.adapter.capabilities(slot, inventory)).toMatchObject({ available: false, reason: "linode_reserved_ipv4_lifecycle_unsupported" }); });
+  it("requires a saved dispatch actor before planning", async () => { const f = fake(); const inventory = await f.adapter.inspect(slot); delete inventory.metadata!.authenticatedUsername; expect(f.adapter.capabilities(slot, inventory)).toMatchObject({ available: false, reason: "linode_event_observation_required" }); });
   it("requires complete token write/event scopes but accepts wildcard", async () => { const f = fake(); f.state.scopes = "linodes:read_only"; expect(f.adapter.capabilities(slot, await f.adapter.inspect(slot)).available).toBe(false); f.state.scopes = "*"; expect(f.adapter.capabilities(slot, await f.adapter.inspect(slot)).available).toBe(true); });
   it("allocates exactly once, waits for reboot event, then exposes the known candidate", async () => { const { adapter, state, steps } = await setup(); expect(steps.map(s => s.action)).toEqual(["linode.ipv4.allocate", "linode.instance.reboot"]); const allocation = await adapter.execute(steps[0]!); expect(allocation.candidateAddress).toBe(next); expect(state.writes[0]).toEqual({ path: "/linode/instances/42/ips", body: { type: "ipv4", public: true } }); expect(await adapter.observeDetails(withArgs(steps[0]!, { receipt: allocation }))).toMatchObject({ status: "applied", candidateAddress: next }); const rebootStep = withArgs(steps[1]!, { candidateReceipt: allocation }); const reboot = await adapter.execute(rebootStep); expect(state.writes[1]).toEqual({ path: "/linode/instances/42/reboot", body: { config_id: 7 } }); expect(await adapter.observeDetails(withArgs(rebootStep, { receipt: reboot }))).toMatchObject({ status: "pending" }); state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }); expect(await adapter.observeDetails(withArgs(rebootStep, { receipt: reboot }))).toMatchObject({ status: "applied", candidateAddress: next, operationId: "11" }); expect(state.ips).toContain(old); });
   it("returns normalized candidate address metadata in the applied terminal receipt", async () => {
@@ -102,6 +103,14 @@ describe("Linode conditional rotation", () => {
     const result = await adapter.observeDetails(withArgs(steps[1]!, { candidateReceipt: allocation, previousExecution: true }));
     expect(result).toMatchObject({ status: "pending", before: { eventWatermark: 10 } });
   });
+  it("observes the original actor after same-account read-only credential rotation", async () => {
+    const { adapter, state, steps, reconnect } = await setup(); const allocation = await adapter.execute(steps[0]!);
+    const reboot = withArgs(steps[1]!, { candidateReceipt: allocation }); const receipt = await adapter.execute(reboot);
+    state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" });
+    state.profileUsername = "new-reader"; state.scopes = "linodes:read_only ips:read_only events:read_only"; const reader = reconnect();
+    expect(await reader.observeDetails(withArgs(reboot, { receipt, previousExecution: true }))).toMatchObject({ status: "applied", operationId: "11", candidateAddress: next });
+    await expect(reader.execute(reboot)).rejects.toMatchObject({ code: "remote_identity_changed" }); expect(state.writes).toHaveLength(2);
+  });
   it("rejects an unknown reboot actor", async () => {
     const { adapter, state, steps } = await setup(); const allocation = await adapter.execute(steps[0]!);
     state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }); state.eventActor = "other-user";
@@ -125,6 +134,16 @@ describe("Linode cleanup", () => {
   async function cleanupSetup() { const f = await setup(); const allocation = await f.adapter.execute(f.steps[0]!); const original = f.inventory.interfaces[0]!.addresses[0]!; const options = { attemptId: "attempt", allowStop: true, releaseAuthorized: true, publishedAddress: next, ownershipSnapshot: { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: original.allocationId!, resourceId: original.resourceId!, address: old } }; return { ...f, allocation, options }; }
   it("plans independent release and reboot actions and requires reboot permission", async () => { const { inventory, options } = await cleanupSetup(); expect(planLinodeCleanup(slot, inventory, options).map(s => s.action)).toEqual(["linode.ipv4.release", "linode.instance.reboot"]); expect(() => planLinodeCleanup(slot, inventory, { ...options, allowStop: false })).toThrow(); });
   it("releases only old IP and completes only after a separate cleanup reboot", async () => { const { adapter, state, inventory, options, allocation } = await cleanupSetup(); const steps = planLinodeCleanup(slot, inventory, options); state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }); const release = await adapter.execute(withArgs(steps[0]!, { candidateReceipt: allocation })); expect(state.ips).toEqual([next]); const reboot = withArgs(steps[1]!, { candidateReceipt: allocation, priorReceipts: [{ action: "linode.ipv4.release", receipt: release }] }); await adapter.execute(reboot); expect(await adapter.observeDetails(reboot)).toMatchObject({ status: "pending" }); state.events.push({ id: 12, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }); expect(await adapter.observeDetails(reboot)).toMatchObject({ status: "applied", candidateAddress: next, operationId: "12" }); });
+  it("keeps the original cleanup identity on reboot receipts", async () => {
+    const { adapter, state, inventory, options, allocation } = await cleanupSetup(); const steps = planLinodeCleanup(slot, inventory, options);
+    const releaseStep = withArgs(steps[0]!, { candidateReceipt: allocation }); const released = await adapter.execute(releaseStep);
+    const release = await adapter.observeDetails(withArgs(releaseStep, { receipt: released }));
+    const reboot = withArgs(steps[1]!, { candidateReceipt: allocation, priorReceipts: [{ action: "linode.ipv4.release", receipt: release }] });
+    const receipt = await adapter.execute(reboot);
+    expect(receipt).toMatchObject({ allocationId: release.allocationId, resourceId: release.resourceId, remoteId: old });
+    state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" });
+    expect(await adapter.observeDetails(withArgs(reboot, { receipt }))).toMatchObject({ status: "applied", allocationId: release.allocationId, resourceId: release.resourceId, remoteId: old, candidateAddress: next, operationId: "11" });
+  });
   it("persists a fresh cleanup watermark when the release response was lost", async () => {
     const { adapter, state, inventory, options, allocation } = await cleanupSetup(); const steps = planLinodeCleanup(slot, inventory, options);
     state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" }); state.releaseOutcome = "timeout";

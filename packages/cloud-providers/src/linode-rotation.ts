@@ -7,8 +7,8 @@ import { makeRotationStep, rotationArguments } from "./rotation-plan.js";
 import type { CleanupPlanOptions, RotationStepArguments } from "./rotation-plan.js";
 
 const actions = new Set(["linode.ipv4.allocate", "linode.instance.reboot", "linode.ipv4.release"]);
-function requireCapability(slot: SlotRef, inventory: CloudInventory, allowStop?: boolean) {
-  const capability = linodeCapabilities(slot, inventory);
+function requireCapability(slot: SlotRef, inventory: CloudInventory, allowStop?: boolean, permission: "read" | "write" = "write") {
+  const capability = linodeCapabilities(slot, inventory, permission);
   if (!capability.available) throw new CloudError("rotation_unsupported", false, undefined, capability.reason);
   if (allowStop !== true) throw new CloudError("rotation_unsupported", false, undefined, "linode_reboot_permission_required");
 }
@@ -44,8 +44,8 @@ function snapshot(inventory: CloudInventory): Record<string, unknown> {
   return { externalAccountId: inventory.metadata?.externalAccountId, instanceId: inventory.ref.instanceId, region: inventory.ref.region,
     configId: inventory.metadata?.configId, eventWatermark: inventory.metadata?.eventWatermark, ipv4: ipv4(inventory) };
 }
-function identity(args: RotationStepArguments, inventory: CloudInventory): void {
-  if (inventory.metadata?.externalAccountId !== args.before.metadata?.externalAccountId || inventory.metadata?.authenticatedUsername !== args.before.metadata?.authenticatedUsername
+function identity(args: RotationStepArguments, inventory: CloudInventory, requireDispatchActor = true): void {
+  if (inventory.metadata?.externalAccountId !== args.before.metadata?.externalAccountId || (requireDispatchActor && inventory.metadata?.authenticatedUsername !== args.before.metadata?.authenticatedUsername)
     || inventory.metadata?.configId !== args.before.metadata?.configId) throw new CloudError("remote_identity_changed", false);
 }
 function candidateReceipt(args: RotationStepArguments): CloudStepResult | undefined {
@@ -72,11 +72,11 @@ async function verifyCandidate(args: RotationStepArguments, adapter: LinodeCloud
   if (!ipv4(inventory).includes(address)) throw new CloudError("resource_ownership_ambiguous", false);
   return { ...receipt, candidateAddress: address, candidateRepeated: (args.failedCandidates ?? []).includes(address) };
 }
-function currentCapability(args: RotationStepArguments, inventory: CloudInventory, selected = args.slot.address): void {
+function currentCapability(args: RotationStepArguments, inventory: CloudInventory, selected = args.slot.address, permission: "read" | "write" = "write"): void {
   // During observation an in-progress reboot can report rebooting. Configuration and permission checks still apply.
   const current = { ...inventory, state: "running" };
-  requireCapability({ ...args.slot, address: selected }, current, args.allowStop);
-  identity(args, inventory);
+  requireCapability({ ...args.slot, address: selected }, current, args.allowStop, permission);
+  identity(args, inventory, permission === "write");
 }
 function releaseReceipt(args: RotationStepArguments): CloudStepResult | undefined { return args.priorReceipts?.find(item => item.action === "linode.ipv4.release")?.receipt; }
 function verifyReleaseReceipt(args: RotationStepArguments): CloudStepResult {
@@ -130,27 +130,31 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
   } else verifyAssigned(args, await exactIp(adapter, args.slot.address), args.slot.address);
   // The before inventory and prior allocation/release receipt already retain a watermark if this response is lost.
   watermark(args);
+  const rebootIdentity = args.phase === "post_publish_cleanup"
+    ? { remoteId: args.slot.address, allocationId: verifyReleaseReceipt(args).allocationId!, resourceId: verifyReleaseReceipt(args).resourceId! }
+    : { remoteId: args.slot.instanceId };
   await adapter.http.request(`/linode/instances/${args.slot.instanceId}/reboot`, { method: "POST", body: { config_id: current.metadata!.configId } });
-  return { remoteId: args.slot.instanceId, before, after: { ...snapshot(current), attemptId: args.attemptId, rebootRequested: true } };
+  return { ...rebootIdentity, before, after: { ...snapshot(current), attemptId: args.attemptId, rebootRequested: true } };
 }
 
 export async function observeLinodeRotation(step: CloudStep, adapter: LinodeCloudAdapter): Promise<CloudObservation> {
   const args = validate(step, adapter);
   const current = await adapter.inspect(args.slot);
-  identity(args, current);
+  // Credential rotation may change the reader, but the saved dispatch actor still controls event matching.
+  identity(args, current, false);
   const base: CloudStepResult = { ...args.receipt, before: args.receipt?.before ?? snapshot(current), after: { ...args.receipt?.after, ...snapshot(current) } };
   try {
     if (step.action === "linode.ipv4.allocate") {
       // Inventory differences have no exclusive attempt attribution; even no change cannot justify another POST.
       if (!args.receipt) return { ...base, status: "ambiguous" };
-      currentCapability(args, current);
+      currentCapability(args, current, args.slot.address, "read");
       const candidate = await verifyCandidate(args, adapter, current, args.receipt);
       return { ...base, ...candidate, status: "applied" };
     }
     if (args.phase === "post_publish_cleanup") assertCleanup(args);
     const candidate = await verifyCandidate(args, adapter, current);
     if (args.phase === "post_publish_cleanup" && candidate.candidateAddress !== args.publishedAddress) return { ...base, status: "ambiguous" };
-    currentCapability(args, current, args.phase === "post_publish_cleanup" ? args.publishedAddress! : args.slot.address);
+    currentCapability(args, current, args.phase === "post_publish_cleanup" ? args.publishedAddress! : args.slot.address, "read");
     if (step.action === "linode.ipv4.release") {
       const ip = await exactIp(adapter, args.slot.address);
       if (ip) { verifyAssigned(args, ip, args.slot.address); return { ...base, status: "pending" }; }
@@ -160,7 +164,8 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
         after: { ...snapshot(current), attemptId: args.attemptId, released: true }, status: "applied" };
     }
     if (args.phase === "post_publish_cleanup") {
-      verifyReleaseReceipt(args);
+      const released = verifyReleaseReceipt(args);
+      base.remoteId = args.slot.address; base.allocationId = released.allocationId!; base.resourceId = released.resourceId!;
       if (ipv4(current).includes(args.slot.address) || await exactIp(adapter, args.slot.address)) return { ...base, status: "ambiguous" };
     }
     const afterId = watermark(args);
@@ -174,7 +179,8 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
     const result = { ...base, operationId: String(event.id), before: { ...base.before, eventWatermark: afterId }, after: { ...base.after, eventStatus: event.status } };
     if (!["finished", "completed"].includes(event.status ?? "") || current.state !== "running") return { ...result, status: "pending" };
     const address = current.interfaces.find(i => i.id === args.slot.interfaceId)!.addresses.find(ip => ip.family === 4 && ip.address === candidate.candidateAddress)!;
-    return { ...result, candidateAddress: candidate.candidateAddress!, candidateRepeated: candidate.candidateRepeated ?? false, allocationId: candidate.allocationId!, resourceId: candidate.resourceId!,
+    const resource = args.phase === "post_publish_cleanup" ? verifyReleaseReceipt(args) : candidate;
+    return { ...result, candidateAddress: candidate.candidateAddress!, candidateRepeated: candidate.candidateRepeated ?? false, allocationId: resource.allocationId!, resourceId: resource.resourceId!,
       after: { ...result.after, attemptId: args.attemptId, addressMetadata: address.metadata ?? {}, ...(address.privateAddress === undefined ? {} : { privateAddress: address.privateAddress }) }, status: "applied" };
   } catch (error) {
     if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
