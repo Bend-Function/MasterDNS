@@ -40,7 +40,7 @@ export function evaluateCapabilities(slot: SlotRef, inventory: CloudInventory): 
     available: true,
     permission: "unverified",
     requiresStop: false,
-    releasesOldAddress: (ref.service === "ec2" && slot.family === 4 && !address.allocationId) || (ref.service === "lightsail" && slot.family === 6),
+    releasesOldAddress: (slot.family === 4 && !address.allocationId) || (ref.service === "lightsail" && slot.family === 6),
     canRestoreOldAddress: false,
   };
 }

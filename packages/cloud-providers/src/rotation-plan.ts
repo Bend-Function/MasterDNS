@@ -27,6 +27,8 @@ export type RotationStepArguments = {
   before: CloudInventory;
   phase: "rotation" | "post_publish_cleanup";
   receipt?: CloudStepResult;
+  /** Persisted applied allocation observation, carried into Lightsail detach/attach. */
+  candidateReceipt?: CloudStepResult;
   /** Set on recovery of a previously dispatched step; never blindly reissue uncertain writes. */
   previousExecution?: boolean;
   failedCandidates?: string[];
@@ -74,7 +76,7 @@ export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, opti
     if (!inventory.nativeName) throw new CloudError("rotation_unsupported", false, undefined, "native_name_missing");
     if (slot.family === 6) actions = ["lightsail.ipv6.disable", "lightsail.ipv6.enable"];
     else if (address.allocationId) actions = ["lightsail.static-ip.allocate", "lightsail.static-ip.detach", "lightsail.static-ip.attach"];
-    else throw new CloudError("rotation_unsupported", false, undefined, "lightsail_static_ip_required");
+    else actions = ["lightsail.static-ip.allocate", "lightsail.static-ip.attach"];
   }
   const args: RotationStepArguments = { slot, attemptId: options.attemptId, before: inventory, phase: "rotation" };
   const steps = actions.map((action, index) => makeRotationStep(action, args, index));

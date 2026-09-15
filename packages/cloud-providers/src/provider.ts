@@ -38,6 +38,7 @@ export type CloudObservationStatus = "pending" | "applied" | "not_applied" | "am
 
 export type CloudStepResult = {
   remoteId?: string;
+  resourceId?: string;
   allocationId?: string;
   operationId?: string;
   operationIds?: string[];

@@ -48,15 +48,42 @@ async function readStaticIp(name: string, send: AwsSend): Promise<StaticIp | und
   }
 }
 
-function originalName(step: CloudStep): string {
+function originalAddress(step: CloudStep) {
   const { before, slot } = rotationArguments(step);
-  const name = before.interfaces.find(i => i.id === slot.interfaceId)?.addresses.find(a => a.address === slot.address && a.family === 4)?.allocationId;
+  const address = before.interfaces.find(i => i.id === slot.interfaceId)?.addresses.find(a => a.address === slot.address && a.family === 4);
+  if (!address) throw new CloudError("invalid_rotation_step", false);
+  return address;
+}
+
+function originalName(step: CloudStep): string {
+  const name = originalAddress(step).allocationId;
   if (!name) throw new CloudError("invalid_rotation_step", false);
   return name;
 }
 
 function verifyAttachment(step: CloudStep, ip: StaticIp) {
   if (ip.attachedTo !== undefined && ip.attachedTo !== rotationArguments(step).before.nativeName) throw new CloudError("resource_ownership_ambiguous", false);
+}
+
+function verifyOriginal(step: CloudStep, ip: StaticIp): void {
+  const original = originalAddress(step);
+  const { receipt, ownershipSnapshot } = rotationArguments(step);
+  if (!original.resourceId || ip.arn !== original.resourceId || ip.ipAddress !== original.address
+    || (!step.action.endsWith("attach") && receipt?.resourceId && receipt.resourceId !== ip.arn)
+    || (ownershipSnapshot?.resourceId && ownershipSnapshot.resourceId !== ip.arn)) throw new CloudError("resource_ownership_ambiguous", false);
+  verifyAttachment(step, ip);
+}
+
+function verifyCandidate(step: CloudStep, ip: StaticIp, allowFirstObservation = false): CloudStepResult {
+  const args = rotationArguments(step);
+  const expected = step.action.endsWith("allocate") ? args.receipt : args.candidateReceipt;
+  if (!ip.arn || !ip.ipAddress || !expected || ((!expected.resourceId || !expected.candidateAddress) && !allowFirstObservation)
+    || (expected.resourceId && expected.resourceId !== ip.arn)
+    || expected.allocationId !== ip.name
+    || (expected.candidateAddress && expected.candidateAddress !== ip.ipAddress)
+    || (step.action.endsWith("attach") && args.receipt?.resourceId && args.receipt.resourceId !== ip.arn)) throw new CloudError("resource_ownership_ambiguous", false);
+  verifyAttachment(step, ip);
+  return { remoteId: ip.name!, allocationId: ip.name!, resourceId: ip.arn, ...candidate(step, ip.ipAddress) };
 }
 
 function operationResult(operations: Operation[] = []): CloudStepResult {
@@ -84,11 +111,11 @@ export async function executeLightsailRotation(step: CloudStep, accountId: strin
   const name = rotationResourceName(step);
   if (args.slot.family !== 4) throw new CloudError("invalid_rotation_step", false);
   if (step.action === "lightsail.static-ip.allocate") {
-    originalName(step);
+    const original = originalAddress(step);
+    if (!original.allocationId && (instance.isStaticIp !== false || instance.publicIpAddress !== args.slot.address)) throw new CloudError("remote_identity_changed", false);
     const existing = await readStaticIp(name, send);
     if (existing) {
-      verifyAttachment(step, existing);
-      return { remoteId: name, allocationId: name, before, after: { staticIp: existing }, ...candidate(step, existing.ipAddress) };
+      return { ...verifyCandidate(step, existing), before, after: { staticIp: existing } };
     }
     const response = await send(new AllocateStaticIpCommand({ staticIpName: name }));
     return { remoteId: name, allocationId: name, before, ...operationResult(response.operations) };
@@ -97,34 +124,39 @@ export async function executeLightsailRotation(step: CloudStep, accountId: strin
     const oldName = originalName(step);
     const old = await readStaticIp(oldName, send);
     if (!old || old.ipAddress !== args.slot.address) throw new CloudError("resource_ownership_ambiguous", false);
-    verifyAttachment(step, old);
-    if (!old.attachedTo) return { remoteId: oldName, before, after: { detached: true } };
-    if (instance.publicIpAddress !== args.slot.address) throw new CloudError("remote_identity_changed", false);
+    verifyOriginal(step, old);
     const replacement = await readStaticIp(name, send);
     if (!replacement) throw new CloudError("resource_ownership_ambiguous", false);
-    verifyAttachment(step, replacement);
+    verifyCandidate(step, replacement);
+    if (!old.attachedTo) return { remoteId: oldName, resourceId: old.arn!, before, after: { detached: true } };
+    if (instance.publicIpAddress !== args.slot.address) throw new CloudError("remote_identity_changed", false);
     const response = await send(new DetachStaticIpCommand({ staticIpName: oldName }));
-    return { remoteId: oldName, before, ...operationResult(response.operations) };
+    return { remoteId: oldName, resourceId: old.arn!, before, ...operationResult(response.operations) };
   }
   if (step.action === "lightsail.static-ip.attach") {
     const replacement = await readStaticIp(name, send);
     if (!replacement) throw new CloudError("resource_ownership_ambiguous", false);
-    verifyAttachment(step, replacement);
-    if (replacement.attachedTo === instance.name && replacement.ipAddress === instance.publicIpAddress) return { remoteId: name, allocationId: name, before, after: { staticIp: replacement }, ...candidate(step, replacement.ipAddress) };
-    if (instance.isStaticIp) throw new CloudError("remote_identity_changed", false);
-    const old = await readStaticIp(originalName(step), send);
-    if (old?.attachedTo) throw new CloudError("resource_ownership_ambiguous", false);
+    const identity = verifyCandidate(step, replacement);
+    if (replacement.attachedTo === instance.name && replacement.ipAddress === instance.publicIpAddress) return { ...identity, before, after: { staticIp: replacement } };
+    if (instance.isStaticIp !== false) throw new CloudError("remote_identity_changed", false);
+    const original = originalAddress(step);
+    if (original.allocationId) {
+      const old = await readStaticIp(original.allocationId, send);
+      if (old) verifyOriginal(step, old);
+      if (old?.attachedTo) throw new CloudError("resource_ownership_ambiguous", false);
+    } else if (instance.publicIpAddress !== args.slot.address) throw new CloudError("remote_identity_changed", false);
     const response = await send(new AttachStaticIpCommand({ instanceName: instance.name!, staticIpName: name }));
-    return { remoteId: name, allocationId: name, before, ...candidate(step, replacement.ipAddress), ...operationResult(response.operations) };
+    return { ...identity, before, ...operationResult(response.operations) };
   }
   assertCleanup(step);
   const oldName = originalName(step);
   const ownerStep = { ...step, arguments: { ...step.arguments, attemptId: args.ownershipAttemptId } };
   const old = await readStaticIp(oldName, send);
   if (!old || old.attachedTo || old.ipAddress !== args.slot.address || instance.publicIpAddress !== args.publishedAddress) throw new CloudError("resource_ownership_ambiguous", false);
+  verifyOriginal(step, old);
   if (!(hasCleanupOwnership(step, { allocationId: old.name!, address: old.ipAddress!, ...(old.arn ? { resourceId: old.arn } : {}) }) || (args.ownershipAttemptId && oldName === rotationResourceName(ownerStep)))) throw new CloudError("resource_ownership_ambiguous", false);
   const response = await send(new ReleaseStaticIpCommand({ staticIpName: oldName }));
-  return { remoteId: oldName, allocationId: oldName, before, ...operationResult(response.operations) };
+  return { remoteId: oldName, allocationId: oldName, resourceId: old.arn!, before, ...operationResult(response.operations) };
 }
 
 async function operationStatus(step: CloudStep, send: AwsSend): Promise<"ready" | "pending" | "ambiguous"> {
@@ -134,7 +166,7 @@ async function operationStatus(step: CloudStep, send: AwsSend): Promise<"ready" 
     const response = await send(new GetOperationCommand({ operationId: id }));
     const op = response.operation as Operation | undefined;
     if (!op || op.id !== id) return "ambiguous";
-    if (op.resourceName && ![before.nativeName, rotationResourceName(step), ...(step.action.includes("static-ip") ? [originalName(step)] : [])].includes(op.resourceName)) return "ambiguous";
+    if (op.resourceName && ![before.nativeName, rotationResourceName(step), ...(step.action.includes("static-ip") ? [originalAddress(step).allocationId] : [])].includes(op.resourceName)) return "ambiguous";
     if (op.status === "Failed") {
       const error = normalizeAwsError({ name: op.errorCode });
       throw error.code === "unknown_cloud_error" ? new CloudError("cloud_operation_failed", false) : error;
@@ -149,8 +181,8 @@ export async function observeLightsailRotation(step: CloudStep, accountId: strin
   const instance = await readInstance(step, send);
   const base: CloudStepResult = { ...args.receipt, before: args.receipt?.before ?? { inventory: args.before }, after: snapshot(instance) };
   const status = await operationStatus(step, send);
-  if (status !== "ready") return { ...base, status };
   if (step.action.startsWith("lightsail.ipv6")) {
+    if (status !== "ready") return { ...base, status };
     if (instance.ipAddressType === "ipv6") return { ...base, status: "ambiguous" };
     if (step.action.endsWith("disable")) return { ...base, status: instance.ipAddressType === "ipv4" && !instance.ipv6Addresses?.length ? "applied" : "pending" };
     const addresses = instance.ipv6Addresses ?? [];
@@ -160,15 +192,27 @@ export async function observeLightsailRotation(step: CloudStep, accountId: strin
   const oldAction = step.action.endsWith("detach") || step.action.endsWith("release");
   const name = oldAction ? originalName(step) : rotationResourceName(step);
   let ip: StaticIp | undefined;
-  try { ip = await readStaticIp(name, send); if (ip) verifyAttachment(step, ip); }
-  catch (error) {
+  let identity: CloudStepResult = {};
+  try {
+    ip = await readStaticIp(name, send);
+    if (ip) {
+      if (oldAction) verifyOriginal(step, ip);
+      else identity = verifyCandidate(step, ip, step.action.endsWith("allocate") && Boolean(args.receipt?.operationId || args.receipt?.operationIds?.length));
+    }
+    if (step.action.endsWith("detach")) {
+      const replacement = await readStaticIp(rotationResourceName(step), send);
+      if (!replacement) return { ...base, status: "ambiguous" };
+      verifyCandidate(step, replacement);
+    }
+  } catch (error) {
     if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
     throw error;
   }
-  if (step.action.endsWith("release")) return { ...base, status: ip ? "pending" : "applied" };
-  if (step.action.endsWith("detach")) return { ...base, status: !ip || ip.ipAddress !== args.slot.address ? "ambiguous" : ip.attachedTo ? "pending" : "applied" };
-  if (!ip) return { ...base, status: args.receipt ? "pending" : "ambiguous" };
-  const result = { ...base, remoteId: name, allocationId: name, ...candidate(step, ip.ipAddress) };
+  const result = { ...base, ...identity, ...(oldAction && ip?.arn ? { resourceId: ip.arn } : {}) };
+  if (status !== "ready") return { ...result, status };
+  if (step.action.endsWith("release")) return { ...result, status: ip ? "pending" : "applied" };
+  if (step.action.endsWith("detach")) return { ...result, status: !ip ? "ambiguous" : ip.attachedTo ? "pending" : "applied" };
+  if (!ip) return { ...result, status: args.receipt ? "pending" : "ambiguous" };
   if (step.action.endsWith("allocate")) return { ...result, status: "applied" };
   return { ...result, status: ip.attachedTo === instance.name && ip.ipAddress === instance.publicIpAddress ? "applied" : "pending" };
 }
