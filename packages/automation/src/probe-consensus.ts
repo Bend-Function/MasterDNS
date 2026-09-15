@@ -1,14 +1,8 @@
-import type { HealthObservation, ProbeOutcome } from "@masterdns/contracts";
+import type { ConsensusPolicy, HealthObservation, ProbeOutcome } from "@masterdns/contracts";
 import { applyHealthResult, type HealthThresholds } from "./health-state.js";
 
 export type RoundDecision = "success" | "failure" | "unknown";
-
-export type ConsensusPolicy = {
-  mode: "any" | "majority" | "all" | "at_least" | "specified";
-  minimumValid: number;
-  failureVotes?: number;
-  specifiedProbeId?: string;
-};
+export type { ConsensusPolicy } from "@masterdns/contracts";
 
 export type RoundHealthObservation = HealthObservation & { lastRoundId?: string };
 
