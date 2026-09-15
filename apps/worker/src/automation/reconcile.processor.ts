@@ -5,7 +5,7 @@ import { queueNames } from "@masterdns/contracts";
 import {
   cloudEndpointLinks,
   rotationPublications,
-  lockRotationContext,
+  lockRotationContexts,
   lockRotationHealth,
   healthRevisions,
   bindingAssignments,
@@ -59,7 +59,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
   private async process(job: Job<PoolReconcileJob>) {
     const outcome = await this.database.db.transaction(async (tx) => {
       const linkedSlots = await tx.select({ slotId: cloudEndpointLinks.slotId }).from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId)).where(eq(endpoints.poolId, job.data.poolId));
-      for (const slotId of [...new Set(linkedSlots.map(l => l.slotId))].sort()) await lockRotationContext(tx, slotId);
+      const cloudContexts = await lockRotationContexts(tx, linkedSlots.map(l => l.slotId));
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${job.data.poolId}))`);
       const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, job.data.poolId)).limit(1);
       if (!pool) return null;
@@ -240,7 +240,8 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         const family = (step.input.record as DnsRecordInput).type === "AAAA" ? "6" : "4";
         const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, endpoint.id), eq(cloudEndpointLinks.family, family)));
         if (!link) throw new Error("cloud_endpoint_link_missing");
-        const c = await lockRotationContext(tx, link.slotId);
+        const c = cloudContexts.get(link.slotId);
+        if (!c) throw new Error("cloud_endpoint_links_changed");
         const h = await lockRotationHealth(tx, c);
         if (c.slot.candidateAddressId || !h.success || c.address?.address !== (step.input.record as DnsRecordInput).content) throw new Error("cloud_address_not_verified");
         const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, c.addressVersion)));

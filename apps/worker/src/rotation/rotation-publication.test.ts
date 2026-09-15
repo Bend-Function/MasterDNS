@@ -564,3 +564,49 @@ it("does not turn an unknown round's historical unhealthy slot state into new Po
   for (const endpoint of f.endpoints)
     expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("healthy");
 });
+
+it.each(["new-link", "restore"] as const)(
+  "propagates fresh same-address revalidation failure after %s with auto rotation off",
+  async (reason) => {
+    const f = await cloudHealthFixture();
+    if (reason === "new-link") {
+      const [endpoint] = await f.d
+        .insert(db.endpoints)
+        .values({ poolId: f.pools[0]!.id, name: "new-binding", addressMode: "cloud" })
+        .returning();
+      await f.d.insert(db.cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId: f.slot.id, family: "4" });
+      await f.service.recover();
+    } else {
+      const links = await f.d.transaction((tx) => db.captureCloudPolicyLinks(tx, f.pools[0]!.id));
+      await f.d.transaction((tx) => db.prepareCloudPolicyRestore(tx, f.pools[0]!.id, f.account.ownerUserId, links));
+    }
+    const [slot] = await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id));
+    expect(slot).toMatchObject({
+      currentAddressId: f.address.id,
+      candidateAddressId: f.address.id,
+      currentVersion: 1,
+      candidateVersion: 2,
+    });
+    await f.round("failure");
+    await f.round("failure");
+    for (const endpoint of f.endpoints)
+      expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).not.toBe("unhealthy");
+    await f.round("failure");
+    for (const endpoint of f.endpoints)
+      expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("unhealthy");
+    await f.plan();
+    await f.execute();
+    expect(f.remote.get("zone-0")!.content).toBe("192.0.2.88");
+    expect(f.remote.get("zone-1")!.content).toBe("192.0.2.88");
+    await f.round("success");
+    await f.round("success");
+    await f.round("success");
+    for (const endpoint of f.endpoints)
+      expect((await f.d.select().from(db.endpoints).where(eq(db.endpoints.id, endpoint.id)))[0]!.healthState).toBe("unhealthy");
+    expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({
+      currentVersion: 1,
+      candidateVersion: 2,
+    });
+    expect(await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
+  },
+);

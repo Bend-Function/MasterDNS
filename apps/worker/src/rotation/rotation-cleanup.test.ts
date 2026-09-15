@@ -245,17 +245,15 @@ it("retains an IPv6 resource still referenced by an equivalent expanded DNS addr
     .insert(db.zones)
     .values({ providerAccountId: account!.id, externalId: randomUUID(), nameAscii: "reference.test" })
     .returning();
-  await f.d
-    .insert(db.dnsRecords)
-    .values({
-      zoneId: zone!.id,
-      externalId: "old-v6",
-      type: "AAAA",
-      name: "www.reference.test",
-      content: "2001:0DB8:0000:0000:0000:0000:0000:0001",
-      ttl: 60,
-      remoteHash: "test",
-    });
+  await f.d.insert(db.dnsRecords).values({
+    zoneId: zone!.id,
+    externalId: "old-v6",
+    type: "AAAA",
+    name: "www.reference.test",
+    content: "2001:0DB8:0000:0000:0000:0000:0000:0001",
+    ttl: 60,
+    remoteHash: "test",
+  });
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(0);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupError).toBe(
@@ -278,4 +276,20 @@ it("uses the immutable original ownership snapshot only after independent releas
     allocationId: f.resource.allocationId,
     address: f.resource.address,
   });
+});
+
+it("persists cleanup failure markers for the durable notification scanner", async () => {
+  const f = await cleanupFixture();
+  f.state.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({
+    cleanupStatus: "failed",
+    cleanupError: "transport_lost",
+  });
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({
+    phase: "cleanup",
+    errorCode: "cleanup_failed",
+  });
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBeNull();
 });

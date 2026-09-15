@@ -23,9 +23,12 @@ export class HealthResultService {
   }
   async applyCloudSlotRound(slotId: string, roundId: string, tx: Transaction) {
     const cloud = await lockRotationContext(tx, slotId);
-    if (cloud.slot.candidateAddressId || !cloud.slot.currentAddressId || cloud.slot.currentVersion === 0) return;
+    if (!cloud.slot.currentAddressId || cloud.slot.currentVersion === 0 || (cloud.slot.candidateAddressId && cloud.slot.candidateAddressId !== cloud.slot.currentAddressId)) return;
     const health = await lockRotationHealth(tx, cloud);
     if (!health.matches || !health.state?.lastCheckedAt || health.state.lastRoundId !== roundId || !health.config || !health.policy) return;
+    // Revalidation probes the same physical address under a new evidence version.
+    // Only full fresh failure may affect the published address; success still requires promotion.
+    if (cloud.slot.candidateAddressId && !health.failure) return;
     const targets = await tx.select({ endpoint: endpoints, pool: endpointPools, address: endpointAddresses })
       .from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId))
       .innerJoin(endpointPools, eq(endpointPools.id, endpoints.poolId))
@@ -54,7 +57,7 @@ export class HealthResultService {
       if (cloud) {
         const health = await lockRotationHealth(tx, cloud);
         const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, target.endpoint.id), eq(cloudEndpointLinks.family, target.address.family)));
-        if (cloud.slot.candidateAddressId || cloud.slot.currentAddressId !== slotEvidence!.addressId
+        if ((cloud.slot.candidateAddressId && (cloud.slot.candidateAddressId !== cloud.slot.currentAddressId || !health.failure)) || cloud.slot.currentAddressId !== slotEvidence!.addressId
           || cloud.slot.currentVersion !== slotEvidence!.addressVersion || cloud.address?.address !== target.address.address
           || link?.slotId !== cloud.slot.id || target.pool.ownerUserId !== cloud.account.ownerUserId
           || !health.matches || health.state?.lastRoundId !== authoritative!.roundId || health.config?.id !== target.config.id

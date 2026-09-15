@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { Injectable, Optional, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
+import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   CloudError,
@@ -28,7 +28,6 @@ import {
 } from "@masterdns/db";
 import type { SlotRef } from "@masterdns/contracts";
 import { DatabaseService } from "../database.service.js";
-import { QueueRuntimeService } from "../queue-runtime.service.js";
 import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease } from "./rotation-lock.js";
 import { livePublicationMatches, publicationAuthorizationError } from "./rotation-publication.service.js";
@@ -52,7 +51,6 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly database: DatabaseService,
     private readonly runtime: CloudRuntimeService,
-    @Optional() private readonly queues?: QueueRuntimeService,
   ) {}
   onModuleInit() {
     void this.tick();
@@ -190,31 +188,26 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       await this.receipt(r, dispatched.id, result, false);
     } catch (e) {
       const code = e instanceof CloudError ? e.code : e instanceof Error ? e.message.slice(0, 80) : "cleanup_failed";
-      await this.database.db
-        .update(rotationResources)
-        .set({
-          cleanupStatus: "failed",
-          cleanupError: code,
-          cleanupDueAt: new Date(Math.max(r.cleanupDueAt?.getTime() ?? 0, Date.now() + 30000)),
-        })
-        .where(and(eq(rotationResources.id, r.id), ne(rotationResources.cleanupStatus, "released")));
-      if (r.cleanupError !== code && code !== "cleanup_grace_pending") {
-        this.logger.warn(`Cleanup ${r.id}: ${code}`);
-        await this.queues?.notifications.add(
-          "fanout-event",
-          {
-            kind: "fanout",
-            event: {
-              eventId: randomUUID(),
-              eventType: "rotation.cleanup_failed",
-              ownerUserId: c.account.ownerUserId,
-              occurredAt: new Date().toISOString(),
-              payload: { summary: "Cloud address cleanup needs attention", resourceId: r.id, errorCode: code },
-            },
-          },
-          { removeOnComplete: 1000, removeOnFail: 1000 },
-        );
-      }
+      if (code === "cleanup_grace_pending") return;
+      // P11c's durable scanner is the only notification/routing authority.
+      await this.database.db.transaction(async (tx) => {
+        await lockRotationContext(tx, c.slot.id);
+        const failed = await tx
+          .update(rotationResources)
+          .set({
+            cleanupStatus: "failed",
+            cleanupError: code,
+            cleanupDueAt: new Date(Math.max(r.cleanupDueAt?.getTime() ?? 0, Date.now() + 30000)),
+          })
+          .where(and(eq(rotationResources.id, r.id), ne(rotationResources.cleanupStatus, "released")))
+          .returning({ id: rotationResources.id });
+        if (failed.length)
+          await tx
+            .update(rotationIncidents)
+            .set({ errorCode: "cleanup_failed", updatedAt: new Date() })
+            .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
+      });
+      if (r.cleanupError !== code) this.logger.warn(`Cleanup ${r.id}: ${code}`);
     } finally {
       await this.database.db.transaction((tx) => releaseRotationLease(tx, lease));
     }
@@ -367,6 +360,12 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
           ...(status === "applied" ? { attached: false, referenced: false } : {}),
         })
         .where(eq(rotationResources.id, r.id));
+      const [remainingFailure] = await tx.select({ id: rotationResources.id }).from(rotationResources)
+        .where(and(eq(rotationResources.incidentId, r.incidentId), eq(rotationResources.cleanupStatus, "failed")));
+      if (remainingFailure) await tx.update(rotationIncidents).set({ errorCode: "cleanup_failed", updatedAt: new Date() })
+        .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
+      else await tx.update(rotationIncidents).set({ errorCode: null, updatedAt: new Date() })
+        .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup"), eq(rotationIncidents.errorCode, "cleanup_failed")));
     });
   }
   private async rejectNoEffect(r: Resource, stepId: string, code: string) {

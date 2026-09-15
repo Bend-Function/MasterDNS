@@ -5,7 +5,7 @@ import { healthCheckConfigSchema, type HealthCheckConfig, type HealthCheckJob, t
 import {
   captureCloudPolicyLinks,
   prepareCloudPolicyRestore,
-  lockRotationContext,
+  lockRotationContexts,
   auditLogs,
   bindingAssignments,
   bindingEndpointHealth,
@@ -227,7 +227,7 @@ export class PoolsService {
     const eventId = randomUUID();
 
     const restored = await this.database.db.transaction(async (tx) => {
-      for (const slotId of [...new Set(snapshot.cloudLinks?.map(l => l.slotId) ?? [])].sort()) await lockRotationContext(tx, slotId);
+      await lockRotationContexts(tx, snapshot.cloudLinks?.map(l => l.slotId) ?? []);
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
       const [lockedPool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, poolId)).limit(1).for("update");
       if (!lockedPool || (actor.role !== "admin" && lockedPool.ownerUserId !== actor.id)) throw new NotFoundException("IP Pool 不存在");

@@ -10,7 +10,7 @@ import {
   managedAddressSlots,
   rotationIncidents,
 } from "./schema/index.js";
-import { lockRotationContext, type RotationContext, type RotationTransaction } from "./rotation-context.js";
+import { lockRotationContexts, type RotationTransaction } from "./rotation-context.js";
 import { resetHealthEvidence } from "./address-health.js";
 export type CloudPolicyLink = {
   endpointId: string;
@@ -47,9 +47,9 @@ export async function captureCloudPolicyLinks(tx: RotationTransaction, poolId: s
 /** Restore identity, never a historic IP. P7 retests the current observed slot;
  * P10 checks its live cloud attachment before any DNS publication. */
 export async function prepareCloudPolicyRestore(tx: RotationTransaction, poolId: string, ownerUserId: string, links: CloudPolicyLink[]) {
-  const contexts = new Map<string, RotationContext>();
+  const contexts = await lockRotationContexts(tx, links.map(link => link.slotId));
   for (const link of [...links].sort((a, b) => a.slotId.localeCompare(b.slotId))) {
-    const c = await lockRotationContext(tx, link.slotId);
+    const c = contexts.get(link.slotId)!;
     if (
       c.account.ownerUserId !== ownerUserId ||
       !c.account.enabled ||
@@ -75,7 +75,6 @@ export async function prepareCloudPolicyRestore(tx: RotationTransaction, poolId:
       .from(rotationIncidents)
       .where(and(eq(rotationIncidents.slotId, c.slot.id), ne(rotationIncidents.status, "complete")));
     if (incident || c.slot.candidateAddressId) throw new Error("cloud_restore_rotation_pending");
-    contexts.set(c.slot.id, c);
   }
   const current = await captureCloudPolicyLinks(tx, poolId);
   // Mode/slot migrations require the dedicated binding flow; fail before writes.

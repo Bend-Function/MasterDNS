@@ -1,4 +1,4 @@
-import { and, eq, ne, sql } from "drizzle-orm";
+import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationPolicies } from "./schema/index.js";
 import type { MasterDnsDatabase } from "./index.js";
 export type RotationTransaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
@@ -36,4 +36,25 @@ export function rotationAuthorizationError(c: RotationContext): string | undefin
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
   if (!c.iface || !c.address || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration) return "resource_not_found";
   if (c.conflictingManager) return "conflicting_manager";
+}
+
+/** Prelock the entire hierarchy before callers acquire any Pool lock. Sorting
+ * slots alone is insufficient: different slot sets can invert account order. */
+export async function lockRotationContexts(tx: RotationTransaction, slotIds: string[]) {
+  const ids = [...new Set(slotIds)].sort();
+  const contexts = new Map<string, RotationContext>();
+  if (!ids.length) return contexts;
+  const identities = () => tx.select({ slotId: managedAddressSlots.id, interfaceId: cloudInterfaces.id, accountId: cloudInstances.accountId, instanceId: cloudInstances.id })
+    .from(managedAddressSlots).innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+    .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId)).where(inArray(managedAddressSlots.id, ids));
+  const before = await identities();
+  if (before.length !== ids.length) throw new Error("rotation_not_found");
+  for (const id of [...new Set(before.map(row => row.accountId))].sort()) await tx.select({ id: cloudAccounts.id }).from(cloudAccounts).where(eq(cloudAccounts.id, id)).for("update");
+  for (const id of [...new Set(before.map(row => row.instanceId))].sort()) await tx.select({ id: cloudInstances.id }).from(cloudInstances).where(eq(cloudInstances.id, id)).for("update");
+  for (const id of ids) await tx.select({ id: managedAddressSlots.id }).from(managedAddressSlots).where(eq(managedAddressSlots.id, id)).for("update");
+  for (const id of [...new Set(before.map(row => row.interfaceId))].sort()) await tx.select({ id: cloudInterfaces.id }).from(cloudInterfaces).where(eq(cloudInterfaces.id, id)).for("share");
+  const after = await identities();
+  if (after.length !== before.length || after.some(row => !before.some(old => old.slotId === row.slotId && old.accountId === row.accountId && old.instanceId === row.instanceId && old.interfaceId === row.interfaceId))) throw new Error("rotation_identity_changed");
+  for (const id of ids) contexts.set(id, await lockRotationContext(tx, id));
+  return contexts;
 }
