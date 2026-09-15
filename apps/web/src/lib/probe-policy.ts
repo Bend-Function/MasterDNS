@@ -69,12 +69,11 @@ export type RoundVoteRow = {
 };
 
 export function roundVoteRows(round: RoundVoteInput): RoundVoteRow[] {
-  const rows = round.memberIds.map((id): RoundVoteRow => {
+  return round.memberIds.map((id): RoundVoteRow => {
+    if (id === "local") return { id, source: "local", outcome: round.localOutcome ?? "unknown", latencyMs: null, statusCode: null, receivedAt: round.localReceivedAt ?? null };
     const observation = round.observations.find((item) => item.probeId === id && item.status === "accepted");
     return observation
       ? { id, source: "probe", outcome: observation.outcome, latencyMs: observation.latencyMs, statusCode: observation.statusCode, receivedAt: observation.receivedAt }
       : { id, source: "probe", outcome: "unknown", latencyMs: null, statusCode: null, receivedAt: null };
   });
-  if (round.localOutcome) rows.push({ id: "local", source: "local", outcome: round.localOutcome, latencyMs: null, statusCode: null, receivedAt: round.localReceivedAt ?? null });
-  return rows;
 }

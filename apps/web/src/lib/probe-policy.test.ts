@@ -30,7 +30,7 @@ describe("defaultMinimumValid", () => {
 describe("roundVoteRows", () => {
   it("uses the round member snapshot and keeps absent, unavailable, and local votes distinct", () => {
     const rows = roundVoteRows({
-      memberIds: ["probe-a", "probe-b", "probe-c"],
+      memberIds: ["probe-a", "probe-b", "probe-c", "local"],
       localOutcome: "success",
       localReceivedAt: "2026-09-15T03:00:00.000Z",
       observations: [
@@ -48,6 +48,13 @@ describe("roundVoteRows", () => {
       ["local", "success"],
     ]);
     expect(rows.at(-1)?.receivedAt).toBe("2026-09-15T03:00:00.000Z");
+  });
+
+  it("shows one unknown local row when the fixed cohort has no local result", () => {
+    expect(roundVoteRows({ memberIds: ["local"], localOutcome: null, localReceivedAt: null, observations: [] })).toEqual([
+      { id: "local", source: "local", outcome: "unknown", latencyMs: null, statusCode: null, receivedAt: null },
+    ]);
+    expect(roundVoteRows({ memberIds: ["probe-a"], localOutcome: "success", localReceivedAt: "2026-09-15T03:00:00.000Z", observations: [] }).map((row) => row.id)).toEqual(["probe-a"]);
   });
 });
 
