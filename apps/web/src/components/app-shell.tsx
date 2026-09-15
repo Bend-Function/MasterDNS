@@ -49,7 +49,7 @@ const navigation = [
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { user, checking } = useSession();
+  const { user, checking, clear } = useSession();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [mobileViewport, setMobileViewport] = useState(false);
   const sidebarRef = useRef<HTMLElement>(null);
@@ -129,8 +129,9 @@ export function AppShell({ children }: { children: ReactNode }) {
   if (!user) return null;
 
   const logout = async () => {
-    if (!UI_PREVIEW) await api("/v1/auth/logout", { method: "POST" });
-    router.replace("/login");
+    clear();
+    try { if (!UI_PREVIEW) await api("/v1/auth/logout", { method: "POST" }); }
+    finally { router.replace("/login"); }
   };
 
   const mobileMenuActive = mobileViewport && mobileOpen;

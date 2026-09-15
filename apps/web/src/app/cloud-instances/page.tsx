@@ -2,7 +2,7 @@
 
 import { ExternalLink, RefreshCw, Search } from "lucide-react";
 import Link from "next/link";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
 import { RelativeTime } from "../../components/relative-time";
 import { Button, EmptyState, ErrorState, LoadingState, PageHeader, StatusBadge } from "../../components/ui";
@@ -10,6 +10,7 @@ import { api, UI_PREVIEW } from "../../lib/api";
 import { demoCloudInstances } from "../../lib/cloud-demo";
 import type { CloudAccount, CloudInstanceDetail, CloudInstanceRow } from "../../lib/cloud-types";
 import { loadVisibleInstanceAddresses } from "../../lib/cloud-ui";
+import { createRequestGeneration } from "../../lib/session-state";
 
 export default function CloudInstancesPage() {
   const [rows, setRows] = useState<CloudInstanceRow[]>(UI_PREVIEW ? demoCloudInstances : []);
@@ -20,28 +21,35 @@ export default function CloudInstancesPage() {
   const [addressLoading, setAddressLoading] = useState<string | null>(null);
   const [search, setSearch] = useState("");
   const [region, setRegion] = useState("");
+  const inventoryGeneration = useRef(createRequestGeneration());
 
   const load = useCallback(async () => {
+    const generation = inventoryGeneration.current.invalidate();
+    setAddresses({}); setAddressErrors({}); setAddressLoading(null);
     if (UI_PREVIEW) { setRows(demoCloudInstances); setLoading(false); return; }
     setLoading(true); setError(null);
     try {
-      setRows(await fetchCloudInstances());
-    } catch (value) { setError(value instanceof Error ? value.message : "实例清单加载失败"); }
-    finally { setLoading(false); }
+      const next = await fetchCloudInstances();
+      if (inventoryGeneration.current.isCurrent(generation)) setRows(next);
+    } catch (value) { if (inventoryGeneration.current.isCurrent(generation)) setError(value instanceof Error ? value.message : "实例清单加载失败"); }
+    finally { if (inventoryGeneration.current.isCurrent(generation)) setLoading(false); }
   }, []);
 
   useEffect(() => {
     if (UI_PREVIEW) return;
     let active = true;
-    fetchCloudInstances().then((value) => { if (active) setRows(value); }).catch((value) => { if (active) setError(value instanceof Error ? value.message : "实例清单加载失败"); }).finally(() => { if (active) setLoading(false); });
+    const generation = inventoryGeneration.current.current();
+    fetchCloudInstances().then((value) => { if (active && inventoryGeneration.current.isCurrent(generation)) setRows(value); }).catch((value) => { if (active && inventoryGeneration.current.isCurrent(generation)) setError(value instanceof Error ? value.message : "实例清单加载失败"); }).finally(() => { if (active && inventoryGeneration.current.isCurrent(generation)) setLoading(false); });
     return () => { active = false; };
   }, []);
   useEffect(() => { if (UI_PREVIEW) return; const refresh = () => void load(); window.addEventListener("masterdns:invalidate", refresh); return () => window.removeEventListener("masterdns:invalidate", refresh); }, [load]);
   const regions = useMemo(() => [...new Set(rows.map((row) => row.instance.region))].sort(), [rows]);
   const visible = useMemo(() => rows.filter(({ instance, account }) => (!region || instance.region === region) && `${instance.name ?? ""} ${instance.externalId} ${instance.service} ${instance.region} ${account?.name ?? ""}`.toLowerCase().includes(search.toLowerCase())), [region, rows, search]);
   const loadAddresses = async (row: CloudInstanceRow) => {
+    const generation = inventoryGeneration.current.current();
     setAddressLoading(row.instance.id);
     const result = await loadVisibleInstanceAddresses([row], 1, async (id) => (await api<CloudInstanceDetail>(`/v1/cloud-instances/${id}`)).addresses);
+    if (!inventoryGeneration.current.isCurrent(generation)) return;
     setAddresses((current) => ({ ...current, ...result.addresses }));
     setAddressErrors((current) => { const next = { ...current }; delete next[row.instance.id]; return { ...next, ...result.errors }; });
     setAddressLoading(null);

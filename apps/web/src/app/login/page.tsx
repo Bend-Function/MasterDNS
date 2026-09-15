@@ -4,10 +4,14 @@ import { LockKeyhole, ShieldCheck, Workflow } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { Button, Field } from "../../components/ui";
+import { useSession } from "../../components/session-context";
 import { api, jsonBody, UI_PREVIEW } from "../../lib/api";
+import { demoUser } from "../../lib/demo";
+import type { User } from "../../lib/types";
 
 export default function LoginPage() {
   const router = useRouter();
+  const { setUser } = useSession();
   const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -16,7 +20,8 @@ export default function LoginPage() {
     event.preventDefault();
     setLoading(true); setError(null);
     try {
-      if (!UI_PREVIEW) await api("/v1/auth/login", { method: "POST", ...jsonBody({ identifier, password }) });
+      const user = UI_PREVIEW ? demoUser : await api<User>("/v1/auth/login", { method: "POST", ...jsonBody({ identifier, password }) });
+      setUser(user);
       router.replace("/");
     } catch (value) { setError(value instanceof Error ? value.message : "登录失败"); }
     finally { setLoading(false); }
