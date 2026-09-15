@@ -6,7 +6,7 @@ import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { withCloudRequest } from "../cloud/cloud-idempotency.js";
-import type { RotationPolicyInput } from "./rotation.schemas.js";
+import type { RotationPolicyInput, RotationResumeInput } from "./rotation.schemas.js";
 
 @Injectable()
 export class RotationService {
@@ -70,10 +70,12 @@ export class RotationService {
       await rotationAudit(tx, updated!, "rotation.pause", actor.id); return updated!;
     });
   }
-  async resume(actor: AuthUser, id: string, key: string) {
+  async resume(actor: AuthUser, id: string, key: string, input: RotationResumeInput = {}) {
     const owned = await this.ownedIncident(actor, id);
-    const result = await this.transaction(async tx => withCloudRequest(tx, { key, actorUserId: actor.id, ownerUserId: owned.ownerUserId, action: "rotation.resume", request: { incidentId: id } }, async () => {
-      const c = await lockRotationContext(tx, owned.slotId); return resumeRotationIncident(tx, c, id, actor.id);
+    const result = await this.transaction(async tx => withCloudRequest(tx, { key, actorUserId: actor.id, ownerUserId: owned.ownerUserId, action: "rotation.resume", request: { incidentId: id, expectedPolicyRevision: input.expectedPolicyRevision } }, async () => {
+      const c = await lockRotationContext(tx, owned.slotId);
+      if (input.expectedPolicyRevision !== undefined && c.policy?.revision !== input.expectedPolicyRevision) throw new ConflictException("Rotation policy revision has changed");
+      return resumeRotationIncident(tx, c, id, actor.id);
     }));
     await this.wake(id); return result;
   }

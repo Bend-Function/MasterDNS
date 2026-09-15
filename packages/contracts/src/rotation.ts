@@ -17,3 +17,5 @@ export const rotationPolicySchema = z.object({
 }).strict();
 export const rotationStartSchema = z.object({ slotId: z.uuid() }).strict();
 export type RotationPolicyInput = z.infer<typeof rotationPolicySchema>;
+export const rotationResumeSchema = z.object({ expectedPolicyRevision: z.number().int().min(0).optional() }).strict().default({});
+export type RotationResumeInput = z.infer<typeof rotationResumeSchema>;

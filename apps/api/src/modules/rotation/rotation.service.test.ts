@@ -100,3 +100,22 @@ it("distinguishes observed hosts, candidate, last verified address and partial D
   expect(detail.addresses.lastVerified).toMatchObject({ address: "192.0.2.1", version: 1 });
   expect(detail.addresses.published.map(record => record.address).sort()).toEqual(["192.0.2.1", "198.51.100.2"].sort());
 });
+it("rejects a stale displayed policy revision without creating a resume budget segment", async () => {
+  const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID()); await service.pause(f.actor, incident.id);
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 1, enabled: true, maxAttempts: 5 }));
+  await expect(new RotationController(service).resume(f.actor, incident.id, randomUUID(), { expectedPolicyRevision: 1 })).rejects.toMatchObject({ status: 409 });
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id))).toHaveLength(1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id)))[0]!.status).toBe("paused");
+});
+it("replays the committed revision-pinned resume after policy changes and fingerprints the displayed revision", async () => {
+  const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID()); await service.pause(f.actor, incident.id);
+  const key = randomUUID(); const first = await service.resume(f.actor, incident.id, key, { expectedPolicyRevision: 1 });
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 1, enabled: true, maxAttempts: 5 }));
+  expect(await service.resume(f.actor, incident.id, key, { expectedPolicyRevision: 1 })).toEqual(first);
+  await expect(service.resume(f.actor, incident.id, key, { expectedPolicyRevision: 2 })).rejects.toMatchObject({ status: 409 });
+  const segments = await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id));
+  expect(segments).toHaveLength(2);
+  expect(segments.find(segment => segment.id === first.currentSegmentId)!.maxAttempts).toBe(3);
+});

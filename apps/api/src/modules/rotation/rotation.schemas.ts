@@ -1,1 +1,1 @@
-export { rotationPolicySchema, rotationStartSchema, type RotationPolicyInput } from "@masterdns/contracts";
+export { rotationPolicySchema, rotationStartSchema, rotationResumeSchema, type RotationResumeInput, type RotationPolicyInput } from "@masterdns/contracts";
