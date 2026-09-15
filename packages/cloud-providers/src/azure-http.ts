@@ -79,8 +79,10 @@ export class AzureHttp {
     private async send(url: string, init: RequestInit): Promise<AzureResponse> {
         try {
             const response = await this.fetcher(url, { ...init, redirect: 'manual', signal: AbortSignal.timeout(30000) });
-            if (response.status >= 300 && response.status < 400)
+            if (response.status >= 300 && response.status < 400) {
+                if (init.method !== 'GET' && new URL(url).origin === ARM_HOST) throw new CloudError('temporary_cloud_error', false, undefined, 'azure_write_outcome_unknown');
                 throw new CloudError('resource_ownership_ambiguous', false);
+            }
             const raw = await response.text();
             if (raw.length > 8 * 1024 * 1024)
                 throw new CloudError('temporary_cloud_error', true);

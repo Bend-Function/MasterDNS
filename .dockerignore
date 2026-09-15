@@ -1,5 +1,7 @@
 .git
 .gitignore
+.worktrees
+**/.worktrees
 .superpowers
 **/.superpowers
 node_modules

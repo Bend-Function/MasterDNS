@@ -61,3 +61,27 @@ describe("Linode HTTP boundaries", () => {
     await expect(http.all("/account/events")).rejects.toBeDefined();
   });
 });
+
+it.each(["POST", "DELETE"] as const)("preserves unknown %s effects after invalid successful response evidence", async method => {
+  for (const fault of ["missing identity", "wrong identity", "malformed JSON", "invalid shape", "redirect"] as const) {
+    let calls = 0;
+    const http = new LinodeHttp("secret", async (_url, init) => {
+      calls++;
+      if (init?.method === "GET") return response({});
+      if (fault === "malformed JSON") return new Response("{", { status: 200, headers: { "X-Customer-UUID": "customer" } });
+      if (fault === "invalid shape") return response(null);
+      if (fault === "redirect") return response({}, 302, { Location: "https://evil.test" });
+      return new Response("{}", { status: 200, headers: fault === "wrong identity" ? { "X-Customer-UUID": "other" } : {} });
+    });
+    await http.request("/profile");
+    await expect(http.request("/linode/instances/42/ips", { method })).rejects.toMatchObject({ code: "temporary_cloud_error", retryable: false, reason: "linode_write_outcome_unknown" });
+    expect(http.externalAccountId).toBe("customer");
+    expect(calls).toBe(2);
+  }
+});
+it.each(["missing", "wrong"] as const)("retains confirmed read identity rejection for a %s customer header", async fault => {
+  let calls = 0;
+  const http = new LinodeHttp("secret", async () => ++calls === 1 ? response({}) : new Response("{}", { status: 200, headers: fault === "wrong" ? { "X-Customer-UUID": "other" } : {} }));
+  await http.request("/profile");
+  await expect(http.request("/linode/instances/42")).rejects.toMatchObject({ code: "remote_identity_changed", retryable: false });
+});

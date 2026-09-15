@@ -201,7 +201,12 @@ function receipt(adapter: AzureCloudAdapter, a: RotationStepArguments, response?
     const async = response?.headers.get('azure-asyncoperation');
     const location = response?.headers.get('location');
     const operation = async ?? location;
-    return { allocationId: candidateId(a), resourceId: candidateId(a), ...(operation ? { operationId: operationUrl(adapter, operation) } : {}), before: { allocationId: originalId(a), address: a.slot.address, interfaceId: a.slot.interfaceId }, after: { ...(operation ? { operationKind: async ? 'azure-asyncoperation' : 'location' } : {}), ...(response ? { retryAfterMs: retryAfter(response.headers), pollAfter: Date.now() + (retryAfter(response.headers) ?? 0) } : {}) } };
+    let operationId: string | undefined;
+    if (operation) {
+        try { operationId = operationUrl(adapter, operation); }
+        catch { throw new CloudError('temporary_cloud_error', false, undefined, 'azure_write_outcome_unknown'); }
+    }
+    return { allocationId: candidateId(a), resourceId: candidateId(a), ...(operationId ? { operationId } : {}), before: { allocationId: originalId(a), address: a.slot.address, interfaceId: a.slot.interfaceId }, after: { ...(operation ? { operationKind: async ? 'azure-asyncoperation' : 'location' } : {}), ...(response ? { retryAfterMs: retryAfter(response.headers), pollAfter: Date.now() + (retryAfter(response.headers) ?? 0) } : {}) } };
 }
 async function poll(adapter: AzureCloudAdapter, a: RotationStepArguments): Promise<{
     status: 'ready' | 'pending';

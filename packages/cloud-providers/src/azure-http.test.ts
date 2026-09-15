@@ -51,3 +51,14 @@ describe('Azure fixed-host HTTP', () => {
         await expect(http.request('/subscriptions/subscription-1')).rejects.toMatchObject({ message: 'invalid_credentials' });
     });
 });
+
+it.each(['PUT', 'DELETE'])('keeps an ARM %s redirect response uncertain without following its bearer destination', async method => {
+    const destinations: string[] = [];
+    const http = new AzureHttp(credentials, async (url, init) => {
+        destinations.push(new URL(String(url)).hostname);
+        expect(init?.redirect).toBe('manual');
+        return String(url).includes('login.microsoftonline.com') ? response({ access_token: 'token', expires_in: 3600 }) : new Response(null, { status: 307, headers: { location: 'https://evil.test' } });
+    });
+    await expect(http.request('/subscriptions/subscription-1/resourceGroups/g/providers/Microsoft.Network/publicIPAddresses/a', method)).rejects.toMatchObject({ code: 'temporary_cloud_error', retryable: false, reason: 'azure_write_outcome_unknown' });
+    expect(destinations).toEqual(['login.microsoftonline.com', 'management.azure.com']);
+});

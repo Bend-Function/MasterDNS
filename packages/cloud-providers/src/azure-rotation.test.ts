@@ -132,7 +132,7 @@ describe('Azure exact-resource rotation', () => {
         const f = await prepare();
         const candidate = await f.adapter.execute(f.steps[0]!);
         f.setMutation(() => new Response('{}', { status: 202, headers: { 'azure-asyncoperation': 'https://evil.test/operation' } }));
-        await expect(f.adapter.execute(withCandidate(f.steps[1], candidate))).rejects.toMatchObject({ code: 'resource_ownership_ambiguous' });
+        await expect(f.adapter.execute(withCandidate(f.steps[1], candidate))).rejects.toMatchObject({ code: 'temporary_cloud_error', retryable: false, reason: 'azure_write_outcome_unknown' });
         const recovered = withCandidate(f.steps[1], candidate);
         recovered.arguments.previousExecution = true;
         expect(await f.adapter.observeDetails(recovered)).toMatchObject({ status: 'ambiguous' });

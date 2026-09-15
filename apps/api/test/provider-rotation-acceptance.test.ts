@@ -261,3 +261,107 @@ it.each(["azure", "linode"] as const)("cleans an allocated but never activated %
   const live = await (await f.runtime.adapter(f.account.id, remote.service)).inspect({ ...f.inventory.ref });
   expect(live.interfaces.flatMap(iface => iface.addresses).some(address => address.address === remote.oldAddress)).toBe(true);
 });
+
+it.each(["missing", "wrong"] as const)("observes a cleanup reboot whose successful response has a %s customer header without redispatch", async fault => {
+  const remote = linodeCloud();
+  const fetch = remote.fetch;
+  let corrupt = false;
+  remote.fetch = async (...args) => {
+    const result = await fetch(...args);
+    if (!corrupt || args[1]?.method !== "POST" || !String(args[0]).endsWith("/reboot")) return result;
+    const headers = new Headers(result.headers);
+    if (fault === "missing") headers.delete("X-Customer-UUID"); else headers.set("X-Customer-UUID", "wrong-customer");
+    return new Response(await result.text(), { status: result.status, headers });
+  };
+  const f = await setup(remote);
+  await f.drive(5); await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, f.incident.id));
+  await f.publication.observe(publication!.id);
+  await f.d.update(db.instanceAuthorizations).set({ allowReleaseAddress: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  const [old] = await f.d.update(db.rotationResources).set({ cleanupStatus: "pending", cleanupDueAt: new Date(0), cleanupAddressVersion: 2 }).where(and(eq(db.rotationResources.incidentId, f.incident.id), eq(db.rotationResources.role, "original"))).returning();
+  await f.cleanup.run(old!.id, new Date()); await f.cleanup.run(old!.id, new Date());
+  corrupt = true;
+  await f.cleanup.run(old!.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, old!.id));
+  const [step] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+  expect(step).toMatchObject({ status: "in_flight", plan: { action: "linode.instance.reboot" } });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(step!.id);
+  await f.cleanup.run(old!.id, new Date()); await f.cleanup.run(old!.id, new Date());
+  expect(remote.writes.filter(write => write.includes("/reboot"))).toHaveLength(2);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, step!.id)))[0]).toMatchObject({ status: "applied", receipt: { operationId: "12" } });
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
+});
+it.each(["missing", "wrong"] as const)("retains a charged unknown allocation after a successful POST with a %s customer header", async fault => {
+  const remote = linodeCloud();
+  const fetch = remote.fetch;
+  remote.fetch = async (...args) => {
+    const result = await fetch(...args);
+    if (args[1]?.method !== "POST" || !String(args[0]).endsWith("/ips")) return result;
+    const headers = new Headers(result.headers);
+    if (fault === "missing") headers.delete("X-Customer-UUID"); else headers.set("X-Customer-UUID", "wrong-customer");
+    return new Response(await result.text(), { status: result.status, headers });
+  };
+  const f = await setup(remote);
+  await f.drive(2);
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id));
+  const [step] = await f.d.select().from(db.rotationSteps).where(and(eq(db.rotationSteps.attemptId, attempt!.id), eq(db.rotationSteps.sequence, 0)));
+  expect(step!.status).toBe("in_flight");
+  expect(attempt!.charged).toBe(true);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(step!.id);
+  await f.drive(3);
+  expect(remote.writes).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, step!.id)))[0]!.status).toBe("ambiguous");
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
+});
+
+it.each([{ provider: "linode", fault: "missing" }, { provider: "linode", fault: "wrong" }, { provider: "azure", fault: "operation URL" }] as const)("observes $provider cleanup DELETE after invalid successful $fault response evidence", async ({ provider, fault }) => {
+  const remote = provider === "linode" ? linodeCloud() : azureCloud();
+  const fetch = remote.fetch;
+  const destinations: string[] = [];
+  remote.fetch = async (...args) => {
+    destinations.push(new URL(String(args[0])).hostname);
+    const result = await fetch(...args);
+    if (args[1]?.method !== "DELETE") return result;
+    const headers = new Headers(result.headers);
+    if (fault === "missing") headers.delete("X-Customer-UUID");
+    else if (fault === "wrong") headers.set("X-Customer-UUID", "wrong-customer");
+    else headers.set("Azure-AsyncOperation", "https://foreign.test/operation");
+    return new Response(result.status === 204 ? null : await result.text(), { status: result.status, headers });
+  };
+  const f = await setup(remote);
+  await f.drive(5); await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, f.incident.id));
+  await f.publication.observe(publication!.id);
+  await f.d.update(db.instanceAuthorizations).set({ allowReleaseAddress: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  const [old] = await f.d.update(db.rotationResources).set({ cleanupStatus: "pending", cleanupDueAt: new Date(0), cleanupAddressVersion: 2 }).where(and(eq(db.rotationResources.incidentId, f.incident.id), eq(db.rotationResources.role, "original"))).returning();
+  await f.cleanup.run(old!.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, old!.id));
+  const [step] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+  expect(step!.status).toBe("in_flight");
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(step!.id);
+  await f.cleanup.run(old!.id, new Date());
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, step!.id)))[0]!.status).toBe("applied");
+  expect(remote.writes.filter(write => write.startsWith("DELETE"))).toHaveLength(1);
+  expect(destinations).not.toContain("foreign.test");
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
+});
+it("still rejects a confirmed pre-write Linode identity mismatch without charging or writing", async () => {
+  const remote = linodeCloud();
+  const fetch = remote.fetch;
+  let corrupt = false;
+  remote.fetch = async (...args) => {
+    const result = await fetch(...args);
+    if (!corrupt || !String(args[0]).endsWith("/linode/instances/42") || args[1]?.method !== "GET") return result;
+    const headers = new Headers(result.headers); headers.set("X-Customer-UUID", "wrong-customer");
+    return new Response(await result.text(), { status: result.status, headers });
+  };
+  const f = await setup(remote);
+  await f.drive(); corrupt = true; await f.drive();
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id));
+  const [step] = await f.d.select().from(db.rotationSteps).where(and(eq(db.rotationSteps.attemptId, attempt!.id), eq(db.rotationSteps.sequence, 0)));
+  expect(step).toMatchObject({ status: "rejected_no_effect", errorCode: "remote_identity_changed" });
+  expect(attempt!.charged).toBe(false);
+  expect(remote.writes).toEqual([]);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(0);
+});

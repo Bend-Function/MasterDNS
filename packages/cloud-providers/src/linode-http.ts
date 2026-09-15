@@ -2,6 +2,7 @@ import { CloudError } from "./errors.js";
 
 const origin = "https://api.linode.com/v4";
 const maxPages = 1_000;
+const unknownWrite = () => new CloudError("temporary_cloud_error", false, undefined, "linode_write_outcome_unknown");
 export class LinodeHttp {
   externalAccountId?: string;
   permissionScopes: string[] = [];
@@ -18,7 +19,7 @@ export class LinodeHttp {
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
       });
     } catch { throw new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_transport_failed" : "linode_write_outcome_unknown"); }
-    if (response.status >= 300 && response.status < 400) throw new CloudError("remote_identity_changed", false, undefined, "linode_redirect_refused");
+    if (response.status >= 300 && response.status < 400) throw method === "GET" ? new CloudError("remote_identity_changed", false, undefined, "linode_redirect_refused") : unknownWrite();
     // Status and retry headers remain authoritative even when an error body is empty, HTML, or interrupted.
     let statusError: CloudError | undefined;
     if (!response.ok) {
@@ -38,18 +39,20 @@ export class LinodeHttp {
     catch { throw statusError ?? new CloudError("temporary_cloud_error", method === "GET", undefined, method === "GET" ? "linode_transport_failed" : "linode_write_outcome_unknown"); }
     let data: unknown;
     try { data = JSON.parse(body); }
-    catch { throw statusError ?? new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response"); }
+    catch { throw statusError ?? (method === "GET" ? new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response") : unknownWrite()); }
     if (statusError) {
       const error = data as { errors?: Array<{ reason?: string }> };
       const quota = Array.isArray(error?.errors) && error.errors.some(e => typeof e?.reason === "string" && /additional IPv4.*technical justification|IPv4.*quota|IP address.*limit/i.test(e.reason));
       if (response.status === 400 && quota) throw new CloudError("quota_exceeded", false, undefined, "linode_additional_ipv4_requires_approval");
       throw statusError;
     }
+    // A successful mutation has already crossed the write boundary. Invalid receipt
+    // identity is not evidence of rejection and must retain the durable unresolved step.
     const uuid = response.headers.get("X-Customer-UUID")?.trim();
-    if (!uuid || (this.externalAccountId !== undefined && uuid !== this.externalAccountId)) throw new CloudError("remote_identity_changed", false);
+    if (!uuid || (this.externalAccountId !== undefined && uuid !== this.externalAccountId)) throw method === "GET" ? new CloudError("remote_identity_changed", false) : unknownWrite();
+    if (data === null || typeof data !== "object") throw method === "GET" ? new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response") : unknownWrite();
     this.externalAccountId = uuid;
     this.permissionScopes = (response.headers.get("X-OAuth-Scopes") ?? "").split(/[\s,]+/).filter(Boolean);
-    if (data === null || typeof data !== "object") throw new CloudError("unknown_cloud_error", false, undefined, "linode_invalid_response");
     return data as T;
   }
 
