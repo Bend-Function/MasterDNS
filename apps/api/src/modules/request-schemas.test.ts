@@ -27,6 +27,12 @@ describe("Pool request schemas", () => {
     expect(() => createEndpointSchema.parse({ name: "dynamic", addressMode: "ddns", ipv4: "192.0.2.10" })).toThrow(/Agent 上报/);
   });
 
+  it("keeps cloud endpoint addresses under managed-slot control", () => {
+    expect(createEndpointSchema.parse({ name: "cloud", addressMode: "cloud" })).toMatchObject({ addressMode: "cloud" });
+    expect(() => createEndpointSchema.parse({ name: "cloud", addressMode: "cloud", ipv4: "192.0.2.10" })).toThrow(/cloud/i);
+    expect(() => updateEndpointSchema.parse({ addressMode: "cloud", ipv6: "2001:db8::10" })).toThrow(/cloud/i);
+  });
+
   it("rejects update requests containing only the force flag", () => {
     expect(() => updateEndpointSchema.parse({ forceApply: true })).toThrow(/至少提供/);
     expect(() => updateBindingSchema.parse({ forceApply: true })).toThrow(/至少提供/);

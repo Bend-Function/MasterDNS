@@ -25,7 +25,7 @@ export const updatePoolSchema = createPoolSchema.omit({ strategy: true }).partia
 
 export const createEndpointSchema = z.object({
   name: z.string().trim().min(1).max(120),
-  addressMode: z.enum(["static", "ddns"]).default("static"),
+  addressMode: z.enum(["static", "ddns", "cloud"]).default("static"),
   priority: z.number().int().min(0).max(1_000_000).default(100),
   lifecycle: z.enum(["enabled", "disabled", "maintenance", "draining"]).default("enabled"),
   ipv4: nullableIp(4).optional(),
@@ -33,11 +33,12 @@ export const createEndpointSchema = z.object({
 }).superRefine((value, context) => {
   if (value.addressMode === "static" && !value.ipv4 && !value.ipv6) context.addIssue({ code: "custom", message: "静态节点至少需要一个 IP 地址" });
   if (value.addressMode === "ddns" && (value.ipv4 || value.ipv6)) context.addIssue({ code: "custom", message: "DDNS 节点的地址由 Agent 上报" });
+  if (value.addressMode === "cloud" && (value.ipv4 || value.ipv6)) context.addIssue({ code: "custom", message: "Cloud 节点的地址由托管槽位提供" });
 });
 
 export const updateEndpointSchema = z.object({
   name: z.string().trim().min(1).max(120).optional(),
-  addressMode: z.literal("static").optional(),
+  addressMode: z.enum(["static", "cloud"]).optional(),
   priority: z.number().int().min(0).max(1_000_000).optional(),
   lifecycle: z.enum(["enabled", "disabled", "maintenance", "draining"]).optional(),
   ipv4: nullableIp(4).optional(),
@@ -46,6 +47,9 @@ export const updateEndpointSchema = z.object({
 }).superRefine((value, context) => {
   if (value.addressMode === "static" && !value.ipv4 && !value.ipv6) {
     context.addIssue({ code: "custom", message: "切换为静态节点时至少提供一个 IP 地址", path: ["addressMode"] });
+  }
+  if (value.addressMode === "cloud" && (value.ipv4 || value.ipv6)) {
+    context.addIssue({ code: "custom", message: "Cloud 节点的地址由托管槽位提供", path: ["addressMode"] });
   }
 }).refine((value) => Object.keys(value).some((key) => key !== "forceApply"), "至少提供一个要修改的字段");
 

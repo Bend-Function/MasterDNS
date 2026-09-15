@@ -15,6 +15,8 @@ import {
   uuid,
   varchar,
 } from "drizzle-orm/pg-core";
+import { addressFamilyEnum, defineCloudSchema, endpointAddressModeEnum } from "./cloud.js";
+export { addressFamilyEnum, cloudAddressKindEnum, cloudAddressOriginEnum, cloudProviderEnum, cloudServiceEnum, endpointAddressModeEnum } from "./cloud.js";
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -29,9 +31,7 @@ export const recordManagementEnum = pgEnum("record_management", ["unmanaged", "m
 export const poolStrategyEnum = pgEnum("pool_strategy", ["primary_backup", "healthy_set", "assignment_pool"]);
 export const selectionModeEnum = pgEnum("selection_mode", ["random", "ordered", "round_robin", "least_assigned"]);
 export const recoveryModeEnum = pgEnum("recovery_mode", ["automatic", "keep_current", "manual", "delayed"]);
-export const endpointAddressModeEnum = pgEnum("endpoint_address_mode", ["static", "ddns"]);
 export const endpointLifecycleEnum = pgEnum("endpoint_lifecycle", ["enabled", "disabled", "maintenance", "draining"]);
-export const addressFamilyEnum = pgEnum("address_family", ["4", "6"]);
 export const addressStateEnum = pgEnum("address_state", ["candidate", "current", "previous"]);
 export const healthStateEnum = pgEnum("health_state", ["unknown", "healthy", "degraded", "unhealthy", "recovering"]);
 export const healthStatPeriodEnum = pgEnum("health_stat_period", ["hour", "day"]);
@@ -148,7 +148,24 @@ export const endpoints = pgTable("endpoints", {
   lastCheckedAt: timestamp("last_checked_at", { withTimezone: true }),
   stateChangedAt: timestamp("state_changed_at", { withTimezone: true }).notNull().defaultNow(),
   ...timestamps,
-}, (table) => [uniqueIndex("endpoints_pool_name_unique").on(table.poolId, table.name), index("endpoints_pool_idx").on(table.poolId)]);
+}, (table) => [
+  uniqueIndex("endpoints_pool_name_unique").on(table.poolId, table.name),
+  index("endpoints_pool_idx").on(table.poolId),
+]);
+
+export const {
+  cloudAccounts,
+  cloudScanScopes,
+  cloudInstances,
+  cloudInterfaces,
+  cloudAddresses,
+  managedAddressSlots,
+  instanceAuthorizations,
+  cloudEndpointLinks,
+} = defineCloudSchema({
+  userId: () => users.id,
+  endpointId: () => endpoints.id,
+});
 
 export const endpointAddresses = pgTable("endpoint_addresses", {
   id: uuid("id").primaryKey().defaultRandom(),
