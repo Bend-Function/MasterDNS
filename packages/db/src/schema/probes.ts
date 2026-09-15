@@ -54,6 +54,60 @@ export function defineProbeSchema(dependencies: Dependencies) {
     uniqueIndex("probe_round_sequences_slot_unique").on(t.slotId).where(sql`${t.slotId} is not null`),
     uniqueIndex("probe_round_sequences_endpoint_family_unique").on(t.endpointId, t.family).where(sql`${t.endpointId} is not null`),
   ]);
+  const addressHealthPolicies = pgTable("address_health_policies", {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slotId: uuid("slot_id").references(dependencies.slotId, { onDelete: "cascade" }),
+    endpointId: uuid("endpoint_id").references(dependencies.endpointId, { onDelete: "cascade" }),
+    family: addressFamilyEnum("family").notNull(),
+    configId: uuid("config_id").notNull().references(dependencies.configId, { onDelete: "cascade" }),
+    mode: varchar("mode", { length: 16 }).$type<"local" | "external" | "mixed">().notNull().default("external"),
+    groupId: uuid("group_id").references(() => probeGroups.id, { onDelete: "set null" }),
+    revision: integer("revision").notNull().default(1),
+    consensus: jsonb("consensus").$type<ConsensusPolicy>().notNull().default({ mode: "majority", minimumValid: 1 }),
+    checkIntervalSeconds: integer("check_interval_seconds").notNull().default(15),
+    executionWindowSeconds: integer("execution_window_seconds").notNull().default(10),
+    resultExpirySeconds: integer("result_expiry_seconds").notNull().default(60),
+    successThreshold: integer("success_threshold").notNull().default(3),
+    failureThreshold: integer("failure_threshold").notNull().default(3),
+    networkPolicy: jsonb("network_policy").$type<ProbeTask["networkPolicy"]>(),
+    updatedAt: time("updated_at").notNull().defaultNow(),
+  }, t => [
+    check("address_health_policy_target", sql`num_nonnulls(${t.slotId}, ${t.endpointId}) = 1`),
+    check("address_health_policy_mode", sql`${t.mode} in ('local', 'external', 'mixed')`),
+    check("address_health_policy_bounds", sql`${t.revision} > 0 and ${t.successThreshold} > 0 and ${t.failureThreshold} > 0 and ${t.executionWindowSeconds} > 0 and ${t.checkIntervalSeconds} >= ${t.executionWindowSeconds} and ${t.resultExpirySeconds} >= ${t.executionWindowSeconds}`),
+    uniqueIndex("address_health_policy_slot_unique").on(t.slotId),
+    uniqueIndex("address_health_policy_endpoint_family_unique").on(t.endpointId, t.family),
+  ]);
+  // Deliberately no config/round/address FK: evidence identity and replay fence survive retention.
+  const addressHealthStates = pgTable("address_health_states", {
+    id: uuid("id").primaryKey().defaultRandom(),
+    slotId: uuid("slot_id").references(dependencies.slotId, { onDelete: "cascade" }),
+    endpointId: uuid("endpoint_id").references(dependencies.endpointId, { onDelete: "cascade" }),
+    family: addressFamilyEnum("family").notNull(),
+    addressId: uuid("address_id"),
+    addressVersion: integer("address_version").notNull().default(0),
+    configId: uuid("config_id"),
+    configVersion: integer("config_version").notNull().default(0),
+    policyId: uuid("policy_id"),
+    policyRevision: integer("policy_revision").notNull().default(0),
+    groupRevision: integer("group_revision"),
+    healthState: varchar("health_state", { length: 16 }).$type<"unknown" | "healthy" | "unhealthy" | "degraded" | "recovering">().notNull().default("unknown"),
+    consecutiveSuccesses: integer("consecutive_successes").notNull().default(0),
+    consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+    lastAppliedSequence: integer("last_applied_sequence").notNull().default(0),
+    lastRoundId: uuid("last_round_id"),
+    latestDecision: varchar("latest_decision", { length: 16 }).$type<"success" | "failure" | "unknown">().notNull().default("unknown"),
+    evidenceExpiresAt: time("evidence_expires_at"),
+    lastCheckedAt: time("last_checked_at"),
+    nextRoundAt: time("next_round_at"),
+    stateChangedAt: time("state_changed_at").notNull().defaultNow(),
+    updatedAt: time("updated_at").notNull().defaultNow(),
+  }, t => [
+    check("address_health_state_target", sql`num_nonnulls(${t.slotId}, ${t.endpointId}) = 1`),
+    check("address_health_state_counters", sql`${t.addressVersion} >= 0 and ${t.lastAppliedSequence} >= 0 and ${t.consecutiveSuccesses} >= 0 and ${t.consecutiveFailures} >= 0`),
+    uniqueIndex("address_health_state_slot_unique").on(t.slotId),
+    uniqueIndex("address_health_state_endpoint_family_unique").on(t.endpointId, t.family),
+  ]);
   const probeRounds = pgTable("probe_rounds", {
     id: uuid("id").primaryKey().defaultRandom(),
     slotId: uuid("slot_id").references(dependencies.slotId, { onDelete: "cascade" }),
@@ -62,6 +116,10 @@ export function defineProbeSchema(dependencies: Dependencies) {
     configId: uuid("config_id").notNull().references(dependencies.configId, { onDelete: "cascade" }),
     groupId: uuid("group_id").references(() => probeGroups.id, { onDelete: "set null" }),
     groupRevision: integer("group_revision"),
+    policyId: uuid("policy_id"),
+    policyRevision: integer("policy_revision"),
+    localOutcome: varchar("local_outcome", { length: 16 }).$type<"success" | "failure" | "unavailable">(),
+    localReceivedAt: time("local_received_at"),
     sequence: integer("sequence").notNull(),
     addressVersion: integer("address_version").notNull(),
     configVersion: integer("config_version").notNull(),
@@ -115,5 +173,18 @@ export function defineProbeSchema(dependencies: Dependencies) {
     measuredAt: time("measured_at").notNull(),
     receivedAt: time("received_at").notNull().defaultNow(),
   }, t => [index("probe_observations_round_idx").on(t.roundId), check("probe_observations_status", sql`${t.status} in ('accepted', 'stale')`), check("probe_observations_outcome", sql`${t.outcome} in ('success', 'failure', 'unavailable')`)]);
-  return { probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRoundSequences, probeRounds, probeTasks, probeObservations };
+  const probeObservationStats = pgTable("probe_observation_stats", {
+    id: uuid("id").primaryKey().defaultRandom(),
+    targetKey: varchar("target_key", { length: 80 }).notNull(),
+    probeId: varchar("probe_id", { length: 40 }).notNull(),
+    family: addressFamilyEnum("family").notNull(),
+    period: varchar("period", { length: 8 }).$type<"hour" | "day">().notNull(),
+    bucketStart: time("bucket_start").notNull(),
+    sampleCount: integer("sample_count").notNull(),
+    successCount: integer("success_count").notNull(),
+    unavailableCount: integer("unavailable_count").notNull(),
+    averageLatencyMs: real("average_latency_ms"),
+    updatedAt: time("updated_at").notNull().defaultNow(),
+  }, t => [uniqueIndex("probe_observation_stats_bucket_unique").on(t.targetKey, t.probeId, t.family, t.period, t.bucketStart)]);
+  return { probeObservationStats, addressHealthPolicies, addressHealthStates, probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRoundSequences, probeRounds, probeTasks, probeObservations };
 }

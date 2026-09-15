@@ -85,9 +85,18 @@ export async function executeEc2Rotation(step: CloudStep, accountId: string, sen
   if (step.action === "ec2.eip.allocate") {
     if (args.slot.family !== 4 || !selected.allocationId) throw new CloudError("invalid_rotation_step", false);
     const existing = await attemptAddress(step, send);
-    if (existing) return { ...allocationResult(step, existing), before, after: { address: existing } };
+    if (existing) {
+      if ((args.receipt?.allocationId && args.receipt.allocationId !== existing.AllocationId)
+        || (args.receipt?.candidateAddress && args.receipt.candidateAddress !== existing.PublicIp)) throw new CloudError("resource_ownership_ambiguous", false);
+      return { ...allocationResult(step, existing), before, after: { address: existing } };
+    }
+    if (args.receipt) throw new CloudError("resource_ownership_ambiguous", false);
+    const current = await readInterface(step, send);
+    const original = current.PrivateIpAddresses?.find(address => address.PrivateIpAddress === selected.privateAddress);
+    if (!selected.privateAddress || original?.Association?.PublicIp !== args.slot.address
+      || original.Association.AllocationId !== selected.allocationId) throw new CloudError("remote_identity_changed", false);
     const response = await send(new AllocateAddressCommand({ Domain: "vpc", TagSpecifications: [{ ResourceType: "elastic-ip", Tags: rotationTags(step) }] }));
-    return { ...allocationResult(step, response), before, after: { allocationId: response.AllocationId, publicIp: response.PublicIp } };
+    return { ...allocationResult(step, response), before: snapshot(current), after: { allocationId: response.AllocationId, publicIp: response.PublicIp } };
   }
   if (step.action === "ec2.eip.associate") {
     if (args.slot.family !== 4 || !selected.allocationId) throw new CloudError("invalid_rotation_step", false);

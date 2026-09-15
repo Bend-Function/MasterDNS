@@ -40,13 +40,8 @@ export const probeTaskSchema = z.object({
     context.addIssue({ code: "custom", path: ["address"], message: `address must be IPv${task.family}` });
   }
 
-  if (isPermanentlyForbiddenAddress(task.address, task.family)) {
-    context.addIssue({ code: "custom", path: ["address"], message: "address is not a permitted probe target" });
-  } else if (requiresPrivateAllowlist(task.address, task.family)) {
-    const allowed = task.networkPolicy?.allowedPrivateCIDRs.some((cidr) => cidrContains(cidr, task.address)) ?? false;
-    if (!allowed) {
-      context.addIssue({ code: "custom", path: ["address"], message: "restricted address is not explicitly allowed" });
-    }
+  if (!isAllowedProbeTarget(task.address, task.family, task.networkPolicy)) {
+    context.addIssue({ code: "custom", path: ["address"], message: "address is not a permitted probe target or is outside its private allowlist" });
   }
 });
 
@@ -107,6 +102,13 @@ export type ProbeTask = z.infer<typeof probeTaskSchema>;
 export type ProbeResult = z.infer<typeof probeResultSchema>;
 export type LeaseResponse = z.infer<typeof leaseResponseSchema>;
 export type ResultAck = z.infer<typeof resultAckSchema>;
+
+// Shared by wire validation and the local round executor; private permission is target-specific.
+export function isAllowedProbeTarget(address: string, family: 4 | 6, networkPolicy?: { allowedPrivateCIDRs: string[] } | undefined): boolean {
+  if (!(family === 4 ? ipv4Schema : ipv6Schema).safeParse(address).success) return false;
+  if (isPermanentlyForbiddenAddress(address, family)) return false;
+  return !requiresPrivateAllowlist(address, family) || (networkPolicy?.allowedPrivateCIDRs.some(cidr => cidrContains(cidr, address)) ?? false);
+}
 
 function isPermanentlyForbiddenAddress(address: string, family: 4 | 6): boolean {
   const ranges = family === 4

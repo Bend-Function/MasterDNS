@@ -117,8 +117,18 @@ export async function executeLightsailRotation(step: CloudStep, accountId: strin
     if (existing) {
       return { ...verifyCandidate(step, existing), before, after: { staticIp: existing } };
     }
+    if (args.receipt) throw new CloudError("resource_ownership_ambiguous", false);
+    let allocationBefore = before;
+    if (original.allocationId) {
+      const old = await readStaticIp(original.allocationId, send);
+      if (!old) throw new CloudError("resource_ownership_ambiguous", false);
+      verifyOriginal(step, old);
+      const current = await readInstance(step, send);
+      if (old.attachedTo !== current.name || current.isStaticIp !== true || current.publicIpAddress !== args.slot.address) throw new CloudError("remote_identity_changed", false);
+      allocationBefore = snapshot(current);
+    }
     const response = await send(new AllocateStaticIpCommand({ staticIpName: name }));
-    return { remoteId: name, allocationId: name, before, ...operationResult(response.operations) };
+    return { remoteId: name, allocationId: name, before: allocationBefore, ...operationResult(response.operations) };
   }
   if (step.action === "lightsail.static-ip.detach") {
     const oldName = originalName(step);

@@ -1,0 +1,102 @@
+import { randomUUID } from "node:crypto";
+import { migrate } from "drizzle-orm/postgres-js/migrator";
+import { eq } from "drizzle-orm";
+import { afterAll, beforeAll, expect, it, vi } from "vitest";
+import { bindingAssignments, cloudEndpointLinks, dnsRecords, domainBindings, endpointPools, endpoints, providerAccounts, zones, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, probeGroups, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationSteps, users } from "@masterdns/db";
+import type { AuthUser } from "../../auth/auth.types.js";
+vi.mock("../../config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
+import { RotationService } from "./rotation.service.js";
+import { RotationController } from "./rotation.controller.js";
+import { rotationPolicySchema } from "./rotation.schemas.js";
+let admin: ReturnType<typeof createDatabase>;
+let connection: ReturnType<typeof createDatabase>;
+let service: RotationService;
+const name = `rotation_api_${randomUUID().replaceAll("-", "")}`;
+beforeAll(async () => {
+  const root = process.env.MASTERDNS_TEST_DATABASE_URL; if (!root) throw new Error("MASTERDNS_TEST_DATABASE_URL is required");
+  admin = createDatabase(root); await admin.client.unsafe(`create database "${name}"`);
+  const url = new URL(root); url.pathname = `/${name}`; connection = createDatabase(url.toString());
+  await migrate(connection.db, { migrationsFolder: new URL("../../../../../packages/db/drizzle", import.meta.url).pathname });
+  service = new RotationService({ db: connection.db } as never, { rotation: { add: async () => ({}) } } as never);
+});
+afterAll(async () => { await connection?.close(); if (admin) { await admin.client.unsafe(`drop database if exists "${name}"`); await admin.close(); } });
+async function fixture() {
+  const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
+  const actor = { id: owner!.id, role: "user" } as AuthUser;
+  const [account] = await connection.db.insert(cloudAccounts).values({ ownerUserId: actor.id, provider: "aws", name: "AWS", externalAccountId: "123456789012", credentialCiphertext: "secret-ciphertext", credentialIv: "iv", credentialTag: "tag" }).returning();
+  await connection.db.insert(cloudScanScopes).values({ accountId: account!.id, service: "ec2", region: "us-east-1", generation: 1 });
+  const [instance] = await connection.db.insert(cloudInstances).values({ accountId: account!.id, service: "ec2", region: "us-east-1", externalId: `i-${randomUUID()}`, metadata: { present: true }, scanGeneration: 1 }).returning();
+  const [iface] = await connection.db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: "eni-test", scanGeneration: 1 }).returning();
+  const [address] = await connection.db.insert(cloudAddresses).values({ interfaceId: iface!.id, family: "4", kind: "host", address: "192.0.2.1", origin: "user", scanGeneration: 1 }).returning();
+  const [slot] = await connection.db.insert(managedAddressSlots).values({ interfaceId: iface!.id, family: "4", name: "primary", currentAddressId: address!.id, currentVersion: 1 }).returning();
+  await connection.db.insert(instanceAuthorizations).values({ instanceId: instance!.id, managed: true, allowIpv4Rotation: true });
+  const [config] = await connection.db.insert(healthCheckConfigs).values({ slotId: slot!.id, checkerType: "tcp", config: { port: 443 } }).returning();
+  const [group] = await connection.db.insert(probeGroups).values({ ownerUserId: actor.id, name: "external" }).returning();
+  const [policy] = await connection.db.insert(addressHealthPolicies).values({ slotId: slot!.id, family: "4", configId: config!.id, groupId: group!.id }).returning();
+  const [health] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", addressId: address!.id, addressVersion: 1, configId: config!.id, configVersion: 1, policyId: policy!.id, policyRevision: 1, groupRevision: 1, healthState: "unhealthy", latestDecision: "failure", consecutiveFailures: 3, lastRoundId: randomUUID(), lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).returning();
+  return { actor, account: account!, slot: slot!, policy: policy!, health: health! };
+}
+it("returns opt-in policy defaults and enforces revision and external threshold coverage", async () => {
+  const f = await fixture(); expect(await service.policy(f.actor, f.slot.id)).toMatchObject({ enabled: false, revision: 0, maxAttempts: 3 });
+  await expect(service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true, candidateWindowSeconds: 15 }))).rejects.toMatchObject({ status: 409 });
+  expect(await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }))).toMatchObject({ enabled: true, revision: 1 });
+  await expect(service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0 }))).rejects.toMatchObject({ status: 409 });
+});
+it("requires Idempotency-Key at the controller and derives the failure source on the server", async () => {
+  const f = await fixture(); const controller = new RotationController(service);
+  expect(() => controller.start(f.actor, { slotId: f.slot.id })).toThrow("Idempotency-Key is required");
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const key = randomUUID(); const first = await service.start(f.actor, f.slot.id, key); const retry = await service.start(f.actor, f.slot.id, key);
+  expect(first.id).toBe(retry.id); expect(first.sourceEventId).toBe(`health-${f.health.lastRoundId}-1`);
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id))).toHaveLength(1);
+});
+it("appends one resume budget for retried requests and retains exhausted history", async () => {
+  const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID());
+  await connection.db.update(rotationBudgetSegments).set({ attemptsUsed: 3, exhausted: true }).where(eq(rotationBudgetSegments.incidentId, incident.id));
+  await connection.db.update(rotationIncidents).set({ status: "exhausted", errorCode: "attempts_exhausted" }).where(eq(rotationIncidents.id, incident.id));
+  const key = randomUUID(); const one = await service.resume(f.actor, incident.id, key); const two = await service.resume(f.actor, incident.id, key);
+  expect(one.currentSegmentId).toBe(two.currentSegmentId); expect(one.currentSegmentId).not.toBe(incident.currentSegmentId);
+  const segments = await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id));
+  expect(segments).toHaveLength(2); expect(segments.find(s => s.id === incident.currentSegmentId)).toMatchObject({ attemptsUsed: 3, exhausted: true });
+});
+it("filters all queries by owner and redacts plans, receipts and encrypted credentials", async () => {
+  const f = await fixture(); const other = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID());
+  const attemptId = randomUUID();
+  await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident.id, segmentId: incident.currentSegmentId, sequence: 1, beforeInventory: { authorization: "secret-header" } });
+  await connection.db.insert(rotationSteps).values({ id: `${attemptId}:0:test`, attemptId, sequence: 0, plan: { id: "test", action: "test", resourceKey: "test", arguments: { token: "secret-token" }, destructive: false }, receipt: { secret: "secret-receipt" } });
+  const detail = JSON.stringify(await service.detail(f.actor, incident.id));
+  for (const secret of ["secret-header", "secret-token", "secret-receipt", "secret-ciphertext"]) expect(detail).not.toContain(secret);
+  expect(await service.list(other.actor)).toHaveLength(0);
+  await expect(service.detail(other.actor, incident.id)).rejects.toMatchObject({ status: 404 });
+  await expect(service.pause(other.actor, incident.id)).rejects.toMatchObject({ status: 404 });
+  await expect(service.policy(other.actor, f.slot.id)).rejects.toMatchObject({ status: 404 });
+});
+it("rejects local-only health and does not treat retained healthy state plus one success as fresh consensus", async () => {
+  const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  await connection.db.update(addressHealthPolicies).set({ mode: "local" }).where(eq(addressHealthPolicies.id, f.policy.id));
+  await expect(service.start(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  await connection.db.update(addressHealthPolicies).set({ mode: "external" }).where(eq(addressHealthPolicies.id, f.policy.id));
+  await connection.db.update(addressHealthStates).set({ healthState: "unhealthy", latestDecision: "failure", consecutiveFailures: 1 }).where(eq(addressHealthStates.id, f.health.id));
+  await expect(service.start(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+});
+it("distinguishes observed hosts, candidate, last verified address and partial DNS values", async () => {
+  const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID());
+  const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.2", origin: "system", scanGeneration: 1 }).returning();
+  await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
+  const [pool] = await connection.db.insert(endpointPools).values({ ownerUserId: f.actor.id, name: "pool", strategy: "primary_backup" }).returning();
+  const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool!.id, name: "cloud", addressMode: "cloud" }).returning();
+  await connection.db.insert(cloudEndpointLinks).values({ endpointId: endpoint!.id, family: "4", slotId: f.slot.id });
+  const [dnsAccount] = await connection.db.insert(providerAccounts).values({ ownerUserId: f.actor.id, provider: "cloudflare", name: "DNS", credentialCiphertext: "cipher", credentialIv: "iv", credentialTag: "tag" }).returning();
+  const [zone] = await connection.db.insert(zones).values({ providerAccountId: dnsAccount!.id, externalId: "zone", nameAscii: "example.com" }).returning();
+  const [binding] = await connection.db.insert(domainBindings).values({ poolId: pool!.id, zoneId: zone!.id, fqdn: "www.example.com", recordType: "A" }).returning();
+  const records = await connection.db.insert(dnsRecords).values(["192.0.2.1", "198.51.100.2"].map((address, i) => ({ zoneId: zone!.id, externalId: `record-${i}`, type: "A", name: "www.example.com", content: address, ttl: 60, remoteHash: "test", management: "managed" as const, managedByPoolId: pool!.id }))).returning();
+  await connection.db.insert(bindingAssignments).values({ domainBindingId: binding!.id, endpointId: endpoint!.id, dnsRecordId: records[1]!.id, desired: true, applied: false, reason: "partial" });
+  const detail = await service.detail(f.actor, incident.id);
+  expect(detail.instanceId).toBeTruthy();
+  expect(detail.addresses.candidate).toMatchObject({ address: "198.51.100.2", version: 2, verified: false });
+  expect(detail.addresses.lastVerified).toMatchObject({ address: "192.0.2.1", version: 1 });
+  expect(detail.addresses.published.map(record => record.address).sort()).toEqual(["192.0.2.1", "198.51.100.2"].sort());
+});

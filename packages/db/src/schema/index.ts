@@ -1,3 +1,4 @@
+import { defineRotationSchema } from "./rotation.js";
 import { defineProbeSchema } from "./probes.js";
 import { sql } from "drizzle-orm";
 import {
@@ -469,6 +470,8 @@ export const notificationDeliveries = pgTable("notification_deliveries", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (table) => [uniqueIndex("notification_event_channel_unique").on(table.eventId, table.channelId), index("notification_retry_idx").on(table.status, table.nextRetryAt)]);
 
-export const { probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRoundSequences, probeRounds, probeTasks, probeObservations } = defineProbeSchema({
+export const { probeObservationStats, addressHealthPolicies, addressHealthStates, probeAgents, probeTokens, probeGroups, probeGroupMembers, probeRoundSequences, probeRounds, probeTasks, probeObservations } = defineProbeSchema({
   userId: () => users.id, endpointId: () => endpoints.id, endpointAddressId: () => endpointAddresses.id, configId: () => healthCheckConfigs.id, slotId: () => managedAddressSlots.id,
 });
+
+export const { rotationPolicies, rotationIncidents, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications } = defineRotationSchema({ userId: () => users.id, slotId: () => managedAddressSlots.id });

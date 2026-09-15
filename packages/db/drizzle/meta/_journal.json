@@ -120,6 +120,20 @@
       "when": 1789443521819,
       "tag": "0016_sloppy_sheva_callister",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1789445027444,
+      "tag": "0017_jittery_excalibur",
+      "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789446133114,
+      "tag": "0018_strong_ser_duncan",
+      "breakpoints": true
     }
   ]
 }

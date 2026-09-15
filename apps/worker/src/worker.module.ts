@@ -1,3 +1,9 @@
+import { RotationProcessor } from "./rotation/rotation.processor.js";
+import { RotationRecoveryService } from "./rotation/rotation-recovery.service.js";
+import { RotationStore } from "./rotation/rotation-store.js";
+import { HealthResultService } from "./health/health-result.service.js";
+import { ProbeSchedulerService } from "./probes/probe-scheduler.service.js";
+import { ProbeHealthService } from "./probes/probe-health.service.js";
 import { Module } from "@nestjs/common";
 import { ReconcileProcessor } from "./automation/reconcile.processor.js";
 import { ReconcileOutboxService } from "./automation/reconcile-outbox.service.js";
@@ -17,6 +23,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
 
 @Module({
   providers: [
+    RotationProcessor, RotationRecoveryService, RotationStore,
     DatabaseService,
     CloudRuntimeService,
     CloudSyncService,
@@ -25,6 +32,9 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
     OperationProcessor,
     SyncProcessor,
     SyncSchedulerService,
+    HealthResultService,
+    ProbeHealthService,
+    ProbeSchedulerService,
     HealthProcessor,
     HealthSchedulerService,
     HealthRetentionService,

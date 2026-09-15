@@ -1,3 +1,4 @@
+import { RotationModule } from "./modules/rotation/rotation.module.js";
 import { ProbesModule } from "./modules/probes/probes.module.js";
 import { Module } from "@nestjs/common";
 import { APP_GUARD } from "@nestjs/core";
@@ -21,7 +22,7 @@ import { PoolsModule } from "./modules/pools/pools.module.js";
 import { UsersModule } from "./modules/users/users.module.js";
 
 @Module({
-  imports: [DatabaseModule, QueueModule, AuthModule, ProbesModule, CloudModule, UsersModule, ProviderAccountsModule, OperationsModule, DnsModule, PoolsModule, DdnsModule, NotificationsModule],
+  imports: [RotationModule, DatabaseModule, QueueModule, AuthModule, ProbesModule, CloudModule, UsersModule, ProviderAccountsModule, OperationsModule, DnsModule, PoolsModule, DdnsModule, NotificationsModule],
   controllers: [HealthController, EventsController],
   providers: [
     { provide: APP_GUARD, useClass: OriginGuard },

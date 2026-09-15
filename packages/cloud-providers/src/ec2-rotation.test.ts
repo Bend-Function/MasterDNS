@@ -46,12 +46,12 @@ it("observes public IP changes and identifies recycled candidates", async () => 
 });
 
 it("allocates tagged EIPs, saves the receipt and never releases the old EIP in the rotation plan", async () => {
-  const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "eipalloc-old" }] }] };
+  const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "eipalloc-old", privateAddress: "10.0.0.1" }] }] };
   const steps = plan(slot, i);
   expect(steps.map(s => s.action)).toEqual(["ec2.eip.allocate", "ec2.eip.associate"]);
   const writes: any[] = [];
   const cloud = adapter(async c => {
-    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [eni] };
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: { PublicIp: slot.address, AllocationId: "eipalloc-old" } }] }] };
     if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [] };
     writes.push(c); return { AllocationId: "eipalloc-new", PublicIp: "198.51.100.2" };
   });
@@ -270,4 +270,37 @@ it("requires the published EIP replacement on the exact selected private address
   });
   await expect(cloud.execute(step)).rejects.toMatchObject({ code: "remote_identity_changed" });
   expect(writes).toEqual([]);
+});
+
+it.each([
+  { label: "public address changed", publicIp: "198.51.100.77", privateIp: "10.0.0.1", allocationId: "eipalloc-old" },
+  { label: "private binding changed", publicIp: slot.address, privateIp: "10.0.0.2", allocationId: "eipalloc-old" },
+  { label: "allocation changed", publicIp: slot.address, privateIp: "10.0.0.1", allocationId: "eipalloc-other" },
+  { label: "address detached", publicIp: undefined, privateIp: "10.0.0.1", allocationId: undefined },
+])("refuses a fresh EIP allocation when the original $label", async ({ publicIp, privateIp, allocationId }) => {
+  const i: CloudInventory = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4, primary: true, privateAddress: "10.0.0.1", allocationId: "eipalloc-old" }] }] };
+  const step = plan(slot, i)[0]!;
+  const allocations: string[] = [];
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [] };
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: privateIp, Association: { PublicIp: publicIp, AllocationId: allocationId } }] }] };
+    allocations.push(c.constructor.name); return { AllocationId: "new", PublicIp: "198.51.100.2" };
+  });
+  await expect(cloud.execute(step)).rejects.toMatchObject({ code: "remote_identity_changed" });
+  expect(allocations).toEqual([]);
+});
+
+it("recovers an existing EIP allocation after the original changed without allocating again", async () => {
+  const i: CloudInventory = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4, primary: true, privateAddress: "10.0.0.1", allocationId: "eipalloc-old" }] }] };
+  const step = plan(slot, i)[0]!;
+  const allocations: string[] = [];
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: "new", PublicIp: "198.51.100.2", Tags: providers.rotationTags(step) }] };
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [] }] };
+    allocations.push(c.constructor.name); return {};
+  });
+  await expect(cloud.execute(step)).resolves.toMatchObject({ allocationId: "new" });
+  step.arguments.receipt = { allocationId: "different", candidateAddress: "198.51.100.3" };
+  await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
+  expect(allocations).toEqual([]);
 });
