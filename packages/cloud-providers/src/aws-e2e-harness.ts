@@ -42,7 +42,7 @@ const allowedActions = new Set([
 export type AwsE2eConfig = {
   credentials: AwsCredentials;
   scope: SlotRef;
-  lightsailScope?: { instanceName: string; staticIpName?: string };
+  lightsailScope?: { instanceName: string; ipv4Address: string; staticIpName?: string };
   write: boolean;
   journalPath?: string;
   observeTimeoutMs: number;
@@ -64,7 +64,7 @@ export type AwsE2eJournal = {
   version: 1;
   attemptId: string;
   scope: SlotRef;
-  lightsailScope?: { instanceName: string; staticIpName?: string };
+  lightsailScope?: { instanceName: string; ipv4Address: string; staticIpName?: string };
   original: CloudInventory;
   phase: "running" | "pending" | "needs_review" | "completed";
   steps: AwsE2eJournalStep[];
@@ -170,14 +170,17 @@ export function loadAwsE2eConfig(environment: NodeJS.ProcessEnv | Record<string,
     throw new Error("invalid Lightsail instance or interface scope");
   }
   const lightsailMissing = service === "lightsail"
-    ? ["MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME", "MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME"].filter((name) => !environment[name]?.trim())
+    ? ["MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME", "MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME",
+      ...(family === 6 ? ["MASTERDNS_AWS_E2E_LIGHTSAIL_IPV4_ADDRESS"] : [])].filter((name) => !environment[name]?.trim())
     : [];
   if (lightsailMissing.length > 0) return { outcome: "skipped", reason: `missing required environment: ${lightsailMissing.join(", ")}` };
   const lightsailInstanceName = environment.MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME?.trim();
   const lightsailStaticIpValue = environment.MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME?.trim();
+  const lightsailIpv4Address = family === 4 ? address : environment.MASTERDNS_AWS_E2E_LIGHTSAIL_IPV4_ADDRESS?.trim();
   if (service === "lightsail" && (!isLightsailName(lightsailInstanceName!) || (lightsailStaticIpValue !== "none" && !isLightsailName(lightsailStaticIpValue!)))) {
     throw new Error("invalid Lightsail native resource scope");
   }
+  if (service === "lightsail" && isIP(lightsailIpv4Address!) !== 4) throw new Error("invalid MASTERDNS_AWS_E2E_LIGHTSAIL_IPV4_ADDRESS");
 
   const write = environment.MASTERDNS_AWS_E2E_WRITE === "1";
   if (environment.MASTERDNS_AWS_E2E_WRITE && !write) throw new Error("MASTERDNS_AWS_E2E_WRITE must be 1 when set");
@@ -205,6 +208,7 @@ export function loadAwsE2eConfig(environment: NodeJS.ProcessEnv | Record<string,
       },
       ...(service === "lightsail" ? { lightsailScope: {
         instanceName: lightsailInstanceName!,
+        ipv4Address: lightsailIpv4Address!,
         ...(lightsailStaticIpValue === "none" ? {} : { staticIpName: lightsailStaticIpValue! }),
       } } : {}),
       write,
@@ -359,7 +363,7 @@ function validateJournal(value: unknown): AwsE2eJournal {
   assertInventoryScope(journal.scope, journal.original, true);
   if (journal.scope.service === "lightsail") {
     const originalAddress = journal.original.interfaces.find((networkInterface) => networkInterface.id === journal.scope.interfaceId)
-      ?.addresses.find((address) => address.address === journal.scope.address && address.family === journal.scope.family);
+      ?.addresses.find((address) => address.address === journal.lightsailScope!.ipv4Address && address.family === 4);
     const staticName = journal.lightsailScope!.staticIpName;
     if (!originalAddress || (staticName !== undefined
       ? originalAddress.allocationId !== staticName || !originalAddress.resourceId
@@ -467,6 +471,7 @@ function isCloudInventory(value: unknown): value is CloudInventory {
 
 function isLightsailScope(value: unknown): value is NonNullable<AwsE2eConfig["lightsailScope"]> {
   return isRecord(value) && typeof value.instanceName === "string" && isLightsailName(value.instanceName)
+    && typeof value.ipv4Address === "string" && isIP(value.ipv4Address) === 4
     && (value.staticIpName === undefined || (typeof value.staticIpName === "string" && isLightsailName(value.staticIpName)));
 }
 
@@ -517,28 +522,38 @@ function lightsailInspectionScope(config: AwsE2eConfig, journal?: AwsE2eJournal)
   if (journal === undefined) return {
     mode: "initial",
     instanceName: config.lightsailScope.instanceName,
-    original: config.lightsailScope.staticIpName
-      ? { kind: "static", name: config.lightsailScope.staticIpName, address: config.scope.address }
-      : { kind: "dynamic", address: config.scope.address },
+    selected: { family: config.scope.family, address: config.scope.address },
+    ipv4: config.lightsailScope.staticIpName
+      ? { kind: "static", name: config.lightsailScope.staticIpName, address: config.lightsailScope.ipv4Address }
+      : { kind: "dynamic", address: config.lightsailScope.ipv4Address },
   };
-  const originalAddress = journal.original.interfaces.find((networkInterface) => networkInterface.id === config.scope.interfaceId)
-    ?.addresses.find((address) => address.address === config.scope.address && address.family === config.scope.family);
-  if (!originalAddress) throw new Error("invalid_aws_e2e_journal");
+  const networkInterface = journal.original.interfaces.find((candidate) => candidate.id === config.scope.interfaceId);
+  const selectedAddress = networkInterface?.addresses.find((address) => address.address === config.scope.address && address.family === config.scope.family);
+  const originalIpv4 = networkInterface?.addresses.find((address) => address.address === config.lightsailScope!.ipv4Address && address.family === 4);
+  if (!selectedAddress || !originalIpv4) throw new Error("invalid_aws_e2e_journal");
   const allocation = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.allocate" && entry.state === "applied");
   const candidate = allocation?.receipt;
   if (allocation && (!candidate?.allocationId || candidate.allocationId !== rotationResourceName(allocation.step)
     || !candidate.resourceId || !candidate.candidateAddress)) throw new Error("invalid_aws_e2e_journal");
   const detach = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.detach");
   const attach = journal.steps.find((entry) => entry.step.action === "lightsail.static-ip.attach");
+  const disable = journal.steps.find((entry) => entry.step.action === "lightsail.ipv6.disable");
+  const enable = journal.steps.find((entry) => entry.step.action === "lightsail.ipv6.enable");
+  const ipv6Candidate = enable?.state === "applied" ? enable.receipt?.candidateAddress : undefined;
+  if (enable?.state === "applied" && (!ipv6Candidate || isIP(ipv6Candidate) !== 6)) throw new Error("invalid_aws_e2e_journal");
   return {
     mode: "transition",
     instanceName: config.lightsailScope.instanceName,
-    original: originalAddress.allocationId && originalAddress.resourceId
-      ? { kind: "static", name: originalAddress.allocationId, address: originalAddress.address, resourceId: originalAddress.resourceId }
-      : { kind: "dynamic", address: originalAddress.address },
+    selected: { family: config.scope.family, address: selectedAddress.address },
+    ipv4: originalIpv4.allocationId && originalIpv4.resourceId
+      ? { kind: "static", name: originalIpv4.allocationId, address: originalIpv4.address, resourceId: originalIpv4.resourceId }
+      : { kind: "dynamic", address: originalIpv4.address },
     ...(candidate ? { candidate: { name: candidate.allocationId!, address: candidate.candidateAddress!, resourceId: candidate.resourceId! } } : {}),
     ...(detach && detach.state !== "planned" ? { allowDetachedOriginal: true } : {}),
     ...(attach && attach.state !== "planned" ? { allowCandidateAttached: true } : {}),
+    ...(disable && disable.state !== "planned" && enable?.state !== "applied" ? { allowIpv6Absent: true } : {}),
+    ...(enable && enable.state !== "planned" ? { allowIpv6Candidate: true } : {}),
+    ...(ipv6Candidate ? { ipv6Candidate } : {}),
   };
 }
 

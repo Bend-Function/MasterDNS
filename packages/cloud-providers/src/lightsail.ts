@@ -24,10 +24,14 @@ type ScopedOriginal =
 export type LightsailInspectionScope = {
   mode: "initial" | "transition";
   instanceName: string;
-  original: ScopedOriginal;
+  selected: { family: 4 | 6; address: string };
+  ipv4: ScopedOriginal;
   candidate?: { name: string; address: string; resourceId: string };
   allowDetachedOriginal?: boolean;
   allowCandidateAttached?: boolean;
+  allowIpv6Absent?: boolean;
+  allowIpv6Candidate?: boolean;
+  ipv6Candidate?: string;
 };
 
 export class LightsailCloudAdapter implements CloudAdapter {
@@ -150,12 +154,12 @@ export class LightsailCloudAdapter implements CloudAdapter {
       if (!instance || instance.name !== scope.instanceName || instance.arn !== ref.instanceId) throw new CloudError("remote_identity_changed", false);
       let staticIps: StaticIp[] = [];
       let originalStatic: StaticIp | undefined;
-      if (scope.original.kind === "static") {
-        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.original.name }));
+      if (scope.ipv4.kind === "static") {
+        const response = await this.lightsailSend(ref.region, new GetStaticIpCommand({ staticIpName: scope.ipv4.name }));
         originalStatic = response.staticIp as StaticIp | undefined;
         if (!originalStatic || !originalStatic.arn || !sameLightsailIdentity(instance.arn, originalStatic.arn, "StaticIp")
-          || originalStatic.name !== scope.original.name || originalStatic.ipAddress !== scope.original.address
-          || (scope.original.resourceId !== undefined && originalStatic.arn !== scope.original.resourceId)
+          || originalStatic.name !== scope.ipv4.name || originalStatic.ipAddress !== scope.ipv4.address
+          || (scope.ipv4.resourceId !== undefined && originalStatic.arn !== scope.ipv4.resourceId)
           || (originalStatic.attachedTo !== undefined && originalStatic.attachedTo !== scope.instanceName)) throw new CloudError("remote_identity_changed", false);
         staticIps.push(originalStatic);
       }
@@ -170,16 +174,28 @@ export class LightsailCloudAdapter implements CloudAdapter {
         staticIps.push(candidateStatic);
       }
 
-      const originalActive = scope.original.kind === "static" && originalStatic?.attachedTo === scope.instanceName
-        && instance.isStaticIp === true && instance.publicIpAddress === scope.original.address && candidateStatic?.attachedTo === undefined;
-      const originalDynamic = scope.original.kind === "dynamic" && instance.isStaticIp === false
-        && instance.publicIpAddress === scope.original.address && candidateStatic?.attachedTo === undefined;
-      const detachedOriginal = scope.mode === "transition" && scope.allowDetachedOriginal === true && scope.original.kind === "static"
+      const originalActive = scope.ipv4.kind === "static" && originalStatic?.attachedTo === scope.instanceName
+        && instance.isStaticIp === true && instance.publicIpAddress === scope.ipv4.address && candidateStatic?.attachedTo === undefined;
+      const originalDynamic = scope.ipv4.kind === "dynamic" && instance.isStaticIp === false
+        && instance.publicIpAddress === scope.ipv4.address && candidateStatic?.attachedTo === undefined;
+      const detachedOriginal = scope.mode === "transition" && scope.allowDetachedOriginal === true && scope.ipv4.kind === "static"
         && originalStatic?.attachedTo === undefined && instance.isStaticIp === false && candidateStatic?.attachedTo === undefined;
       const candidateActive = scope.mode === "transition" && scope.allowCandidateAttached === true && candidateStatic?.attachedTo === scope.instanceName
         && instance.isStaticIp === true && instance.publicIpAddress === scope.candidate?.address
-        && (scope.original.kind === "dynamic" || originalStatic?.attachedTo === undefined);
-      if (!originalActive && !originalDynamic && !detachedOriginal && !candidateActive) throw new CloudError("remote_identity_changed", false);
+        && (scope.ipv4.kind === "dynamic" || originalStatic?.attachedTo === undefined);
+      const ipv4Valid = originalActive || originalDynamic || detachedOriginal || candidateActive;
+      const addresses = instance.ipv6Addresses ?? [];
+      const originalIpv6 = scope.selected.family === 6 && scope.ipv6Candidate === undefined
+        && instance.ipAddressType === "dualstack" && addresses.includes(scope.selected.address);
+      const absentIpv6 = scope.selected.family === 6 && scope.mode === "transition" && scope.allowIpv6Absent === true
+        && instance.ipAddressType === "ipv4" && addresses.length === 0;
+      const newIpv6 = scope.selected.family === 6 && scope.mode === "transition" && scope.allowIpv6Candidate === true
+        && instance.ipAddressType === "dualstack" && addresses.length === 1
+        && (scope.ipv6Candidate === undefined || addresses[0] === scope.ipv6Candidate);
+      const selectedValid = scope.selected.family === 4
+        ? scope.selected.address === scope.ipv4.address
+        : originalIpv6 || absentIpv6 || newIpv6;
+      if (!ipv4Valid || !selectedValid) throw new CloudError("remote_identity_changed", false);
 
       const inventory = mapLightsailInstance(this.accountId, ref.region, instance, staticIps);
       if (inventory === undefined) throw new CloudError("resource_not_found", false);

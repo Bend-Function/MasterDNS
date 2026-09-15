@@ -172,6 +172,22 @@ describe("AWS E2E configuration guards", () => {
     expect(scopedReads).toBe(1);
   });
 
+  it("requires an independently scoped Lightsail IPv4 address for an IPv6 slot", () => {
+    expect(loadAwsE2eConfig({
+      ...completeEnv,
+      MASTERDNS_AWS_E2E_SERVICE: "lightsail",
+      MASTERDNS_AWS_E2E_INSTANCE_ID: "arn:aws:lightsail:us-east-1:123456789012:Instance/instance-guid",
+      MASTERDNS_AWS_E2E_INTERFACE_ID: "primary",
+      MASTERDNS_AWS_E2E_ADDRESS: "2001:db8::10",
+      MASTERDNS_AWS_E2E_FAMILY: "6",
+      MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME: "web-one",
+      MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME: "none",
+    })).toEqual({
+      outcome: "skipped",
+      reason: "missing required environment: MASTERDNS_AWS_E2E_LIGHTSAIL_IPV4_ADDRESS",
+    });
+  });
+
   it.each([
     ["instance", { ...inventory, ref: { ...inventory.ref, instanceId: "i-0fedcba9876543210" } }, "scope_instance_mismatch"],
     ["interface", { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, id: "eni-unrelated" }] }, "scope_interface_mismatch"],

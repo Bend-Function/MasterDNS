@@ -20,6 +20,8 @@ const originalStaticName = "web-static";
 const originalStaticArn = `arn:aws:lightsail:us-east-1:${accountId}:StaticIp/original-guid`;
 const candidateAddress = "203.0.113.20";
 const candidateArn = `arn:aws:lightsail:us-east-1:${accountId}:StaticIp/candidate-guid`;
+const originalIpv6 = "2001:db8::10";
+const candidateIpv6 = "2001:db8::20";
 
 class MemoryJournal implements AwsE2eJournalStore {
   constructor(public value?: AwsE2eJournal) {}
@@ -178,7 +180,7 @@ function restartJournal(original: CloudInventory, slot: SlotRef, active: "detach
     version: 1,
     attemptId,
     scope: slot,
-    lightsailScope: { instanceName, staticIpName: originalStaticName },
+    lightsailScope: { instanceName, staticIpName: originalStaticName, ipv4Address: originalAddress },
     original,
     phase: "running",
     steps: entries,
@@ -239,5 +241,170 @@ describe("AWS E2E Lightsail transitions", () => {
       .rejects.toThrow("invalid_aws_e2e_journal");
     expect(test.requests).toEqual([]);
     expect(test.writes).toEqual([]);
+  });
+});
+
+function ipv6Fixture(ipv4: "static" | "dynamic", initialMode: "original" | "disabled" | "candidate" | "unplanned" = "original", wrongStaticAddress = false) {
+  const slot: SlotRef = {
+    accountId,
+    service: "lightsail",
+    region: "us-east-1",
+    instanceId: instanceArn,
+    slotId: "public-v6",
+    interfaceId: "primary",
+    address: originalIpv6,
+    family: 6,
+  };
+  const original: CloudInventory = {
+    ref: slot,
+    nativeName: instanceName,
+    name: instanceName,
+    state: "running",
+    ipv6Only: false,
+    interfaces: [{ id: "primary", addresses: [
+      { address: originalAddress, family: 4, primary: true, ...(ipv4 === "static" ? { allocationId: originalStaticName, resourceId: originalStaticArn } : {}) },
+      { address: originalIpv6, family: 6, primary: true },
+    ] }],
+  };
+  const loaded = loadAwsE2eConfig({
+    MASTERDNS_AWS_E2E_ACCESS_KEY_ID: "temporary-access-key",
+    MASTERDNS_AWS_E2E_SECRET_ACCESS_KEY: "temporary-secret",
+    MASTERDNS_AWS_E2E_SESSION_TOKEN: "temporary-session-token",
+    MASTERDNS_AWS_E2E_ACCOUNT_ID: accountId,
+    MASTERDNS_AWS_E2E_SERVICE: "lightsail",
+    MASTERDNS_AWS_E2E_REGION: "us-east-1",
+    MASTERDNS_AWS_E2E_INSTANCE_ID: instanceArn,
+    MASTERDNS_AWS_E2E_SLOT_ID: "public-v6",
+    MASTERDNS_AWS_E2E_INTERFACE_ID: "primary",
+    MASTERDNS_AWS_E2E_ADDRESS: originalIpv6,
+    MASTERDNS_AWS_E2E_FAMILY: "6",
+    MASTERDNS_AWS_E2E_LIGHTSAIL_INSTANCE_NAME: instanceName,
+    MASTERDNS_AWS_E2E_LIGHTSAIL_STATIC_IP_NAME: ipv4 === "static" ? originalStaticName : "none",
+    MASTERDNS_AWS_E2E_LIGHTSAIL_IPV4_ADDRESS: originalAddress,
+  });
+  if (loaded.outcome !== "ready") throw new Error("expected ready configuration");
+
+  let mode = initialMode;
+  const writes: string[] = [];
+  const requests: string[] = [];
+  const adapter = new LightsailCloudAdapter(accountId, loaded.config.credentials, {
+    stsSend: async () => ({ Account: accountId }),
+    lightsailSend: async (command) => {
+      const action = command.constructor.name;
+      requests.push(action);
+      if (action === "GetInstanceCommand") return { instance: {
+        name: instanceName,
+        arn: instanceArn,
+        state: { name: "running" },
+        ipAddressType: mode === "disabled" ? "ipv4" : "dualstack",
+        isStaticIp: ipv4 === "static",
+        publicIpAddress: originalAddress,
+        ipv6Addresses: mode === "disabled" ? [] : [mode === "original" ? originalIpv6 : candidateIpv6],
+      } };
+      if (action === "GetStaticIpCommand" && ipv4 === "static") return { staticIp: {
+        name: originalStaticName,
+        arn: originalStaticArn,
+        attachedTo: instanceName,
+        ipAddress: wrongStaticAddress ? "198.51.100.99" : originalAddress,
+      } };
+      if (action === "GetOperationCommand") return { operation: {
+        id: command.input.operationId,
+        status: "Succeeded",
+        resourceName: instanceName,
+      } };
+      if (action === "SetIpAddressTypeCommand") {
+        writes.push(action);
+        mode = command.input.ipAddressType === "ipv4" ? "disabled" : "candidate";
+        const id = mode === "disabled" ? "disable" : "enable";
+        return { operations: [{ id, status: "Started" }] };
+      }
+      throw new Error(`unexpected command ${action}`);
+    },
+  });
+  return {
+    adapter,
+    config: { ...loaded.config, write: true, journalPath: "/tmp/aws-e2e-lightsail-v6.json" },
+    original,
+    slot,
+    writes,
+    requests,
+    setMode: (value: typeof mode) => { mode = value; },
+  };
+}
+
+function ipv6RestartJournal(original: CloudInventory, slot: SlotRef, active: "disable" | "enable", ipv4: "static" | "dynamic"): AwsE2eJournal {
+  const attemptId = "aws-e2e-v6-restart";
+  const steps = planCloudRotation(slot, original, { allowStop: false, attemptId });
+  const entries: AwsE2eJournal["steps"] = [];
+  if (active === "disable") {
+    entries.push({ step: steps[0]!, state: "dispatched" }, { step: steps[1]!, state: "planned" });
+  } else {
+    const receipt = { remoteId: instanceArn, operationId: "disable", operationIds: ["disable"], before: { state: "before" }, after: { state: "after" } };
+    steps[0]!.arguments.receipt = structuredClone(receipt);
+    entries.push({ step: steps[0]!, state: "applied", receipt, observation: { ...receipt, status: "applied" } });
+    entries.push({ step: steps[1]!, state: "dispatched" });
+  }
+  return {
+    version: 1,
+    attemptId,
+    scope: slot,
+    lightsailScope: {
+      instanceName,
+      ipv4Address: originalAddress,
+      ...(ipv4 === "static" ? { staticIpName: originalStaticName } : {}),
+    },
+    original,
+    phase: "running",
+    steps: entries,
+  } as AwsE2eJournal;
+}
+
+describe("AWS E2E Lightsail IPv6 transitions", () => {
+  it.each(["static", "dynamic"] as const)("completes IPv6 rotation with independently scoped %s IPv4", async (ipv4) => {
+    const test = ipv6Fixture(ipv4);
+
+    await expect(runAwsE2e(test.config, { adapter: test.adapter, journal: new MemoryJournal() }))
+      .resolves.toMatchObject({ outcome: "completed", candidateAddress: candidateIpv6 });
+    expect(test.writes).toEqual(["SetIpAddressTypeCommand", "SetIpAddressTypeCommand"]);
+    expect(test.requests).not.toContain("GetInstancesCommand");
+    expect(test.requests).not.toContain("GetStaticIpsCommand");
+  });
+
+  it.each([
+    ["disable", "static"],
+    ["disable", "dynamic"],
+    ["enable", "static"],
+    ["enable", "dynamic"],
+  ] as const)("resumes a dispatched IPv6 %s with scoped %s IPv4", async (active, ipv4) => {
+    const test = ipv6Fixture(ipv4, active === "disable" ? "disabled" : "candidate");
+    const journal = new MemoryJournal(ipv6RestartJournal(test.original, test.slot, active, ipv4));
+
+    await expect(runAwsE2e(test.config, { adapter: test.adapter, journal }))
+      .resolves.toMatchObject({ outcome: "completed", candidateAddress: candidateIpv6 });
+    expect(test.writes).toEqual(active === "disable" ? ["SetIpAddressTypeCommand"] : []);
+  });
+
+  it("rejects an unplanned IPv6 change before mutation", async () => {
+    const test = ipv6Fixture("dynamic", "unplanned");
+    await expect(runAwsE2e({ ...test.config, write: false }, { adapter: test.adapter }))
+      .rejects.toMatchObject({ code: "remote_identity_changed" });
+    expect(test.writes).toEqual([]);
+  });
+
+  it("rejects a wrong independent static IPv4 scope before IPv6 mutation", async () => {
+    const test = ipv6Fixture("static", "original", true);
+    await expect(runAwsE2e(test.config, { adapter: test.adapter, journal: new MemoryJournal() }))
+      .rejects.toMatchObject({ code: "remote_identity_changed" });
+    expect(test.writes).toEqual([]);
+  });
+
+  it("rejects an unplanned return to the original IPv6 after a different candidate was applied", async () => {
+    const test = ipv6Fixture("dynamic");
+    const journal = new MemoryJournal();
+    await runAwsE2e(test.config, { adapter: test.adapter, journal });
+    test.setMode("original");
+
+    await expect(runAwsE2e(test.config, { adapter: test.adapter, journal }))
+      .rejects.toMatchObject({ code: "remote_identity_changed" });
   });
 });
