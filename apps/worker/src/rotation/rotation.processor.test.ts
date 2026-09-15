@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { createDatabase, rotationLeases } from "@masterdns/db";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease } from "./rotation-lock.js";
@@ -30,7 +30,7 @@ it("serializes concurrent physical-instance claims and fences a stale holder aft
 
 import { vi } from "vitest";
 import { CloudError, Ec2CloudAdapter, LightsailCloudAdapter, type CloudAdapter, type CloudInventory, type CloudStepResult } from "@masterdns/cloud-providers";
-import { addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
+import { auditLogs, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { RotationStore } from "./rotation-store.js";
 import { RotationProcessor } from "./rotation.processor.js";
@@ -295,4 +295,85 @@ it("preserves the same uncharged attempt for a due explicit throttling retry", a
   expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toMatchObject([{ id: before!.id, charged: true }]);
   expect(f.state.writes).toEqual([f.state.writes[0], f.state.writes[0]]);
   expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
+});
+it.each(["permission_denied", "quota_exceeded"] as const)("resumes a charged partial plan after %s without replacing its allocation", async code => {
+  const f = await fixture(); await drive(f, 3);
+  const [attempt] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+  const [allocation] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, f.state.writes[0]!));
+  f.state.error = new CloudError(code, false); await drive(f, 1);
+  const rejectedId = f.state.writes[1]!;
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, rejectedId)))[0]).toMatchObject({ status: "rejected_no_effect", errorCode: code });
+  f.state.error = undefined;
+  await connection.db.update(instanceAuthorizations).set({ revision: 2 }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await connection.db.transaction(async tx => resumeRotationIncident(tx, await lockRotationContext(tx, f.slot.id), f.incident.id, f.owner.id));
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, rejectedId)))[0]).toMatchObject({ status: "prepared", errorCode: null });
+  await drive(f, 2);
+  expect(f.state.writes).toEqual([allocation!.id, rejectedId, rejectedId]);
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, allocation!.id)))[0]!.receipt).toEqual(allocation!.receipt);
+  expect((await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.id, attempt!.id)))[0]).toMatchObject({ charged: true, status: "candidate" });
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.id, attempt!.segmentId)))[0]!.attemptsUsed).toBe(1);
+  const audit = await connection.db.select().from(auditLogs).where(and(eq(auditLogs.resourceId, f.incident.id), eq(auditLogs.action, "rotation.step_reprepared")));
+  expect(audit).toMatchObject([{ actorUserId: f.owner.id, afterSnapshot: { stepId: rejectedId, attemptId: attempt!.id, previousErrorCode: code } }]);
+});
+async function failingSlotBatch(f: Awaited<ReturnType<typeof fixture>>, count: number) {
+  const prefix = randomUUID().slice(0, 4);
+  const ids = Array.from({ length: count }, (_, i) => `00000000-${prefix}-4000-8000-${String(i + 1).padStart(12, "0")}`);
+  await connection.db.insert(managedAddressSlots).values(ids.map(id => ({ id, interfaceId: f.iface.id, family: "4" as const, name: id, currentAddressId: f.address.id, currentVersion: 1 })));
+  const configs = await connection.db.insert(healthCheckConfigs).values(ids.map(slotId => ({ id: randomUUID(), slotId, checkerType: "tcp", config: { port: 443 } }))).returning();
+  const policies = await connection.db.insert(addressHealthPolicies).values(configs.map(config => ({ id: randomUUID(), slotId: config.slotId, family: "4" as const, configId: config.id, groupId: f.group.id }))).returning();
+  await connection.db.insert(rotationPolicies).values(ids.map(slotId => ({ slotId, enabled: true })));
+  await connection.db.insert(addressHealthStates).values(policies.map(policy => ({ slotId: policy.slotId, family: "4" as const, addressId: f.address.id, addressVersion: 1, configId: policy.configId, configVersion: 1, policyId: policy.id, policyRevision: 1, groupRevision: 1, healthState: "unhealthy" as const, latestDecision: "failure" as const, consecutiveFailures: 3, lastRoundId: randomUUID(), lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) })));
+  return ids;
+}
+it("admits an eligible failure after more than 200 unauthorized failing slots", async () => {
+  const blocked = await fixture();
+  await connection.db.update(instanceAuthorizations).set({ managed: false }).where(eq(instanceAuthorizations.instanceId, blocked.instance.id));
+  const blockedSlots = await failingSlotBatch(blocked, 201);
+  const eligible = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "complete" }).where(eq(rotationIncidents.id, eligible.incident.id));
+  await connection.db.update(addressHealthStates).set({ lastRoundId: randomUUID() }).where(eq(addressHealthStates.id, eligible.health.id));
+  const recovery = new RotationRecoveryService({ db: connection.db } as never, { rotation: { add: async () => ({}) } } as never);
+  await recovery.recover();
+  expect(await connection.db.select().from(rotationIncidents).where(and(eq(rotationIncidents.slotId, eligible.slot.id), eq(rotationIncidents.status, "active")))).toHaveLength(1);
+  expect(await connection.db.select().from(rotationIncidents).where(inArray(rotationIncidents.slotId, blockedSlots))).toHaveLength(0);
+}, 30000);
+it("defers more than 200 foreign-plan claim failures so later due incidents receive service", async () => {
+  const owner = await fixture(); const slots = await failingSlotBatch(owner, 201);
+  const incidentRows = slots.map((slotId, index) => ({ ...owner.incident, id: randomUUID(), slotId, sourceEventId: `blocked-${index}`, currentSegmentId: randomUUID(), nextRunAt: new Date(0) }));
+  await connection.db.insert(rotationIncidents).values(incidentRows);
+  await connection.db.insert(rotationBudgetSegments).values(incidentRows.map(incident => ({ id: incident.currentSegmentId, incidentId: incident.id, maxAttempts: 3 })));
+  await connection.db.insert(rotationLeases).values({ physicalKey: owner.incident.physicalKey, incidentId: owner.incident.id });
+  await connection.db.update(rotationIncidents).set({ nextRunAt: new Date(Date.now() + 60000) }).where(eq(rotationIncidents.id, owner.incident.id));
+  const eligible = await fixture(); await connection.db.update(rotationIncidents).set({ nextRunAt: new Date(1) }).where(eq(rotationIncidents.id, eligible.incident.id));
+  const jobs: string[] = [];
+  const recovery = new RotationRecoveryService({ db: connection.db } as never, { rotation: { add: async (_name: string, data: { incidentId: string }) => {
+    jobs.push(data.incidentId); const lease = await eligible.store.claim(data.incidentId); if (lease) await eligible.store.release(lease); return {};
+  } } } as never);
+  await recovery.recover(); expect(jobs).not.toContain(eligible.incident.id);
+  await recovery.recover(); expect(jobs).toContain(eligible.incident.id);
+  const [blocked] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, incidentRows[0]!.id));
+  expect(blocked!.nextRunAt.getTime()).toBeGreaterThan(Date.now());
+}, 30000);
+it("keeps attached candidate resources authoritative when an old lease's allocation observation arrives last", async () => {
+  const f = await fixture(); await drive(f, 2);
+  const allocationId = f.state.writes[0]!;
+  const allocationResult = { ...f.state.effect, status: "applied" as const, after: { stage: "allocation" } };
+  let started!: () => void; const reading = new Promise<void>(resolve => { started = resolve; });
+  let finish!: (result: typeof allocationResult) => void;
+  const delayed = new Promise<typeof allocationResult>(resolve => { finish = resolve; });
+  const observe = f.adapter.observeDetails!; let first = true;
+  f.adapter.observeDetails = async step => {
+    if (step.id === allocationId && first) { first = false; started(); return delayed; }
+    return { ...await observe(step), after: { stage: step.id === allocationId ? "allocation" : "attached" } };
+  };
+  const older = f.processor.run(f.incident.id); await reading;
+  await connection.db.update(rotationLeases).set({ expiresAt: new Date(0) }).where(eq(rotationLeases.physicalKey, f.incident.physicalKey));
+  await drive(f, 3);
+  const [installed] = await connection.db.select().from(rotationResources).where(and(eq(rotationResources.incidentId, f.incident.id), eq(rotationResources.role, "candidate")));
+  expect(installed).toMatchObject({ attached: true, referenced: true });
+  finish(allocationResult); await older;
+  const [after] = await connection.db.select().from(rotationResources).where(eq(rotationResources.id, installed!.id));
+  expect(after).toMatchObject({ addressId: installed!.addressId, attached: true, referenced: true, snapshot: { receipt: { after: { stage: "attached" } } } });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateVersion).toBe(2);
+  expect(f.state.writes).toHaveLength(2);
 });
