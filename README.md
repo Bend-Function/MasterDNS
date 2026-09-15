@@ -4,9 +4,13 @@
 
 ## 项目状态
 
-PRD v1.0、架构和数据模型已经确认。当前实现包含本地多用户、云账号加密、Cloudflare/阿里云适配、AWS EC2/Lightsail 地址轮换、周期同步与漂移修复、DNS Operation、外部探测、IP Pool 调度、DDNS Agent、Webhook/Telegram 通知和响应式管理控制台。
+PRD v1.0、架构和数据模型已经确认。当前实现包含本地多用户、云账号加密、Cloudflare/阿里云适配、AWS EC2/Lightsail、Azure VM 与 Linode 云资源清单和受限地址轮换、周期同步与漂移修复、DNS Operation、外部探测、IP Pool 调度、DDNS Agent、Webhook/Telegram 通知和响应式管理控制台。
 
 正式文档入口见 [docs/README.md](docs/README.md)，部署、备份和升级步骤见 [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)。
+
+云计算账号支持 AWS AccessKey/部署身份、Azure Service Principal 和 Linode Personal Access Token。地址绑定与监控不要求开启轮换；所有轮换及停机/重启/释放权限均需显式授权。Azure 支持符合条件的现有 NIC IP 配置 IPv4/IPv6；Linode 仅支持唯一旧版配置、Network Helper 已启用的 IPv4，SLAAC IPv6 只绑定与监控。Linode 额外 IPv4 需获批配额并产生费用，换址和释放后的清理会分别重启实例。
+
+能力、权限和恢复边界见 [Azure](docs/providers/azure.md)、[Linode](docs/providers/linode.md)；离线测试与待验收项见 [验收记录](docs/validation/azure-linode.md)。这些实现不代表已通过真实云写入或生产部署验收。
 
 ## Docker Compose
 
