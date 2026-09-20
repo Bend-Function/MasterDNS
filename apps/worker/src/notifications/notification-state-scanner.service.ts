@@ -9,6 +9,7 @@ import {
   cloudInstances,
   cloudInterfaces,
   endpoints,
+  endpointAddresses,
   endpointPools,
   managedAddressSlots,
   rotationAttempts,
@@ -17,7 +18,7 @@ import {
   rotationResources,
   rotationSteps,
 } from "@masterdns/db";
-import { and, asc, eq, gt, inArray } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
 
@@ -63,15 +64,17 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
       policy: addressHealthPolicies,
       endpointPool: endpointPools,
       account: cloudAccounts,
+      endpointAddress: endpointAddresses,
     }).from(addressHealthStates)
       .leftJoin(addressHealthPolicies, eq(addressHealthStates.policyId, addressHealthPolicies.id))
       .leftJoin(endpoints, eq(addressHealthStates.endpointId, endpoints.id))
+      .leftJoin(endpointAddresses, and(eq(addressHealthStates.addressId, endpointAddresses.id), eq(addressHealthStates.endpointId, endpointAddresses.endpointId), eq(addressHealthStates.family, endpointAddresses.family)))
       .leftJoin(endpointPools, eq(endpoints.poolId, endpointPools.id))
       .leftJoin(managedAddressSlots, eq(addressHealthStates.slotId, managedAddressSlots.id))
       .leftJoin(cloudInterfaces, eq(managedAddressSlots.interfaceId, cloudInterfaces.id))
       .leftJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id))
       .leftJoin(cloudAccounts, eq(cloudInstances.accountId, cloudAccounts.id))
-      .where(this.healthCursor ? gt(addressHealthStates.id, this.healthCursor) : undefined)
+      .where(and(this.healthCursor ? gt(addressHealthStates.id, this.healthCursor) : undefined, or(isNull(addressHealthStates.endpointId), ne(endpointAddresses.state, "previous"))))
       .orderBy(asc(addressHealthStates.id))
       .limit(batchSize);
     if (rows.length === 0) {
@@ -79,13 +82,13 @@ export class NotificationStateScannerService implements OnModuleInit, OnModuleDe
       return;
     }
     const poolIdsBySlot = await this.poolIdsBySlot(rows.flatMap(({ state }) => state.slotId ? [state.slotId] : []));
-    const events = rows.flatMap(({ state, policy, endpointPool, account }) => {
+    const events = rows.flatMap(({ state, policy, endpointPool, account, endpointAddress }) => {
       const ownerUserId = endpointPool?.ownerUserId ?? account?.ownerUserId;
       if (!ownerUserId) return [];
       const poolIds = state.slotId
         ? (poolIdsBySlot.get(state.slotId) ?? []).filter((pool) => pool.ownerUserId === ownerUserId).map((pool) => pool.poolId)
         : endpointPool ? [endpointPool.id] : [];
-      const event = healthEvent(state, policy, ownerUserId, poolIds);
+      const event = healthEvent(state, policy, ownerUserId, poolIds, endpointAddress);
       return event ? [event] : [];
     });
     await Promise.all(events.map((event) => this.enqueue(event)));
@@ -164,6 +167,7 @@ function healthEvent(
   policy: typeof addressHealthPolicies.$inferSelect | null,
   ownerUserId: string,
   poolIds: string[],
+  address: typeof endpointAddresses.$inferSelect | null,
 ): NotificationEvent | undefined {
   const currentPolicy = !!policy
     && policy.revision === state.policyRevision
@@ -181,11 +185,12 @@ function healthEvent(
       ? "health.target_recovered"
       : "health.insufficient_probes";
   const targetId = state.slotId ?? state.endpointId!;
+  const label = address ? `${address.state === "candidate" ? "Candidate" : "Current"} address ${address.address} for target ${targetId}` : `Health target ${targetId}`;
   const summary = state.latestDecision === "failure"
-    ? `Health target ${targetId} failed its health checks.`
+    ? `${label} failed its health checks.`
     : state.latestDecision === "success"
-      ? `Health target ${targetId} recovered.`
-      : `Health target ${targetId} has insufficient valid probe evidence.`;
+      ? `${label} recovered.`
+      : `${label} has insufficient valid probe evidence.`;
   return {
     eventId: stateEventId(["health", state.id, state.stateChangedAt.toISOString(), state.latestDecision, state.healthState]),
     eventType,
@@ -196,6 +201,7 @@ function healthEvent(
       summary,
       healthStateId: state.id,
       targetId,
+      ...(address ? { addressId: address.id, address: address.address, addressRole: address.state } : {}),
       targetType: state.slotId ? "managed_address_slot" : "endpoint",
       family: state.family,
       decision: state.latestDecision,

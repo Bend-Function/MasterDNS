@@ -10,6 +10,7 @@ import {
   cloudInterfaces,
   createDatabase,
   endpoints,
+  endpointAddresses,
   endpointPools,
   healthCheckConfigs,
   managedAddressSlots,
@@ -66,6 +67,18 @@ beforeEach(async () => {
 });
 
 describe("durable notification state scanning", () => {
+  it("labels candidate health separately and stops notifying previous addresses", async () => {
+    const f = await healthFixture({ decision: "failure", healthState: "unhealthy", consecutiveFailures: 3 });
+    await connection.db.update(endpointAddresses).set({ state: "candidate" }).where(eq(endpointAddresses.id, f.addressId));
+    const queues = fakeQueues();
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+    expect(queues.events[0]!.payload).toMatchObject({ addressId: f.addressId, addressRole: "candidate" });
+    expect(queues.events[0]!.payload.summary).toContain("Candidate address");
+    await connection.db.update(endpointAddresses).set({ state: "previous" }).where(eq(endpointAddresses.id, f.addressId));
+    const after = fakeQueues();
+    await new NotificationStateScannerService({ db: connection.db } as never, after as never).scanOnce();
+    expect(after.events).toEqual([]);
+  });
   it("keeps a confirmed after-threshold event stable across a lost wake and persists one delivery per channel", async () => {
     const fixture = await healthFixture({ decision: "failure", healthState: "unhealthy", consecutiveFailures: 4, failureThreshold: 3 });
     await insertChannel(fixture.ownerId, { isDefault: true });
@@ -273,6 +286,7 @@ async function healthFixture(input: {
   const owner = await insertUser();
   const pool = await insertPool(owner.id, randomUUID());
   const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool.id, name: "target" }).returning();
+  const [address] = await connection.db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: "4", address: "192.0.2.10", state: "current", source: "static" }).returning();
   const [config] = await connection.db.insert(healthCheckConfigs).values({
     endpointId: endpoint!.id,
     checkerType: "tcp",
@@ -288,6 +302,7 @@ async function healthFixture(input: {
   const changedAt = new Date("2026-09-15T01:02:03.000Z");
   const [state] = await connection.db.insert(addressHealthStates).values({
     endpointId: endpoint!.id,
+    addressId: address!.id,
     family: "4",
     configId: config!.id,
     configVersion: config!.revision,
@@ -299,7 +314,7 @@ async function healthFixture(input: {
     consecutiveFailures: input.consecutiveFailures ?? 0,
     stateChangedAt: changedAt,
   }).returning();
-  return { ownerId: owner.id, poolId: pool.id, stateId: state!.id };
+  return { ownerId: owner.id, poolId: pool.id, stateId: state!.id, addressId: address!.id };
 }
 
 async function rotationFixture(input: { status: "active" | "paused" | "exhausted" | "complete"; phase: "cloud" | "candidate" | "publish" | "cleanup" | "complete"; errorCode?: string }) {

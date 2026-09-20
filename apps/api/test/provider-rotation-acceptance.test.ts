@@ -371,9 +371,18 @@ it("still rejects a confirmed pre-write Linode identity mismatch without chargin
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(0);
 });
 
-it("recovers a lost Azure association through Updating without sticky ambiguity or another NIC PUT", async () => {
+it.each(["Updating", "original binding"] as const)("recovers a lost Azure association through %s without sticky ambiguity or another NIC PUT", async visibility => {
   const remote = azureCloud(), fetch = remote.fetch;
+  let nicPuts = 0;
+  let completeAssociation = async () => { remote.setNicState("Succeeded"); };
   remote.fetch = async (...args) => {
+    if (args[1]?.method === "PUT" && String(args[0]).includes("/networkInterfaces/")) {
+      nicPuts++;
+      if (visibility === "original binding") {
+        completeAssociation = async () => { await fetch(...args); };
+        throw new Error("lost-associate-response");
+      }
+    }
     const response = await fetch(...args);
     if (args[1]?.method === "PUT" && String(args[0]).includes("/networkInterfaces/")) { remote.setNicState("Updating"); throw new Error("lost-associate-response"); }
     return response;
@@ -386,8 +395,10 @@ it("recovers a lost Azure association through Updating without sticky ambiguity 
   await f.drive(2);
   expect((await getStep()).status).toBe("pending");
   expect((await getStep()).receipt).toMatchObject({ status: "pending" });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe((await getStep()).id);
+  expect(f.dnsWrites).toEqual([remote.oldAddress]);
   expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
-  remote.setNicState("Succeeded"); await f.drive(2);
+  await completeAssociation(); await f.drive(2);
   expect((await getStep()).status).toBe("applied");
   const [slot] = await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id));
   expect(slot).toMatchObject({ currentVersion: 1, candidateVersion: 2 });
@@ -395,6 +406,7 @@ it("recovers a lost Azure association through Updating without sticky ambiguity 
   expect((await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id))).map(a => a.id)).toEqual([attempt!.id]);
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.id, f.incident.currentSegmentId)))[0]!.attemptsUsed).toBe(1);
   expect(remote.writes.filter(w => w.includes("/networkInterfaces/"))).toHaveLength(1);
+  expect(nicPuts).toBe(1);
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
   await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
   expect(f.dnsWrites).toEqual([remote.oldAddress, remote.candidateAddress]);

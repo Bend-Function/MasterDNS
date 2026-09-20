@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { hasFreshHealthEvidence, probeObservationStats, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, addressHealthPolicies, addressHealthStates, probeObservations, probeTasks, probeRounds, probeAgents, endpointAddresses } from "@masterdns/db";
+import { hasFreshHealthEvidence, probeObservationStats, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, addressHealthPolicies, addressHealthStates, probeObservations, probeTasks, probeRounds, probeAgents, endpointAddresses, endpoints, reconcileIntents } from "@masterdns/db";
 import { randomUUID } from "node:crypto";
 import { fixture, testDatabase } from "./probe-test-utils.js";
 import { ProbeSchedulerService } from "./probe-scheduler.service.js";
@@ -190,4 +190,47 @@ it("timestamps evidence expiry once for downstream notification deduplication", 
  expect(state).toMatchObject({ latestDecision: "unknown", stateChangedAt: expiry });
  await scheduler.schedulePolicy(f.policy.id, new Date(expiry.getTime()+15000));
  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id)))[0]!.stateChangedAt).toEqual(expiry);
+});
+
+it.each(["external", "mixed"] as const)("keeps probing published DDNS current while a %s candidate fails", async mode => {
+  const f = await fixture(connection.db, "ddns");
+  const [current] = await connection.db.insert(endpointAddresses).values({ endpointId: f.endpoint.id, family: "4", address: "192.0.2.10", state: "current", source: "ddns", healthState: "healthy" }).returning();
+  await connection.db.update(endpoints).set({ healthState: "healthy" }).where(eq(endpoints.id, f.endpoint.id));
+  const [policy] = await connection.db.insert(addressHealthPolicies).values({ endpointId: f.endpoint.id, family: "4", configId: f.config.id, mode, groupId: f.group.id, consensus: { mode: "all", minimumValid: mode === "mixed" ? 3 : 2 }, successThreshold: 2, failureThreshold: 2 }).returning();
+  const initial = await scheduler.schedulePolicy(policy!.id, now);
+  let rounds = await connection.db.select().from(probeRounds).where(eq(probeRounds.endpointId, f.endpoint.id));
+  expect(rounds.map(r => r.endpointAddressId).sort()).toEqual([current!.id, f.address.id].sort());
+  for (let i = 0; i < 2; i++) {
+    if (i) {
+      await scheduler.schedulePolicy(policy!.id, new Date(now.getTime() + i * 15000));
+      rounds = (await connection.db.select().from(probeRounds).where(eq(probeRounds.endpointId, f.endpoint.id))).filter(r => r.status === "pending");
+    }
+    // Close candidate first to prove its higher sequence does not suppress current evidence.
+    rounds.sort((a, b) => Number(b.endpointAddressId === f.address.id) - Number(a.endpointAddressId === f.address.id));
+    for (const r of rounds) {
+      await vote(r.id, "failure");
+      if (mode === "mixed") await health.recordLocal(r.id, "failure", new Date(r.deadline.getTime() - 1));
+      await health.closeRound(r.id, r.deadline);
+    }
+  }
+  expect(initial).toBeDefined();
+  expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, current!.id)))[0]).toMatchObject({ state: "current", healthState: "unhealthy", consecutiveFailures: 2 });
+  expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, f.address.id)))[0]).toMatchObject({ state: "candidate", healthState: "unhealthy", consecutiveFailures: 2 });
+  expect((await connection.db.select().from(endpoints).where(eq(endpoints.id, f.endpoint.id)))[0]!.healthState).toBe("unhealthy");
+  const intents = await connection.db.select().from(reconcileIntents).where(eq(reconcileIntents.poolId, f.pool.id));
+  expect(intents.some(intent => intent.trigger === "failure")).toBe(true);
+  const states = await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id));
+  expect(states).toHaveLength(2);
+});
+
+it("supersedes accepted old-round results after same-IP address recreation", async () => {
+  const f = await target();
+  const old = await scheduler.schedulePolicy(f.policy.id, now);
+  await vote(old!.id, "success");
+  await connection.db.update(endpointAddresses).set({ state: "previous" }).where(eq(endpointAddresses.id, f.address.id));
+  const [replacement] = await connection.db.insert(endpointAddresses).values({ endpointId: f.endpoint.id, family: "4", address: f.address.address, state: "current", source: "static" }).returning();
+  await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 1000));
+  expect(await health.closeRound(old!.id, old!.deadline)).toBe("unknown");
+  expect((await connection.db.select().from(probeRounds).where(eq(probeRounds.id, old!.id)))[0]!.status).toBe("superseded");
+  expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, replacement!.id)))[0]).toMatchObject({ healthState: "unknown", consecutiveSuccesses: 0 });
 });

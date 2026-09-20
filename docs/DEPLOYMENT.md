@@ -106,40 +106,119 @@ IPv4 与 IPv6 使用独立健康策略和轮换开关。实例 `managed` 授权�
 
 ## 9. 备份与恢复
 
-数据库是持久状态的事实来源，Redis 仅保存可恢复的队列状态。建议每日执行 PostgreSQL 逻辑备份，并定期验证恢复流程：
+数据库是持久状态的事实来源，Redis 仅保存可恢复的队列状态。建议每日执行 PostgreSQL 逻辑备份，并定期在隔离环境演练恢复。备份还应记录应用 Git 版本、API/Worker/Web 镜像的不可变 ID 或 digest、Agent 精确版本、迁移记录和关键业务表行数；对应的 `.env` 和 `MASTER_ENCRYPTION_KEY` 应加密并分开保管。升级前的备份应在停止写入后执行。
+
+以下各命令块在子 shell 中遇错即停止。任何步骤失败都保持维护状态，不应跳过错误继续启动服务。目录名必须唯一：
 
 ```bash
-docker compose exec -T postgres pg_dump -U masterdns -d masterdns -Fc > masterdns.dump
-
-# 恢复窗口：先停止所有可能触发数据库写入的服务和 Web 入口
-docker compose stop web api worker migrate
-docker compose exec -T postgres pg_restore --clean --if-exists --exit-on-error -U masterdns -d masterdns < masterdns.dump
-docker compose run --rm migrate node packages/db/dist/preflight-cli.js
-docker compose run --rm migrate
-docker compose start api worker web
-docker compose ps
+(
+  set -eu
+  umask 077
+  backup_dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p backups
+  mkdir "$backup_dir"
+  cp .env "$backup_dir/.env"
+  git rev-parse HEAD > "$backup_dir/app-revision.txt"
+  # 在构建新镜像之前保存，避免相同标签指向新版本；保留这些本地镜像。
+  for service in api worker web; do
+    image_id="$(docker compose images -q "$service")"
+    test -n "$image_id"
+    docker image inspect --format '{{.Id}}' "$image_id" > "$backup_dir/$service-image.txt"
+  done
+  docker compose exec -T postgres pg_dump -U masterdns -d masterdns -Fc > "$backup_dir/masterdns.dump.partial"
+  mv "$backup_dir/masterdns.dump.partial" "$backup_dir/masterdns.dump"
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U masterdns -d masterdns \
+    -c 'SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY id' > "$backup_dir/migrations.txt"
+)
 ```
 
-恢复操作会覆盖目标数据库，应只在明确的恢复窗口执行。完整恢复需要同时具备数据库备份和对应的 `MASTER_ENCRYPTION_KEY`；Redis 卷可以重建，Worker 会扫描未完成的 Operation、持久通知状态与通知投递并重新入队。
+恢复旧备份必须使用**新建的空数据库**。不要对已升级的原库执行 `pg_restore --clean`：旧备份不包含新表及其外键，清理旧表可能失败并留下部分清理状态；加 `--single-transaction` 只能避免部分提交，不能解决新增依赖。下面的 `masterdns_restore`、`masterdns_before_restore` 必须是未占用的名称；若已存在，选择新的名称并一致修改命令，不要删除原有数据库来腾出名称。
 
-备份只能恢复平台的持久状态。恢复旧数据库前先停止 Web、API、Worker 和 migration，防止旧状态继续驱动副作用；恢复后先核对 AWS/Azure/Linode、DNS、candidate/current/publication 与 cleanup 的远端实际状态，再恢复自动化。数据库备份不能撤销已经执行的 EC2/Lightsail、Azure/Linode 或 DNS 写入，也不能找回已释放且不可复原的地址。
+```bash
+(
+  set -eu
+  docker compose stop web api worker migrate
+  # 同时停止其他部署副本、手工 migration 和直接连接数据库的写入者。
+  docker compose exec -T postgres createdb -U masterdns --template=template0 masterdns_restore
+  docker compose exec -T postgres pg_restore --exit-on-error --single-transaction \
+    -U masterdns -d masterdns_restore < backups/SELECT_BACKUP/masterdns.dump
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U masterdns -d masterdns_restore \
+    -c 'SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY id'
+)
+```
+
+切换前，将迁移记录与备份记录及**目标旧版本**的迁移 journal 核对，并验证用户、DNS 记录、端点/地址、凭证密文字段与关键行数。在隔离环境使用对应旧镜像和密钥完成读取/解密验收，禁用云/DNS 写入。恢复失败时原 `masterdns` 不受影响；保留失败的新库用于诊断，另建空库重试。不要使用最新镜像运行 migration 来“修复”旧备份，否则会再次升级 schema。
+
+验证通过且所有数据库客户端已退出后，从维护数据库 `postgres` 执行事务切换。PostgreSQL 17 支持以下事务内重命名；任何检查或重命名失败，整个事务回滚，原库名保留。命令不会强制断开连接，也不会删除原库：
+
+```bash
+docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U masterdns -d postgres <<'SQL'
+BEGIN;
+SET LOCAL lock_timeout = '10s';
+SET LOCAL statement_timeout = '30s';
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname IN ('masterdns', 'masterdns_restore')) THEN
+    RAISE EXCEPTION 'Stop all clients of masterdns and masterdns_restore before switching';
+  END IF;
+END $$;
+ALTER DATABASE masterdns RENAME TO masterdns_before_restore;
+ALTER DATABASE masterdns_restore RENAME TO masterdns;
+COMMIT;
+SQL
+```
+
+创建 `restore-images.yml`，为 `api`、`worker`、`web` 各自设置备份时记录的不可变镜像 ID（`image: sha256:...`）或已保留的固定 digest，并使用旧版本的 Compose 配置与匹配密钥。确认这些镜像仍存在；不得使用 `latest` 或已被新构建覆盖的标签。核对 AWS/Azure/Linode、DNS、candidate/current/publication 与 cleanup 的远端实际状态，处置未完成操作后，才在独立命令块中恢复服务：
+
+```bash
+(
+  set -eu
+  # 使用容器健康检查等待 API，避免宿主 shell 未加载 .env 中自定义端口。
+  docker compose -f docker-compose.yml -f restore-images.yml up -d --no-deps --no-build --pull never --wait --wait-timeout 120 api
+  docker compose -f docker-compose.yml -f restore-images.yml up -d --no-deps --no-build --pull never web worker
+  docker compose ps
+)
+```
+
+`--no-deps` 防止 Compose 隐式启动 migration；不要改用普通 `up -d` 或 `start` 来启动残留的新版本容器。若切换后验收失败，再停止全部客户端，使用同样的事务检查，将当前 `masterdns` 改名为新的保留名，再将 `masterdns_before_restore` 改回 `masterdns`，两个数据库均保留；重新启动前仍须确认对应镜像和远端状态。验证及保留期结束前不要删除原库。
+
+完整恢复需要数据库备份和对应的 `MASTER_ENCRYPTION_KEY`。Redis 卷可以重建，Worker 会扫描未完成的 Operation、持久通知状态与通知投递并重新入队；恢复旧数据库时应使用空的隔离队列或重建本部署专用 Redis，防止遗留任务混入，不能清空其他系统共享的 Redis。备份只能恢复平台持久状态，不能撤销已经执行的 EC2/Lightsail、Azure/Linode 或 DNS 写入，也不能找回已释放且不可复原的地址。
+
+仓库提供可选隔离演练 `pnpm test:database-restore`，须显式设置 `RESTORE_TEST_ENABLED=1`、`RESTORE_TEST_CONTAINER` 和该测试 PostgreSQL 的 `PG*` 连接参数；它只创建和清理随机命名的测试数据库，验证 0010 旧数据恢复、失败隔离、活动连接拒绝切换及事务正反向切换，不启动应用或调用云服务。
 
 ## 10. 升级与回退
 
-升级前先备份数据库和 `.env`，再构建并启动新版本：
+升级前按上一节保存旧镜像的不可变 ID、代码版本、Agent 版本和匹配密钥，并备份 `.env`。先构建新版本并只读预检；旧服务停止后再取一致的回退备份，重新预检并显式执行迁移。整个命令块中任一步失败都会退出，不启动新服务：
 
 ```bash
-git pull --ff-only
-docker compose build
-docker compose run --rm --no-deps migrate node packages/db/dist/preflight-cli.js
-docker compose up -d
-docker compose ps
-docker compose logs --since=10m migrate api worker
+(
+  set -eu
+  umask 077
+  git pull --ff-only
+  docker compose config --quiet
+  docker compose build
+  docker compose run --rm --no-deps migrate node packages/db/dist/preflight-cli.js
+  docker compose stop web api worker migrate
+  # 同时停止其他应用副本与直接写入者；postgres、redis 继续运行。
+  backup_dir="backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p backups
+  mkdir "$backup_dir"
+  cp .env "$backup_dir/.env"
+  docker compose exec -T postgres pg_dump -U masterdns -d masterdns -Fc > "$backup_dir/masterdns.dump.partial"
+  mv "$backup_dir/masterdns.dump.partial" "$backup_dir/masterdns.dump"
+  docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U masterdns -d masterdns \
+    -c 'SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY id' > "$backup_dir/migrations.txt"
+  docker compose run --rm --no-deps migrate node packages/db/dist/preflight-cli.js
+  docker compose run --rm --no-deps migrate
+  docker compose up -d --no-deps --no-build api worker web
+  docker compose ps
+  docker compose logs --since=10m api worker
+)
 ```
 
-升级预检是只读操作。若它报告同一 Zone、FQDN 和记录类型被多个 Pool 绑定，应在旧版本仍运行时根据报告中的 Binding/Pool ID 保留一个业务上正确的绑定，并删除或改名其他绑定；预检不会替操作员选择或删除数据。重复运行预检直至通过后再执行 `docker compose up -d`。健康检查唯一约束升级会按 `updated_at`、`created_at`、`id` 顺序保留每个 scope 最新的启用配置，并自动禁用其余旧配置。
+升级预检是只读操作。若它报告同一 Zone、FQDN 和记录类型被多个 Pool 绑定，应在旧版本仍运行时根据报告中的 Binding/Pool ID 保留一个业务上正确的绑定，并删除或改名其他绑定；预检不会替操作员选择或删除数据。重复运行预检直至通过，再进入停止写入、备份与迁移步骤；停服后的第二次预检用于捕获期间新增的冲突。不要在旧 API/Worker 仍运行时迁移，也不要在迁移非零退出后启动服务。健康检查唯一约束升级会按 `updated_at`、`created_at`、`id` 顺序保留每个 scope 最新的启用配置，并自动禁用其余旧配置。
 
-migration 只向前执行。升级前必须保存 PostgreSQL 备份、对应的 `MASTER_ENCRYPTION_KEY`、旧镜像标签和旧 Agent 精确版本。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则应在维护窗口恢复升级前数据库备份和旧镜像。down migration 即使存在也不能撤销已经执行的云计算或 DNS 写入；回退后必须按远端读取结果人工处置 partial publication、ambiguous ownership 和 cleanup failure，不能只回退代码。
+migration 只向前执行。若应用版本需要回退，应先确认旧版本能够读取新 schema；否则按上一节恢复升级前备份到新库，验证并切换，然后启动对应旧镜像。down migration 即使存在也不能撤销已经执行的云计算或 DNS 写入；回退后必须按远端读取结果人工处置 partial publication、ambiguous ownership 和 cleanup failure，不能只回退代码。
 
 ## 11. 常见检查
 

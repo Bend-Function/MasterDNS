@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { addressHealthStates, addressHealthPolicies, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, probeAgents } from "@masterdns/db";
+import { addressHealthStates, addressHealthPolicies, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, probeAgents, endpointAddresses } from "@masterdns/db";
 import { fixture, testDatabase } from "./health-policy-test-utils.js";
 import { HealthPoliciesService } from "./health-policies.service.js";
 let connection: Awaited<ReturnType<typeof testDatabase>>;
@@ -64,4 +64,27 @@ it("preserves revision and evidence for reordered JSONB consensus and HTTP heade
  const [state] = await connection.db.insert(addressHealthStates).values({ endpointId: f.endpoint.id, family: "4", latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
  expect((await service.save(actor, { ...input, consensus: { failureVotes: 1, minimumValid: 2, mode: "at_least" } })).revision).toBe(policy.revision);
  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, state!.id)))[0]).toMatchObject({ latestDecision: "success", evidenceExpiresAt: expiresAt });
+});
+
+it("reports current health separately from failed candidate and excludes previous addresses", async () => {
+ const f = await fixture(connection.db, "ddns");
+ const input = { endpointId: f.endpoint.id, family: "4", configId: f.config.id, mode: "external", groupId: f.group.id };
+ const policy = await service.save(f.actor as never, input);
+ const [current, previous] = await connection.db.insert(endpointAddresses).values([
+   { endpointId: f.endpoint.id, family: "4", address: "192.0.2.10", state: "current", source: "ddns" },
+   { endpointId: f.endpoint.id, family: "4", address: "192.0.2.11", state: "previous", source: "ddns" },
+ ]).returning();
+ const rows = await connection.db.insert(addressHealthStates).values([
+   { endpointId: f.endpoint.id, family: "4", addressId: f.address.id, policyId: policy.id, healthState: "unhealthy" },
+   { endpointId: f.endpoint.id, family: "4", addressId: previous!.id, policyId: policy.id, healthState: "healthy" },
+   { endpointId: f.endpoint.id, family: "4", addressId: current!.id, policyId: policy.id, healthState: "healthy" },
+ ]).returning();
+ const [listed] = await service.list(f.actor as never);
+ expect(listed!.state).toMatchObject({ addressId: current!.id, healthState: "healthy" });
+ expect((listed as any).states).toMatchObject([
+   { addressId: current!.id, address: "192.0.2.10", addressRole: "current", healthState: "healthy" },
+   { addressId: f.address.id, addressRole: "candidate", healthState: "unhealthy" },
+ ]);
+ await service.save(f.actor as never, { ...input, successThreshold: 4 });
+ for (const row of rows) expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, row.id)))[0]!.healthState).toBe("unknown");
 });

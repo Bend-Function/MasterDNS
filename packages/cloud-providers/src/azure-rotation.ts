@@ -351,6 +351,11 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         const persisted = validateCandidateReceipt(a);
         if (candidate.properties.ipAddress !== persisted.candidateAddress)
             return { ...a.receipt, status: 'ambiguous' };
+        // A dispatched NIC PUT can still expose the original binding before Updating.
+        // Keep observing this proven pre-write state; execution recovery never redispatches.
+        if (step.action === 'azure.public-ip.associate' && equalArmId(current.binding, originalId(a)) &&
+            old && equalArmId(old.properties.ipConfiguration?.id, a.slot.interfaceId) && !candidate.properties.ipConfiguration)
+            return { ...a.receipt, status: 'pending' };
         if (!equalArmId(current.binding, candidateId(a)) || !equalArmId(candidate.properties.ipConfiguration?.id, a.slot.interfaceId))
             return { ...a.receipt, status: 'ambiguous' };
         if (step.action === 'azure.public-ip.delete') {

@@ -2,6 +2,7 @@
 
 import type { ConsensusPolicy, HealthCheckConfig } from "@masterdns/contracts";
 import { useMemo, useState, type FormEvent } from "react";
+import { buildHttpHealthConfig } from "../lib/probe-health-config";
 import { consensusPreview, defaultMinimumValid, isSpecifiedProbeAllowed, validateProbePolicyDraft } from "../lib/probe-policy";
 import type { AddressHealthPolicy, HealthConfigRow, HealthPolicyInput, ProbeAgent, ProbeGroup } from "../lib/probe-types";
 import { Field, Switch } from "./ui";
@@ -74,11 +75,11 @@ export function ProbePolicyForm({ formId, targetKind, targetId, family, policy, 
     try {
       const nextConfig = checkType === "tcp"
         ? { type: "tcp" as const, port, timeoutMs }
-        : {
+        : buildHttpHealthConfig({
             type: "http" as const, protocol, ...(port ? { port } : {}), ...(hostname.trim() ? { hostname: hostname.trim() } : {}), method, path,
-            headers: parseHeaders(headers), expectedStatusMin: statusMin, expectedStatusMax: statusMax, ...(parseStatuses(statusList).length ? { expectedStatuses: parseStatuses(statusList) } : {}),
+            headers: parseHeaders(headers), expectedStatusMin: statusMin, expectedStatusMax: statusMax,
             ...(bodyContains ? { bodyContains } : {}), ...(bodyPattern ? { bodyPattern } : {}), followRedirects, verifyTls, timeoutMs,
-          };
+          }, statusList);
       await onSubmit({
         config: nextConfig,
         policy: {
@@ -113,6 +114,5 @@ export function ProbePolicyForm({ formId, targetKind, targetId, family, policy, 
 }
 
 function defaultConfig(): HealthCheckConfig { return { type: "http", protocol: "https", method: "GET", path: "/", headers: {}, expectedStatusMin: 200, expectedStatusMax: 399, followRedirects: true, verifyTls: true, timeoutMs: 3000 }; }
-function parseStatuses(value: string) { return value.split(",").map((item) => Number(item.trim())).filter((item) => Number.isInteger(item)); }
 function parseHeaders(value: string) { return Object.fromEntries(value.split("\n").map((line) => { const separator = line.indexOf(":"); return separator < 1 ? null : [line.slice(0, separator).trim(), line.slice(separator + 1).trim()]; }).filter((entry): entry is [string, string] => Boolean(entry))); }
 function policyError(value: string) { return ({ interval_before_window: "检查间隔不能短于轮次截止时间", expiry_before_window: "结果有效期不能短于轮次截止时间", timeout_exceeds_window: "外部检查超时需为任务领取保留至少 1 秒", minimum_valid_exceeds_cohort: "最少有效结果不能超过固定 Cohort", failure_votes_exceed_cohort: "失败票数不能超过固定 Cohort", slot_requires_external_vote: "云地址槽位必须包含至少一个有效外部探测票", group_required: "请选择探测组", specified_probe_required: "请选择固定 Cohort 内的探测点" } as Record<string, string>)[value] ?? "策略配置不合法"; }

@@ -135,7 +135,7 @@ describe('Azure exact-resource rotation', () => {
         await expect(f.adapter.execute(withCandidate(f.steps[1], candidate))).rejects.toMatchObject({ code: 'temporary_cloud_error', retryable: false, reason: 'azure_write_outcome_unknown' });
         const recovered = withCandidate(f.steps[1], candidate);
         recovered.arguments.previousExecution = true;
-        expect(await f.adapter.observeDetails(recovered)).toMatchObject({ status: 'ambiguous' });
+        expect(await f.adapter.observeDetails(recovered)).toMatchObject({ status: 'pending' });
         await expect(f.adapter.execute(recovered)).rejects.toMatchObject({ code: 'resource_ownership_ambiguous' });
         expect(f.writes).toHaveLength(2);
     });
@@ -147,6 +147,56 @@ describe('Azure exact-resource rotation', () => {
         const recovered = await f.adapter.execute({ ...step, arguments: { ...step.arguments, previousExecution: true } });
         expect(recovered.candidateAddress).toBe(candidate.candidateAddress);
         expect(f.writes).toHaveLength(2);
+    });
+    it.each([4, 6] as const)('keeps an in-flight IPv%s NIC association observable before Azure exposes the write', async family => {
+        const f = await prepare(fixture(family));
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        const step = withCandidate(f.steps[1], candidate);
+        let signalEntered!: () => void, finish!: () => void;
+        const entered = new Promise<void>(resolve => { signalEntered = resolve; });
+        const complete = new Promise<void>(resolve => { finish = resolve; });
+        let puts = 0;
+        const slow = new AzureCloudAdapter('account', credentials, { fetch: async (input, init) => {
+            if (new URL(String(input)).pathname === nicId && init?.method === 'PUT') {
+                puts++;
+                signalEntered();
+                await complete;
+                await f.fetcher(input, init);
+                throw new TypeError('lost response');
+            }
+            return f.fetcher(input, init);
+        } });
+        const execution = slow.execute(step).catch(error => error);
+        await entered;
+        const recovering = { ...step, arguments: { ...step.arguments, previousExecution: true } };
+        try {
+            expect(await f.adapter.observeDetails(recovering)).toMatchObject({ status: 'pending' });
+            await expect(slow.execute(recovering)).rejects.toMatchObject({ code: 'resource_ownership_ambiguous' });
+            expect(puts).toBe(1);
+        } finally {
+            finish();
+            await execution;
+        }
+        expect(await f.adapter.observeDetails(recovering)).toMatchObject({ status: 'applied', candidateAddress: candidate.candidateAddress });
+        expect(await slow.execute(recovering)).toMatchObject({ candidateAddress: candidate.candidateAddress });
+        expect(f.resources[pipId].properties.ipConfiguration).toBeUndefined();
+        expect(puts).toBe(1);
+        expect(f.writes).toHaveLength(2);
+    });
+    it.each(['old detached', 'candidate bound', 'candidate generation', 'candidate address', 'topology', 'missing receipt'] as const)('keeps %s evidence ambiguous while the original NIC binding remains visible', async conflict => {
+        const f = await prepare();
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        const step = withCandidate(f.steps[1], candidate);
+        step.arguments.previousExecution = true;
+        if (conflict === 'old detached') delete f.resources[pipId].properties.ipConfiguration;
+        if (conflict === 'candidate bound') f.resources[candidate.allocationId!].properties.ipConfiguration = { id: configId };
+        if (conflict === 'candidate generation') f.resources[candidate.allocationId!].properties.resourceGuid = 'recreated';
+        if (conflict === 'candidate address') f.resources[candidate.allocationId!].properties.ipAddress = '20.30.40.99';
+        if (conflict === 'topology') f.resources[nicId].properties.ipConfigurations[0].properties.privateIPAddress = '10.0.0.99';
+        if (conflict === 'missing receipt') delete step.arguments.candidateReceipt;
+        expect(await f.adapter.observeDetails(step)).toMatchObject({ status: 'ambiguous' });
+        await expect(f.adapter.execute(step)).rejects.toMatchObject({ code: 'resource_ownership_ambiguous' });
+        expect(f.writes).toHaveLength(1);
     });
     it('observes async deletion through Location and confirms actual 404', async () => {
         const f = await prepare();

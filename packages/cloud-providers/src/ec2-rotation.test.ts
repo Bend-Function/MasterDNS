@@ -11,6 +11,57 @@ const eni = { NetworkInterfaceId: "eni-main", Attachment: { InstanceId: "i-one",
 const plan = (s = slot, i = inventory, allowStop = false) => providers.planCloudRotation(s, i, { allowStop, attemptId: "attempt-1" });
 const adapter = (send: (c: any) => Promise<any>) => new providers.Ec2CloudAdapter("local", credentials, { ec2Send: send });
 
+it.each([
+  { label: "changed allocation", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: "substituted", publicIp: "198.51.100.2" },
+  { label: "changed address", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: "intended", publicIp: "198.51.100.99" },
+  { label: "missing allocation proof", proof: { candidateAddress: "198.51.100.2" }, allocationId: "intended", publicIp: "198.51.100.2" },
+  { label: "missing address proof", proof: { allocationId: "intended" }, allocationId: "intended", publicIp: "198.51.100.2" },
+  { label: "missing remote allocation", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: undefined, publicIp: "198.51.100.2" },
+  { label: "missing remote address", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: "intended", publicIp: undefined },
+  { label: "legacy plan without proof", proof: undefined, allocationId: "intended", publicIp: "198.51.100.2" },
+])("refuses association and recovery with $label despite matching attempt tags", async ({ proof, allocationId, publicIp }) => {
+  const i: CloudInventory = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4, primary: true, allocationId: "old", privateAddress: "10.0.0.1" }] }] };
+  const step = plan(slot, i)[1]!;
+  step.arguments.candidateReceipt = proof;
+  const writes: string[] = [];
+  let attached = false;
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: { PublicIp: attached ? publicIp : slot.address, AllocationId: attached ? allocationId : "old" } }] }] };
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: allocationId, PublicIp: publicIp, Tags: providers.rotationTags(step), ...(attached ? { NetworkInterfaceId: "eni-main", PrivateIpAddress: "10.0.0.1" } : {}) }] };
+    writes.push(c.constructor.name); return { AssociationId: "assoc-new" };
+  });
+  await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
+  step.arguments.previousExecution = true;
+  for (attached of [false, true]) {
+    await expect(cloud.observeDetails(step)).resolves.toMatchObject({ status: "ambiguous" });
+    await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
+  }
+  // An association receipt cannot replace the missing original allocation proof.
+  step.arguments.receipt = { allocationId, candidateAddress: publicIp };
+  await expect(cloud.observeDetails(step)).resolves.toMatchObject({ status: "ambiguous" });
+  expect(writes).toEqual([]);
+});
+
+it.each([
+  { allocationId: "different", candidateAddress: "198.51.100.2" },
+  { allocationId: "intended", candidateAddress: "198.51.100.99" },
+])("preserves ambiguous association receipt evidence %j", async receipt => {
+  const i: CloudInventory = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4, primary: true, allocationId: "old", privateAddress: "10.0.0.1" }] }] };
+  const step = plan(slot, i)[1]!;
+  step.arguments.candidateReceipt = { allocationId: "intended", candidateAddress: "198.51.100.2" };
+  step.arguments.receipt = receipt;
+  step.arguments.previousExecution = true;
+  const writes: string[] = [];
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: { PublicIp: "198.51.100.2", AllocationId: "intended" } }] }] };
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: "intended", PublicIp: "198.51.100.2", Tags: providers.rotationTags(step), NetworkInterfaceId: "eni-main", PrivateIpAddress: "10.0.0.1" }] };
+    writes.push(c.constructor.name); return {};
+  });
+  await expect(cloud.observeDetails(step)).resolves.toMatchObject({ status: "ambiguous", ...receipt });
+  await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
+  expect(writes).toEqual([]);
+});
+
 it("prefers direct primary ENI toggling even when stopping is permitted", async () => {
   const steps = plan(slot, inventory, true);
   expect(steps.map(s => s.action)).toEqual(["ec2.auto-ipv4.disable", "ec2.auto-ipv4.enable"]);
@@ -62,10 +113,11 @@ it("allocates tagged EIPs, saves the receipt and never releases the old EIP in t
 it("never steals an attempt EIP attached to another instance", async () => {
   const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "old" }] }] };
   const step = plan(slot, i)[1]!;
+  step.arguments.candidateReceipt = { allocationId: "new", candidateAddress: "198.51.100.2" };
   const writes: string[] = [];
   const cloud = adapter(async c => {
     if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [eni] };
-    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: "new", InstanceId: "i-other", NetworkInterfaceId: "eni-other", Tags: providers.rotationTags(step) }] };
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: "new", PublicIp: "198.51.100.2", InstanceId: "i-other", NetworkInterfaceId: "eni-other", Tags: providers.rotationTags(step) }] };
     writes.push(c.constructor.name); return {};
   });
   await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
@@ -75,6 +127,7 @@ it("never steals an attempt EIP attached to another instance", async () => {
 it("uses non-reassociating EIP association to the selected private address", async () => {
   const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "old" }] }] };
   const step = plan(slot, i)[1]!;
+  step.arguments.candidateReceipt = { allocationId: "new", candidateAddress: "198.51.100.2" };
   const writes: any[] = [];
   const cloud = adapter(async c => {
     if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [eni] };
@@ -155,6 +208,7 @@ it("treats duplicate tagged resources as ambiguous instead of choosing one", asy
 it("does not accept the candidate EIP attached to the wrong private IP on the selected ENI", async () => {
   const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "old" }] }] };
   const step = plan(slot, i)[1]!;
+  step.arguments.candidateReceipt = { allocationId: "new", candidateAddress: "198.51.100.2" };
   const cloud = adapter(async c => {
     if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [...eni.PrivateIpAddresses, { Primary: false, PrivateIpAddress: "10.0.0.2", Association: { PublicIp: "198.51.100.2" } }] }] };
     return { Addresses: [{ AllocationId: "new", PublicIp: "198.51.100.2", PrivateIpAddress: "10.0.0.2", NetworkInterfaceId: "eni-main", Tags: providers.rotationTags(step) }] };
@@ -218,18 +272,27 @@ it("refuses auto IPv4 enable until disabling is remotely visible", async () => {
 });
 
 it("records a successful EIP association as pending until the target private IP shows it", async () => {
-  const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "old" }] }] };
-  const step = plan(slot, i)[1]!;
-  let attached = false;
+  const i = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4 as const, primary: true, allocationId: "old", privateAddress: "10.0.0.1" }] }] };
+  const [allocate, step] = plan(slot, i) as [CloudStep, CloudStep];
+  let allocated = false, attached = false;
+  const writes: string[] = [];
   const cloud = adapter(async c => {
-    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: { PublicIp: attached ? "198.51.100.2" : slot.address } }] }] };
-    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: [{ AllocationId: "new", PublicIp: "198.51.100.2", Tags: providers.rotationTags(step), ...(attached ? { NetworkInterfaceId: "eni-main", PrivateIpAddress: "10.0.0.1" } : {}) }] };
+    if (c.constructor.name === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [{ ...eni, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: { PublicIp: attached ? "198.51.100.2" : slot.address, AllocationId: attached ? "new" : "old" } }] }] };
+    if (c.constructor.name === "DescribeAddressesCommand") return { Addresses: allocated ? [{ AllocationId: "new", PublicIp: "198.51.100.2", Tags: providers.rotationTags(step), ...(attached ? { NetworkInterfaceId: "eni-main", PrivateIpAddress: "10.0.0.1" } : {}) }] : [] };
+    writes.push(c.constructor.name);
+    if (c.constructor.name === "AllocateAddressCommand") { allocated = true; return { AllocationId: "new", PublicIp: "198.51.100.2" }; }
     return { AssociationId: "assoc-new" };
   });
+  allocate.arguments.receipt = await cloud.execute(allocate);
+  step.arguments.candidateReceipt = await cloud.observeDetails(allocate);
   step.arguments.receipt = await cloud.execute(step);
+  step.arguments.previousExecution = true;
   await expect(cloud.observe(step)).resolves.toBe("pending");
+  await expect(cloud.execute(step)).rejects.toMatchObject({ code: "resource_ownership_ambiguous" });
   attached = true;
-  await expect(cloud.observeDetails(step)).resolves.toMatchObject({ status: "applied", candidateAddress: "198.51.100.2" });
+  await expect(cloud.observeDetails(step)).resolves.toMatchObject({ status: "applied", allocationId: "new", candidateAddress: "198.51.100.2" });
+  await expect(cloud.execute(step)).resolves.toMatchObject({ allocationId: "new", candidateAddress: "198.51.100.2" });
+  expect(writes).toEqual(["AllocateAddressCommand", "AssociateAddressCommand"]);
 });
 
 it("never applies automatic IPv4 toggling to device zero on a secondary network card", async () => {

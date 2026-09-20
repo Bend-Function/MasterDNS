@@ -106,7 +106,7 @@ export function defineProbeSchema(dependencies: Dependencies) {
     check("address_health_state_target", sql`num_nonnulls(${t.slotId}, ${t.endpointId}) = 1`),
     check("address_health_state_counters", sql`${t.addressVersion} >= 0 and ${t.lastAppliedSequence} >= 0 and ${t.consecutiveSuccesses} >= 0 and ${t.consecutiveFailures} >= 0`),
     uniqueIndex("address_health_state_slot_unique").on(t.slotId),
-    uniqueIndex("address_health_state_endpoint_family_unique").on(t.endpointId, t.family),
+    uniqueIndex("address_health_state_endpoint_address_unique").on(t.endpointId, t.family, t.addressId),
   ]);
   const probeRounds = pgTable("probe_rounds", {
     id: uuid("id").primaryKey().defaultRandom(),

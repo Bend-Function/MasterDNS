@@ -81,6 +81,7 @@ export type AddressHealthPolicy = {
   networkPolicy: { allowedPrivateCIDRs: string[] } | null;
   updatedAt: string;
   state: AddressHealthState | null;
+  states?: Array<AddressHealthState & { address: string; addressRole: "current" | "candidate" }>;
   config: HealthConfigRow | null;
 };
 

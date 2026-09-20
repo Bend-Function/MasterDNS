@@ -1,0 +1,2 @@
+DROP INDEX "address_health_state_endpoint_family_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "address_health_state_endpoint_address_unique" ON "address_health_states" USING btree ("endpoint_id","family","address_id");

@@ -63,6 +63,17 @@ function allocationResult(step: CloudStep, address: Address): CloudStepResult {
   return { remoteId: address.AllocationId, allocationId: address.AllocationId, ...candidate(step, address.PublicIp) };
 }
 
+function assertCandidateIdentity(step: CloudStep, address: Address | undefined): asserts address is Address {
+  const { candidateReceipt: proof, receipt } = rotationArguments(step);
+  // Attempt tags alone cannot identify the allocation persisted by the preceding step.
+  if (!proof?.allocationId || !proof.candidateAddress || !address
+    || address.AllocationId !== proof.allocationId || address.PublicIp !== proof.candidateAddress
+    || (receipt?.allocationId !== undefined && receipt.allocationId !== proof.allocationId)
+    || (receipt?.candidateAddress !== undefined && receipt.candidateAddress !== proof.candidateAddress)) {
+    throw new CloudError("resource_ownership_ambiguous", false);
+  }
+}
+
 export async function executeEc2Rotation(step: CloudStep, accountId: string, send: AwsSend): Promise<CloudStepResult> {
   const args = validate(step, accountId);
   if (args.previousExecution) {
@@ -101,7 +112,7 @@ export async function executeEc2Rotation(step: CloudStep, accountId: string, sen
   if (step.action === "ec2.eip.associate") {
     if (args.slot.family !== 4 || !selected.allocationId) throw new CloudError("invalid_rotation_step", false);
     const address = await attemptAddress(step, send);
-    if (!address?.AllocationId) throw new CloudError("resource_ownership_ambiguous", false);
+    assertCandidateIdentity(step, address);
     if (address.NetworkInterfaceId === args.slot.interfaceId) {
       if (address.PrivateIpAddress !== targetPrivateAddress(step, eni)) throw new CloudError("resource_ownership_ambiguous", false);
       const associated = eni.PrivateIpAddresses?.find(a => a.PrivateIpAddress === address.PrivateIpAddress && a.Association?.PublicIp === address.PublicIp);
@@ -173,7 +184,10 @@ export async function observeEc2Rotation(step: CloudStep, accountId: string, sen
     }
   }
   let address: Address | undefined;
-  try { address = await attemptAddress(step, send); }
+  try {
+    address = await attemptAddress(step, send);
+    if (step.action === "ec2.eip.associate") assertCandidateIdentity(step, address);
+  }
   catch (error) {
     if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
     throw error;

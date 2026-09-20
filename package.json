@@ -18,6 +18,7 @@
     "test": "pnpm -r --if-present test",
     "test:coverage": "pnpm --filter @masterdns/automation test:coverage",
     "test:probe-integration": "node scripts/test-probe-integration.ts",
+    "test:database-restore": "node scripts/test-database-restore.ts",
     "db:generate": "pnpm --filter @masterdns/db generate",
     "db:preflight": "pnpm --filter @masterdns/db preflight",
     "db:migrate": "pnpm --filter @masterdns/db migrate",

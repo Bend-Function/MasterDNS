@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { and, eq, lte } from "drizzle-orm";
-import { addressHealthPolicies, addressHealthStates, createProbeRound, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeGroups, probeRounds, resetHealthEvidence } from "@masterdns/db";
+import { addressHealthPolicies, addressHealthStates, createProbeRound, healthCheckConfigs, healthTargetWhere, lockHealthTargets, probeGroups, probeRounds, resetHealthEvidence } from "@masterdns/db";
 import { DatabaseService } from "../database.service.js";
 import { ProbeHealthService } from "./probe-health.service.js";
 @Injectable()
@@ -29,27 +29,32 @@ export class ProbeSchedulerService implements OnModuleInit, OnModuleDestroy {
     return this.database.db.transaction(async tx => {
       const [snapshot] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId));
       if (!snapshot || (snapshot.mode === "local" && !snapshot.slotId)) return undefined;
-      const target = await lockHealthTarget(tx, snapshot, true, now);
-      if (!target || target.addressVersion < 1) return undefined;
+      const targets = await lockHealthTargets(tx, snapshot, true, now);
       const [config] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, snapshot.configId)).for("share");
       const [group] = snapshot.mode !== "local" && snapshot.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, snapshot.groupId)).for("share") : [];
       const [policy] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId)).for("share");
       if (!policy || policy.revision !== snapshot.revision || !config?.enabled || (!group && policy.mode !== "local")) return undefined;
-      let [state] = await tx.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, snapshot));
-      const epoch = { addressId: target.addressId, addressVersion: target.addressVersion, configId: config.id, configVersion: config.revision, policyId: policy.id, policyRevision: policy.revision, groupRevision: group?.revision ?? null };
-      const changed = !state || Object.entries(epoch).some(([key, value]) => state![key as keyof typeof state] !== value);
-      if (!changed && state?.nextRoundAt && state.nextRoundAt > now) return undefined;
-      if (state && !changed && state.evidenceExpiresAt && state.evidenceExpiresAt <= now) {
-        [state] = await tx.update(addressHealthStates).set({ consecutiveSuccesses: 0, consecutiveFailures: 0, latestDecision: "unknown", evidenceExpiresAt: null, ...(state.latestDecision !== "unknown" ? { stateChangedAt: now } : {}), updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
+      const rounds: typeof probeRounds.$inferSelect[] = [];
+      for (const target of targets) {
+        if (target.addressVersion < 1) continue;
+        const identity = { ...snapshot, endpointAddressId: snapshot.endpointId ? target.addressId : undefined };
+        let [state] = await tx.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, identity));
+        const epoch = { addressId: target.addressId, addressVersion: target.addressVersion, configId: config.id, configVersion: config.revision, policyId: policy.id, policyRevision: policy.revision, groupRevision: group?.revision ?? null };
+        const changed = !state || Object.entries(epoch).some(([key, value]) => state![key as keyof typeof state] !== value);
+        if (!changed && state?.nextRoundAt && state.nextRoundAt > now) continue;
+        if (state && !changed && state.evidenceExpiresAt && state.evidenceExpiresAt <= now) {
+          [state] = await tx.update(addressHealthStates).set({ consecutiveSuccesses: 0, consecutiveFailures: 0, latestDecision: "unknown", evidenceExpiresAt: null, ...(state.latestDecision !== "unknown" ? { stateChangedAt: now } : {}), updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
+        }
+        if (state && changed) {
+          [state] = await tx.update(addressHealthStates).set({ ...resetHealthEvidence, ...epoch, stateChangedAt: now, updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
+        } else if (!state) {
+          [state] = await tx.insert(addressHealthStates).values({ slotId: snapshot.slotId, endpointId: snapshot.endpointId, family: snapshot.family, ...epoch, stateChangedAt: now }).returning();
+        }
+        const round = await createProbeRound(tx, { id: "worker", role: "admin" }, { slotId: snapshot.slotId ?? undefined, endpointAddressId: snapshot.endpointId ? target.addressId : undefined, configId: config.id, groupId: group?.id, addressVersion: target.addressVersion, consensus: policy.mode === "local" ? { mode: "all", minimumValid: 1 } : policy.consensus, deadline: new Date(now.getTime()+policy.executionWindowSeconds*1000), resultExpiresAt: new Date(now.getTime()+policy.resultExpirySeconds*1000), networkPolicy: policy.networkPolicy ?? undefined, includeLocal: policy.mode !== "external", dispatchCapableOnly: true, policyId: policy.id, policyRevision: policy.revision }, now);
+        await tx.update(addressHealthStates).set({ nextRoundAt: new Date(now.getTime()+policy.checkIntervalSeconds*1000), updatedAt: now }).where(eq(addressHealthStates.id, state!.id));
+        rounds.push(round);
       }
-      if (state && changed) {
-        [state] = await tx.update(addressHealthStates).set({ ...resetHealthEvidence, ...epoch, stateChangedAt: now, updatedAt: now }).where(eq(addressHealthStates.id, state.id)).returning();
-      } else if (!state) {
-        [state] = await tx.insert(addressHealthStates).values({ slotId: snapshot.slotId, endpointId: snapshot.endpointId, family: snapshot.family, ...epoch, stateChangedAt: now }).returning();
-      }
-      const round = await createProbeRound(tx, { id: "worker", role: "admin" }, { slotId: snapshot.slotId ?? undefined, endpointAddressId: snapshot.endpointId ? target.addressId : undefined, configId: config.id, groupId: group?.id, addressVersion: target.addressVersion, consensus: policy.mode === "local" ? { mode: "all", minimumValid: 1 } : policy.consensus, deadline: new Date(now.getTime()+policy.executionWindowSeconds*1000), resultExpiresAt: new Date(now.getTime()+policy.resultExpirySeconds*1000), networkPolicy: policy.networkPolicy ?? undefined, includeLocal: policy.mode !== "external", dispatchCapableOnly: true, policyId: policy.id, policyRevision: policy.revision }, now);
-      await tx.update(addressHealthStates).set({ nextRoundAt: new Date(now.getTime()+policy.checkIntervalSeconds*1000), updatedAt: now }).where(eq(addressHealthStates.id, state!.id));
-      return round;
+      return rounds[0];
     });
   }
 }

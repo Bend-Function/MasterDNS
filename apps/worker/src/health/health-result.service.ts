@@ -95,7 +95,7 @@ export class HealthResultService {
           : target.binding
             ? { state: "unknown" as const, consecutiveSuccesses: 0, consecutiveFailures: 0 }
             : { state: currentAddress.healthState, consecutiveSuccesses: currentAddress.consecutiveSuccesses, consecutiveFailures: currentAddress.consecutiveFailures };
-      const [localState] = localPolicy ? await tx.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, localPolicy)) : [];
+      const [localState] = localPolicy ? await tx.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, { ...localPolicy, endpointAddressId: currentAddress.id })) : [];
       if (localPolicy) {
         const sameEpoch = localState?.addressId === currentAddress.id && localState.policyId === localPolicy.id && localState.policyRevision === localPolicy.revision && localState.configId === target.config.id && localState.configVersion === target.config.revision;
         observation = sameEpoch ? { state: localState.healthState, consecutiveSuccesses: localState.consecutiveSuccesses, consecutiveFailures: localState.consecutiveFailures } : { state: "unknown", consecutiveSuccesses: 0, consecutiveFailures: 0 };
@@ -340,4 +340,3 @@ function latestDate(values: Array<Date | null>): Date | null {
   const timestamps = values.flatMap((value) => value ? [value.getTime()] : []);
   return timestamps.length > 0 ? new Date(Math.max(...timestamps)) : null;
 }
-

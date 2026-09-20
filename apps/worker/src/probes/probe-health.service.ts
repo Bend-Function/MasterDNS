@@ -28,6 +28,7 @@ export class ProbeHealthService {
         && config.revision === round.configVersion && policy.id === state.policyId && policy.revision === round.policyRevision
         && policy.configId === config.id && (policy.mode === "local" ? round.groupId === null : policy.groupId === round.groupId) && (round.groupId ? group?.revision === round.groupRevision : policy.mode === "local" && round.groupRevision === null)
         && target.addressVersion === round.addressVersion && target.addressId === state.addressId && target.address === round.address
+        && (round.slotId !== null || target.addressId === round.endpointAddressId)
         && state.configVersion === round.configVersion && state.policyRevision === policy.revision && state.groupRevision === (group?.revision ?? null)
         && state.lastAppliedSequence < round.sequence;
       if (!fresh) {

@@ -1,8 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { externalHealthCheckConfigSchema, healthCheckConfigSchema } from "@masterdns/contracts";
-import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, resetHealthEvidence, type HealthTargetIdentity, type ProbeTransaction } from "@masterdns/db";
-import { and, desc, eq, sql } from "drizzle-orm";
+import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, resetHealthEvidence, type HealthTargetIdentity, type ProbeTransaction } from "@masterdns/db";
+import { and, desc, eq, ne, sql } from "drizzle-orm";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { healthPolicyInputSchema, slotHealthConfigSchema } from "./health-policies.schemas.js";
@@ -72,9 +72,16 @@ export class HealthPoliciesService {
     for (const policy of rows) {
       const owner = await this.owner(this.database.db as unknown as ProbeTransaction, policy);
       if (!owner || (actor.role !== "admin" && owner.id !== actor.id)) continue;
-      const [state] = await this.database.db.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, policy));
+      const evidence = await this.database.db.select().from(addressHealthStates).where(healthTargetWhere(addressHealthStates, policy));
+      const addresses = policy.endpointId ? await this.database.db.select().from(endpointAddresses).where(and(eq(endpointAddresses.endpointId, policy.endpointId), eq(endpointAddresses.family, policy.family), ne(endpointAddresses.state, "previous"))) : [];
+      addresses.sort((a, b) => Number(b.state === "current") - Number(a.state === "current"));
+      const states = addresses.flatMap(address => {
+        const state = evidence.find(item => item.addressId === address.id);
+        return state ? [{ ...state, address: address.address, addressRole: address.state }] : [];
+      });
+      const state = policy.slotId ? evidence[0] : evidence.find(item => item.addressId === addresses[0]?.id);
       const [config] = await this.database.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, policy.configId));
-      visible.push({ ...policy, state: state ?? null, config: config ?? null });
+      visible.push({ ...policy, state: state ?? null, states, config: config ?? null });
     }
     return visible;
   }
