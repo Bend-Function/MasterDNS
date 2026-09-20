@@ -249,11 +249,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     }
   }
   private async eligible(tx: RotationTransaction, c: RotationContext, incident: typeof rotationIncidents.$inferSelect, r: Resource, now: Date) {
-    const error = rotationAuthorizationError(c);
+    const error = rotationAuthorizationError(c, incident.trigger);
     if (error) throw new Error(error);
     const health = await lockRotationHealth(tx, c);
     if (incident.physicalKey !== c.physicalKey || incident.authorizationRevision !== c.authorization!.revision ||
-      incident.policyRevision !== c.policy!.revision || incident.addressVersion !== c.addressVersion || !healthRevisionMatches(incident, health))
+      incident.policyRevision !== c.policy!.revision || incident.addressVersion !== c.addressVersion || (incident.trigger !== "manual" && !healthRevisionMatches(incident, health)))
       throw new Error("cleanup_incident_changed");
     if (!r.cleanupDueAt || r.cleanupDueAt > now) throw new Error("cleanup_grace_pending");
     if (r.origin !== "system" && !c.authorization!.allowReleaseAddress) throw new Error("original_address_release_not_authorized");

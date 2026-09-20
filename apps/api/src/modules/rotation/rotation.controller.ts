@@ -12,6 +12,7 @@ export class RotationController {
   @Patch("rotation-policies/:slotId") setPolicy(@CurrentUser() actor: AuthUser, @Param("slotId", ParseUUIDPipe) slotId: string, @ZodBody(rotationPolicySchema) input: RotationPolicyInput) { return this.rotations.setPolicy(actor, slotId, input); }
   @Get("rotations") list(@CurrentUser() actor: AuthUser) { return this.rotations.list(actor); }
   @Post("rotations") start(@CurrentUser() actor: AuthUser, @ZodBody(rotationStartSchema) input: { slotId: string }, @Headers("idempotency-key") key?: string) { return this.rotations.start(actor, input.slotId, cloudRequestKey(key)); }
+  @Post("rotations/manual") startManual(@CurrentUser() actor: AuthUser, @ZodBody(rotationStartSchema) input: { slotId: string }, @Headers("idempotency-key") key?: string) { return this.rotations.startManual(actor, input.slotId, cloudRequestKey(key)); }
   @Get("rotations/:id") detail(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.rotations.detail(actor, id); }
   @Post("rotations/:id/pause") pause(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.rotations.pause(actor, id); }
   @Post("rotations/:id/resume") resume(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Headers("idempotency-key") key?: string, @ZodBody(rotationResumeSchema) input: RotationResumeInput = {}) { return this.rotations.resume(actor, id, cloudRequestKey(key), input); }

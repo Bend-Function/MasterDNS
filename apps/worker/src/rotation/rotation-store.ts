@@ -43,7 +43,7 @@ export class RotationStore {
     const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, incident.addressVersion)));
     const snapshot: RotationSnapshot = {
       phase: incident.phase,
-      authorization: { managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: !!c.policy?.enabled && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
+      authorization: { managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
         regionAllowed: !!c.scope && (c.account.regions === null || c.account.regions.includes(c.instance.region)), conflictingManager: c.conflictingManager },
       revisions: { authorization: c.authorization?.revision ?? 0, policy: c.policy?.revision ?? 0, address: c.addressVersion },
       expectedRevisions: { authorization: incident.authorizationRevision, policy: incident.policyRevision, address: incident.addressVersion },
@@ -67,10 +67,10 @@ export class RotationStore {
     if (action.kind !== "observe") {
       if (incident.pausedByUserId) action = { kind: "wait", reason: "instance_busy" };
       else if (incident.status === "paused" && incident.phase === "cloud") action = { kind: "wait", reason: "instance_busy" };
-      else if (!healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
+      else if (incident.trigger !== "manual" && !healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
       else if (c.physicalKey !== incident.physicalKey) action = { kind: "pause", reason: "remote_identity_changed" };
     }
-    if (action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
+    if (incident.trigger !== "manual" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
       action = c.slot.candidateAddressId ? { kind: "publish", mode: "dispatch", addressVersion: c.slot.candidateVersion } : { kind: "complete" };
     }
     return { c, incident, h, physical, budget, attempt, steps, snapshot, action, publication };
@@ -101,7 +101,7 @@ export class RotationStore {
     return this.transaction(id, async (tx, c, incident) => {
       const run = await this.snapshot(tx, c, incident, lease); this.assertIdentity(c, identity);
       if (run.action.kind !== "execute" || run.action.operation !== "cloud_step" || run.action.stepId !== stepId || !run.attempt || !run.physical || run.physical.unresolvedStepId || run.physical.incidentId !== id) return;
-      const error = rotationAuthorizationError(c); if (error) throw new Error(error);
+      const error = rotationAuthorizationError(c, incident.trigger); if (error) throw new Error(error);
       const step = run.steps.find(s => s.id === stepId)!;
       if (step.plan.action === "linode.instance.reboot" && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
       const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
@@ -216,7 +216,12 @@ export class RotationStore {
     await tx.update(addressHealthStates).set(resetHealthEvidence).where(eq(addressHealthStates.slotId, c.slot.id));
     await tx.update(rotationAttempts).set({ status: "candidate", candidateAddressId: address!.id, candidateVersion: version, candidateRepeated: !!result.candidateRepeated }).where(eq(rotationAttempts.id, attempt.id));
     await tx.insert(rotationResources).values({ incidentId: incident.id, attemptId: attempt.id, addressId: address!.id, address: address!.address, allocationId: result.allocationId, resourceId: result.resourceId, origin: address!.origin, ownershipAttemptId: address!.attemptId, role: "candidate", snapshot: { receipt: result, inventory: attempt.beforeInventory } }).onConflictDoUpdate({ target: [rotationResources.attemptId, rotationResources.role], set: { addressId: address!.id, attached: true, referenced: true } });
-    await tx.update(rotationIncidents).set({ phase: "candidate", ...(incident.pendingSegmentId ? { currentSegmentId: incident.pendingSegmentId, pendingSegmentId: null } : {}), addressVersion: version, candidateDeadline: new Date(now.getTime() + (c.policy?.candidateWindowSeconds ?? 180) * 1000), nextRunAt: now, updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
+    if (incident.trigger === "manual") {
+      // Every plan step has been read back as applied. Manual authority permits
+      // publication of this exact version; it does not create probe evidence.
+      await tx.insert(rotationPublications).values({ slotId: c.slot.id, addressVersion: version, addressId: address!.id, incidentId: incident.id }).onConflictDoNothing();
+    }
+    await tx.update(rotationIncidents).set({ phase: incident.trigger === "manual" ? "publish" : "candidate", ...(incident.pendingSegmentId ? { currentSegmentId: incident.pendingSegmentId, pendingSegmentId: null } : {}), addressVersion: version, candidateDeadline: incident.trigger === "manual" ? null : new Date(now.getTime() + (c.policy?.candidateWindowSeconds ?? 180) * 1000), nextRunAt: now, updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
     await tx.update(rotationLeases).set({ incidentId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.incidentId, incident.id)));
     await rotationAudit(tx, incident, "rotation.candidate", undefined, { addressVersion: version, attemptId: attempt.id });
   }

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AddressSlot, CloudAuthorization } from "./cloud-types";
-import { authorizationPayload, loadCloudScopes, loadVisibleInstanceAddresses, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
+import { authorizationPayload, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
 import { createIntentKey } from "./intent-key";
 
 const slot = (overrides: Partial<AddressSlot> = {}): AddressSlot => ({
@@ -152,6 +152,61 @@ describe("provider-aware rotation eligibility", () => {
     const slaac = slot({ slot: { ...slot().slot, family: "6" }, currentAddress: { id: "v6", address: "2001:db8::1", family: "6" }, capability: { ...slot().capability!, available: false, reason: "linode_slaac_ipv6_immutable" } });
     expect(selectableCloudSlots("AAAA", [slaac])).toHaveLength(1);
     expect(cloudRotationBlock(slaac, { ...auth, allowIpv6Rotation: true })).toMatch(/SLAAC/);
+  });
+});
+
+describe("manual AWS IPv4 eligibility", () => {
+  const authorization: CloudAuthorization = {
+    instanceId: "instance-1",
+    revision: 4,
+    managed: true,
+    allowIpv4Rotation: true,
+    allowIpv6Rotation: false,
+    allowStopStart: false,
+    allowReleaseAddress: false,
+  };
+
+  it("offers an authorized public EC2 IPv4 slot without requiring an automatic policy", () => {
+    expect(manualIpv4RotationEligibility(slot(), {
+      accountEnabled: true,
+      provider: "aws",
+      service: "ec2",
+      instancePresent: true,
+      savedAuthorization: authorization,
+      draftAuthorization: authorization,
+    })).toEqual({ visible: true, reason: null });
+  });
+
+  it("keeps the action visible with a saved-authorization explanation", () => {
+    expect(manualIpv4RotationEligibility(slot(), {
+      accountEnabled: true,
+      provider: "aws",
+      service: "lightsail",
+      instancePresent: true,
+      savedAuthorization: { ...authorization, allowIpv4Rotation: false },
+      draftAuthorization: { ...authorization, allowIpv4Rotation: false },
+    })).toEqual({ visible: true, reason: "请先保存“允许 IPv4 换址”授权" });
+  });
+
+  it("blocks submission while any authorization edit is unsaved", () => {
+    expect(manualIpv4RotationEligibility(slot(), {
+      accountEnabled: true,
+      provider: "aws",
+      service: "ec2",
+      instancePresent: true,
+      savedAuthorization: authorization,
+      draftAuthorization: { ...authorization, allowReleaseAddress: true },
+    })).toEqual({ visible: true, reason: "请先保存当前授权更改" });
+  });
+
+  it("does not offer the action for private IPv4, IPv6, or non-AWS slots", () => {
+    const context = { accountEnabled: true, provider: "aws" as const, service: "ec2" as const, instancePresent: true, savedAuthorization: authorization, draftAuthorization: authorization };
+    const privateIpv4 = slot({ capability: { ...slot().capability!, available: false, reason: "private_ipv4_unsupported" } });
+    const ipv6 = slot({ slot: { ...slot().slot, family: "6" }, currentAddress: { id: "address-6", address: "2001:db8::10", family: "6" } });
+
+    expect(manualIpv4RotationEligibility(privateIpv4, context).visible).toBe(false);
+    expect(manualIpv4RotationEligibility(ipv6, context).visible).toBe(false);
+    expect(manualIpv4RotationEligibility(slot(), { ...context, provider: "azure", service: "azure_vm" }).visible).toBe(false);
   });
 });
 

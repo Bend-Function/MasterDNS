@@ -26,15 +26,15 @@ async function fixture() {
   const [account] = await connection.db.insert(cloudAccounts).values({ ownerUserId: actor.id, provider: "aws", name: "AWS", externalAccountId: "123456789012", credentialCiphertext: "secret-ciphertext", credentialIv: "iv", credentialTag: "tag" }).returning();
   await connection.db.insert(cloudScanScopes).values({ accountId: account!.id, service: "ec2", region: "us-east-1", generation: 1 });
   const [instance] = await connection.db.insert(cloudInstances).values({ accountId: account!.id, service: "ec2", region: "us-east-1", externalId: `i-${randomUUID()}`, metadata: { present: true }, scanGeneration: 1 }).returning();
-  const [iface] = await connection.db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: "eni-test", scanGeneration: 1 }).returning();
-  const [address] = await connection.db.insert(cloudAddresses).values({ interfaceId: iface!.id, family: "4", kind: "host", address: "192.0.2.1", origin: "user", scanGeneration: 1 }).returning();
+  const [iface] = await connection.db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: "eni-test", metadata: { deviceIndex: 0, primaryAddresses: ["192.0.2.1"] }, scanGeneration: 1 }).returning();
+  const [address] = await connection.db.insert(cloudAddresses).values({ interfaceId: iface!.id, family: "4", kind: "host", address: "192.0.2.1", metadata: { providerMetadata: { awsAddressScope: "public" } }, origin: "user", scanGeneration: 1 }).returning();
   const [slot] = await connection.db.insert(managedAddressSlots).values({ interfaceId: iface!.id, family: "4", name: "primary", currentAddressId: address!.id, currentVersion: 1 }).returning();
   await connection.db.insert(instanceAuthorizations).values({ instanceId: instance!.id, managed: true, allowIpv4Rotation: true });
   const [config] = await connection.db.insert(healthCheckConfigs).values({ slotId: slot!.id, checkerType: "tcp", config: { port: 443 } }).returning();
   const [group] = await connection.db.insert(probeGroups).values({ ownerUserId: actor.id, name: "external" }).returning();
   const [policy] = await connection.db.insert(addressHealthPolicies).values({ slotId: slot!.id, family: "4", configId: config!.id, groupId: group!.id }).returning();
   const [health] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", addressId: address!.id, addressVersion: 1, configId: config!.id, configVersion: 1, policyId: policy!.id, policyRevision: 1, groupRevision: 1, healthState: "unhealthy", latestDecision: "failure", consecutiveFailures: 3, lastRoundId: randomUUID(), lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).returning();
-  return { actor, account: account!, slot: slot!, policy: policy!, health: health! };
+  return { actor, account: account!, instance: instance!, address: address!, slot: slot!, policy: policy!, health: health! };
 }
 it("returns opt-in policy defaults and enforces revision and external threshold coverage", async () => {
   const f = await fixture(); expect(await service.policy(f.actor, f.slot.id)).toMatchObject({ enabled: false, revision: 0, maxAttempts: 3 });
@@ -49,6 +49,102 @@ it("requires Idempotency-Key at the controller and derives the failure source on
   const key = randomUUID(); const first = await service.start(f.actor, f.slot.id, key); const retry = await service.start(f.actor, f.slot.id, key);
   expect(first.id).toBe(retry.id); expect(first.sourceEventId).toBe(`health-${f.health.lastRoundId}-1`);
   expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id))).toHaveLength(1);
+});
+it("admits a manual AWS IPv4 rotation without probes and creates disabled timing defaults", async () => {
+  const f = await fixture();
+  await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));
+  await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, f.slot.id));
+  const controller = new RotationController(service);
+  expect(() => controller.startManual(f.actor, { slotId: f.slot.id })).toThrow("Idempotency-Key is required");
+  const key = randomUUID();
+  const first = await service.startManual(f.actor, f.slot.id, key);
+  const replay = await service.startManual(f.actor, f.slot.id, key);
+  expect(replay).toEqual(first);
+  expect(first).toMatchObject({ trigger: "manual", healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null });
+  expect(first.sourceEventId).toMatch(/^manual-/);
+  expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]).toMatchObject({ enabled: false, revision: 1, maxAttempts: 3 });
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id)))[0]).toMatchObject({ maxAttempts: 1, attemptsUsed: 0 });
+});
+it("admits a same-address initial-verification placeholder without changing its slot state", async () => {
+  const f = await fixture();
+  await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));
+  await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, f.slot.id));
+  await connection.db.update(managedAddressSlots).set({ currentVersion: 0, candidateAddressId: f.address.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, f.slot.id));
+
+  const incident = await service.startManual(f.actor, f.slot.id, randomUUID());
+  const [slot] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id));
+  expect(incident).toMatchObject({ trigger: "manual", addressVersion: 1 });
+  expect(slot).toMatchObject({ currentAddressId: f.address.id, currentVersion: 0, candidateAddressId: f.address.id, candidateVersion: 1 });
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id)))[0]).toMatchObject({ maxAttempts: 1, attemptsUsed: 0 });
+});
+it("admits manual rotation while healthy and reuses its active incident across distinct request keys", async () => {
+  const f = await fixture();
+  await connection.db.update(addressHealthStates).set({ healthState: "healthy", latestDecision: "success", consecutiveFailures: 0, consecutiveSuccesses: 3 }).where(eq(addressHealthStates.id, f.health.id));
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false });
+  const [first, concurrent] = await Promise.all([
+    service.startManual(f.actor, f.slot.id, randomUUID()),
+    service.startManual(f.actor, f.slot.id, randomUUID()),
+  ]);
+  expect(concurrent.id).toBe(first.id);
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id))).toHaveLength(1);
+});
+it("rejects unauthorized, invalid, private, foreign and candidate-bearing manual slots before incident creation", async () => {
+  const unauthorized = await fixture();
+  await connection.db.update(instanceAuthorizations).set({ allowIpv4Rotation: false }).where(eq(instanceAuthorizations.instanceId, unauthorized.instance.id));
+  await expect(service.startManual(unauthorized.actor, unauthorized.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+
+  const privateAddress = await fixture();
+  await connection.db.update(cloudAddresses).set({ address: "10.0.0.4", metadata: { providerMetadata: { awsAddressScope: "private" } } }).where(eq(cloudAddresses.id, privateAddress.address.id));
+  await expect(service.startManual(privateAddress.actor, privateAddress.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+
+  const invalid = await fixture();
+  await connection.db.update(cloudAddresses).set({ address: "not-an-ip" }).where(eq(cloudAddresses.id, invalid.address.id));
+  await expect(service.startManual(invalid.actor, invalid.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+
+  const foreign = await fixture();
+  await connection.db.update(cloudAccounts).set({ provider: "azure" }).where(eq(cloudAccounts.id, foreign.account.id));
+  await expect(service.startManual(foreign.actor, foreign.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  const other = await fixture();
+  await expect(service.startManual(other.actor, foreign.slot.id, randomUUID())).rejects.toMatchObject({ status: 404 });
+
+  const candidate = await fixture();
+  const [next] = await connection.db.insert(cloudAddresses).values({ interfaceId: candidate.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.2", metadata: { providerMetadata: { awsAddressScope: "public" } }, origin: "system", scanGeneration: 1 }).returning();
+  await connection.db.update(managedAddressSlots).set({ candidateAddressId: next!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, candidate.slot.id));
+  await expect(service.startManual(candidate.actor, candidate.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+
+  for (const current of [unauthorized, privateAddress, invalid, foreign, candidate]) {
+    expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, current.slot.id))).toHaveLength(0);
+  }
+});
+it("conflicts with an active health incident instead of returning it as a manual rotation", async () => {
+  const f = await fixture();
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const healthKey = randomUUID();
+  const health = await service.start(f.actor, f.slot.id, healthKey);
+  await expect(service.startManual(f.actor, f.slot.id, healthKey)).rejects.toMatchObject({ status: 409 });
+  await expect(service.startManual(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id)))[0]).toMatchObject({ id: health.id, trigger: "health" });
+});
+it("does not report an active manual incident as a health-triggered rotation", async () => {
+  const f = await fixture();
+  const manual = await service.startManual(f.actor, f.slot.id, randomUUID());
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 1, enabled: true }));
+  await expect(service.start(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id)))[0]).toMatchObject({ id: manual.id, trigger: "manual" });
+});
+it("resumes a charged manual plan under renewed authorization without a new budget", async () => {
+  const f = await fixture();
+  const incident = await service.startManual(f.actor, f.slot.id, randomUUID());
+  const attemptId = randomUUID();
+  await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident.id, segmentId: incident.currentSegmentId, sequence: 1, charged: true, chargedAt: new Date(), status: "cloud", beforeInventory: {} });
+  await connection.db.update(rotationBudgetSegments).set({ attemptsUsed: 1, exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
+  await connection.db.update(rotationIncidents).set({ status: "paused", currentAttemptId: attemptId, pausedByUserId: f.actor.id }).where(eq(rotationIncidents.id, incident.id));
+  await connection.db.update(instanceAuthorizations).set({ revision: 2 }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));
+  await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, f.slot.id));
+  const resumed = await service.resume(f.actor, incident.id, randomUUID());
+  expect(resumed).toMatchObject({ status: "active", currentSegmentId: incident.currentSegmentId, currentAttemptId: attemptId, authorizationRevision: 2, trigger: "manual" });
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id))).toHaveLength(1);
 });
 it("appends one resume budget for retried requests and retains exhausted history", async () => {
   const f = await fixture(); await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));

@@ -77,32 +77,42 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
   const error = publicationAuthorizationError(c);
   if (error) throw new Error(error);
   const h = await lockRotationHealth(tx, c);
-  if (!h.success) throw new Error("fresh_external_success_required");
+  const [incident] = publication?.incidentId
+    ? await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, publication.incidentId)).for("update") : [];
+  const manual = incident?.trigger === "manual";
+  if (!manual && !h.success) throw new Error("fresh_external_success_required");
   if (publication && (publication.addressId !== c.address?.id || publication.addressVersion !== c.addressVersion))
     throw new Error("publication_version_changed");
-  if (
-    publication?.context &&
-    (publication.context.physicalKey !== c.physicalKey ||
+  // A finished publication does not freeze future healthy DNS decisions to the
+  // historical manual incident. Current exact-version evidence is authoritative.
+  if (publication?.status === "applied" && h.success) return { ...h, manualIncidentId: null };
+  if (publication?.context && (publication.context.physicalKey !== c.physicalKey ||
       publication.context.authorizationRevision !== c.authorization!.revision ||
-      !healthRevisionMatches(publication.context as never, h))
-  )
+      (manual ? publication.context.manualIncidentId !== incident.id : !healthRevisionMatches(publication.context as never, h))))
     throw new Error("publication_authorization_changed");
   if (publication?.incidentId) {
-    const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, publication.incidentId)).for("update");
-    const rotationError = rotationAuthorizationError(c);
+    const rotationError = rotationAuthorizationError(c, manual ? "manual" : "health");
     if (rotationError) throw new Error(rotationError);
-    if (
-      !incident ||
-      incident.pausedByUserId ||
-      incident.status !== "active" ||
-      incident.addressVersion !== c.addressVersion ||
-      incident.authorizationRevision !== c.authorization!.revision ||
+    const completedManual = manual && incident.status === "complete" && publication.status === "applied";
+    if (!incident || incident.slotId !== c.slot.id || incident.physicalKey !== c.physicalKey || incident.pausedByUserId ||
+      (incident.status !== "active" && !completedManual) ||
+      incident.addressVersion !== c.addressVersion || incident.authorizationRevision !== c.authorization!.revision ||
       incident.policyRevision !== c.policy!.revision ||
-      !healthRevisionMatches(incident, h)
-    )
+      (manual ? !["publish", "cleanup", "complete"].includes(incident.phase) : !healthRevisionMatches(incident, h)))
       throw new Error("publication_incident_changed");
+    if (manual && (c.account.provider !== "aws" || c.slot.family !== "4" || !["ec2", "lightsail"].includes(c.instance.service)))
+      throw new Error("manual_rotation_unsupported");
+    // Once a manual operation is finished, configured health checks regain control.
+    if (completedManual && h.configured && !h.success) throw new Error("fresh_external_success_required");
   }
-  return h;
+  return { ...h, manualIncidentId: manual ? incident.id : null };
+}
+
+export function publicationEvidence(h: Awaited<ReturnType<typeof assertPublicationContext>>) {
+  return h.manualIncidentId ? { manualIncidentId: h.manualIncidentId } : healthRevisions(h);
+}
+export function publicationEvidenceMatches(context: Record<string, unknown>, h: Awaited<ReturnType<typeof assertPublicationContext>>) {
+  return h.manualIncidentId ? context.manualIncidentId === h.manualIncidentId : healthRevisionMatches(context as never, h);
 }
 @Injectable()
 export class RotationPublicationService implements OnModuleInit, OnModuleDestroy {
@@ -278,7 +288,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId))
           .innerJoin(endpointPools, eq(endpointPools.id, endpoints.poolId))
           .where(eq(cloudEndpointLinks.slotId, slotId));
-        if (!links.length) throw new Error("publication_has_no_links");
+        if (!links.length && !h.manualIncidentId) throw new Error("publication_has_no_links");
         if (links.some((r) => r.endpoint.addressMode !== "cloud" || r.pool.ownerUserId !== c.account.ownerUserId))
           throw new Error("publication_owner_changed");
         const poolIds = [...new Set(links.map((r) => r.pool.id))].sort();
@@ -314,18 +324,18 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
             address: current.address!.address,
             source: "cloud",
             state: "current",
-            healthState: "healthy",
-            consecutiveSuccesses: h.state!.consecutiveSuccesses,
-            lastCheckedAt: h.state!.lastCheckedAt,
+            healthState: h.manualIncidentId ? "unknown" : "healthy",
+            consecutiveSuccesses: h.manualIncidentId ? 0 : h.state!.consecutiveSuccesses,
+            lastCheckedAt: h.manualIncidentId ? null : h.state!.lastCheckedAt,
             promotedAt: h.now,
           });
           await tx
             .update(endpoints)
             .set({
-              healthState: "healthy",
-              consecutiveSuccesses: h.state!.consecutiveSuccesses,
+              healthState: h.manualIncidentId ? "unknown" : "healthy",
+              consecutiveSuccesses: h.manualIncidentId ? 0 : h.state!.consecutiveSuccesses,
               consecutiveFailures: 0,
-              lastCheckedAt: h.state!.lastCheckedAt,
+              lastCheckedAt: h.manualIncidentId ? null : h.state!.lastCheckedAt,
               updatedAt: h.now,
             })
             .where(eq(endpoints.id, endpoint.id));
@@ -339,7 +349,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         const values = {
           status: "in_flight" as const,
           children,
-          context: { physicalKey: c.physicalKey, authorizationRevision: c.authorization!.revision, ...healthRevisions(h) },
+          context: { physicalKey: c.physicalKey, authorizationRevision: c.authorization!.revision, ...publicationEvidence(h) },
           previousMaxTtl: maxTtl,
           promotedAt: h.now,
           updatedAt: h.now,

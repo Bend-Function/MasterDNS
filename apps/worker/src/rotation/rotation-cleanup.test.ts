@@ -94,6 +94,21 @@ it("retains original user addresses without independent release authorization", 
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(0);
 });
+it("manual AWS cleanup needs no probes but still waits for TTL and preserves user release authorization", async () => {
+  for (const origin of ["system", "user"] as const) {
+    const f = await cleanupFixture(origin);
+    await f.d.update(db.rotationIncidents).set({ trigger: "manual", healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null }).where(eq(db.rotationIncidents.id, f.incident.id));
+    await f.d.update(db.rotationPolicies).set({ enabled: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+    await f.d.delete(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
+    await f.d.delete(db.addressHealthPolicies).where(eq(db.addressHealthPolicies.slotId, f.slot.id));
+    await f.d.delete(db.healthCheckConfigs).where(eq(db.healthCheckConfigs.id, f.policy.configId));
+    await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(Date.now() + 60000) }).where(eq(db.rotationResources.id, f.resource.id));
+    await f.cleanup.run(f.resource.id, new Date()); expect(f.state.writes).toBe(0);
+    await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+    await f.cleanup.run(f.resource.id, new Date());
+    expect(f.state.writes).toBe(origin === "system" ? 1 : 0);
+  }
+});
 it("does not clean before grace or while the old address is published, then observes a lost cleanup response without redispatch", async () => {
   const f = await cleanupFixture();
   await f.d

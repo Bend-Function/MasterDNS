@@ -1,0 +1,8 @@
+ALTER TABLE "rotation_incidents" ALTER COLUMN "health_policy_id" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ALTER COLUMN "health_policy_revision" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ALTER COLUMN "config_id" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ALTER COLUMN "config_revision" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ALTER COLUMN "group_id" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ALTER COLUMN "group_revision" DROP NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ADD COLUMN "trigger" varchar(16) DEFAULT 'health' NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_incidents" ADD CONSTRAINT "rotation_incidents_trigger_epoch" CHECK (("rotation_incidents"."trigger" = 'health' and "rotation_incidents"."health_policy_id" is not null and "rotation_incidents"."health_policy_revision" is not null and "rotation_incidents"."config_id" is not null and "rotation_incidents"."config_revision" is not null and "rotation_incidents"."group_id" is not null and "rotation_incidents"."group_revision" is not null) or ("rotation_incidents"."trigger" = 'manual' and "rotation_incidents"."health_policy_id" is null and "rotation_incidents"."health_policy_revision" is null and "rotation_incidents"."config_id" is null and "rotation_incidents"."config_revision" is null and "rotation_incidents"."group_id" is null and "rotation_incidents"."group_revision" is null));

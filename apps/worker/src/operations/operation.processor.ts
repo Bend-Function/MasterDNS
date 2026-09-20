@@ -8,7 +8,6 @@ import {
   captureCloudPolicyLinks,
   cloudEndpointLinks,
   lockRotationContext,
-  healthRevisionMatches,
   auditLogs,
   bindingAssignments,
   dnsRecords,
@@ -32,7 +31,7 @@ import { ProviderRuntimeService } from "../providers/provider-runtime.service.js
 import { isDnsZoneLockError, type DnsZoneLease, withDnsZoneLock, withRedisLease } from "../sync/dns-zone-lock.js";
 
 import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
-import { assertPublicationContext, livePublicationMatches, effectiveOldTtl } from "../rotation/rotation-publication.service.js";
+import { assertPublicationContext, livePublicationMatches, effectiveOldTtl, publicationEvidenceMatches } from "../rotation/rotation-publication.service.js";
 
 const stepInputSchema = z.object({
   zoneExternalId: z.string().min(1),
@@ -244,14 +243,14 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         const [owner] = await tx.select().from(endpointPools).where(eq(endpointPools.id, input.poolId!));
         const [publication] = typeof input.cloud?.publicationId === "string" ? await tx.select().from(rotationPublications).where(eq(rotationPublications.id, input.cloud.publicationId)) : [];
         if (!publication || publication.slotId !== c.slot.id || publication.addressVersion !== c.addressVersion) throw new ProviderError("Cloud publication is missing or superseded", "validation_failed", adapter.provider);
-        const h = await assertPublicationContext(tx, c, publication.status === "applied" ? undefined : publication);
+        const h = await assertPublicationContext(tx, c, publication.context?.manualIncidentId || publication.status !== "applied" ? publication : undefined);
         const current = live && livePublicationMatches(c, live)
           && c.account.credentialCiphertext === cloud.account.credentialCiphertext
           && !c.slot.candidateAddressId && link?.slotId === c.slot.id
           && owner?.ownerUserId === c.account.ownerUserId && c.address?.address === input.record?.content
           && input.cloud?.addressId === c.address?.id && input.cloud?.addressVersion === c.addressVersion
           && input.cloud?.authorizationRevision === c.authorization?.revision && input.cloud?.physicalKey === c.physicalKey
-          && healthRevisionMatches(input.cloud as never, h);
+          && publicationEvidenceMatches(input.cloud!, h);
         if (!current) throw new ProviderError("Cloud publication authorization or address changed", "validation_failed", adapter.provider);
       }
       lease.assertOwned();

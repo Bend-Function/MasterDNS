@@ -174,6 +174,115 @@ async function dnsFixture(backup = false) {
   };
   return { ...f, writes, state, bindings, plan, execute, remote };
 }
+
+async function manualPublication(f: Awaited<ReturnType<typeof fixture>>) {
+  await f.d.delete(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  await f.d.delete(db.addressHealthPolicies).where(eq(db.addressHealthPolicies.slotId, f.slot.id));
+  await f.d.delete(db.healthCheckConfigs).where(eq(db.healthCheckConfigs.id, f.policy.configId));
+  await f.d.update(db.instanceAuthorizations).set({ allowIpv4Rotation: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: false });
+  const segmentId = randomUUID();
+  const [incident] = await f.d.insert(db.rotationIncidents).values({
+    ownerUserId: f.account.ownerUserId, slotId: f.slot.id, family: "4", trigger: "manual", phase: "publish", currentSegmentId: segmentId,
+    physicalKey: JSON.stringify(["aws", f.account.externalAccountId, "ec2", "us-east-1", f.instance.externalId]),
+    sourceEventId: `manual-${randomUUID()}`, authorizationRevision: 1, policyRevision: 1, addressVersion: 1,
+  }).returning();
+  await f.d.insert(db.rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 1, attemptsUsed: 1, actorUserId: f.account.ownerUserId });
+  await f.d.insert(db.rotationPublications).values({ slotId: f.slot.id, incidentId: incident!.id, addressId: f.address.id, addressVersion: 1 });
+  return incident!;
+}
+
+it("manual publication updates linked DNS without health evidence and retries only failed DNS", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.service.publish(incident.id);
+  const addresses = await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+  expect(addresses).toMatchObject([{ healthState: "unknown", consecutiveSuccesses: 0, lastCheckedAt: null }]);
+  expect(await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id))).toEqual([]);
+  await f.plan(); await f.execute();
+  const [p] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
+  await f.service.observe(p!.id);
+  expect(f.writes).toEqual(["zone-0"]);
+  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, p!.id)))[0]).toMatchObject({ status: "failed", errorCode: "dns_partial" });
+  f.state.failSecond = false; await f.execute(); await f.service.observe(p!.id);
+  expect(f.writes).toEqual(["zone-0", "zone-1"]);
+  expect(f.remote.get("zone-0")?.content).toBe(f.address.address);
+  expect(f.remote.get("zone-1")?.content).toBe(f.address.address);
+  expect(f.state.cloudCalls).toBe(0);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ phase: "cleanup" });
+});
+
+it("manual publication succeeds with no DNS bindings", async () => {
+  const f = await fixture(); const incident = await manualPublication(f);
+  await f.d.delete(db.cloudEndpointLinks).where(eq(db.cloudEndpointLinks.slotId, f.slot.id));
+  await f.service.publish(incident.id);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentAddressId: f.address.id, currentVersion: 1, candidateAddressId: null });
+  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id)))[0]).toMatchObject({ status: "applied", children: [] });
+});
+
+it("completed manual publication does not override later binding health failures", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  f.state.failSecond = false;
+  await f.service.publish(incident.id); await f.plan(); await f.execute();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
+  await f.service.observe(publication!.id);
+  await f.d.update(db.rotationIncidents).set({ phase: "complete", status: "complete", completedAt: new Date() }).where(eq(db.rotationIncidents.id, incident.id));
+  const pool = f.pools[0]!, binding = f.bindings[0]!;
+  const [backup] = await f.d.insert(db.endpoints).values({ poolId: pool.id, name: "backup", addressMode: "static", healthState: "healthy", priority: 200 }).returning();
+  const [backupAddress] = await f.d.insert(db.endpointAddresses).values({ endpointId: backup!.id, family: "4", address: "192.0.2.88", source: "static", state: "current", healthState: "healthy" }).returning();
+  const [current] = await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+  await f.d.insert(db.healthCheckConfigs).values({ domainBindingId: binding.id, checkerType: "tcp", config: { port: 443 } });
+  await f.d.insert(db.bindingEndpointHealth).values([
+    { domainBindingId: binding.id, endpointId: f.endpoints[0]!.id, endpointAddressId: current!.id, healthState: "unhealthy", consecutiveFailures: 3 },
+    { domainBindingId: binding.id, endpointId: backup!.id, endpointAddressId: backupAddress!.id, healthState: "healthy", consecutiveSuccesses: 3 },
+  ]);
+  const [latestPool] = await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, pool.id));
+  const decisionRevision = latestPool!.decisionRevision + 1;
+  await f.d.update(db.endpointPools).set({ decisionRevision }).where(eq(db.endpointPools.id, pool.id));
+  await f.d.insert(db.reconcileIntents).values({ poolId: pool.id, eventId: randomUUID(), policyRevision: latestPool!.policyRevision, decisionRevision, trigger: "failure", source: "failover" });
+  await f.plan(); await f.execute();
+  expect(f.remote.get("zone-0")?.content).toBe("192.0.2.88");
+});
+
+it("later healthy DNS repairs use current authorization after a completed manual publication", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  f.state.failSecond = false;
+  await f.service.publish(incident.id); await f.plan(); await f.execute();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
+  await f.service.observe(publication!.id);
+  await f.d.update(db.rotationIncidents).set({ phase: "complete", status: "complete", completedAt: new Date() }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.d.update(db.instanceAuthorizations).set({ revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.d.update(db.rotationPolicies).set({ revision: 2, enabled: true }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.d.insert(db.healthCheckConfigs).values({ id: f.policy.configId, slotId: f.slot.id, checkerType: "tcp", config: { port: 443 }, revision: 2 });
+  await f.d.insert(db.addressHealthPolicies).values({ id: f.policy.id, slotId: f.slot.id, family: "4", configId: f.policy.configId, groupId: f.policy.groupId, revision: 2 });
+  await f.d.insert(db.addressHealthStates).values({ slotId: f.slot.id, family: "4", addressId: f.address.id, addressVersion: 1, configId: f.policy.configId, configVersion: 2, policyId: f.policy.id, policyRevision: 2, groupRevision: 1, healthState: "healthy", latestDecision: "success", consecutiveSuccesses: 3, lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) });
+  const pool = f.pools[0]!;
+  await f.d.update(db.endpointAddresses).set({ healthState: "healthy", consecutiveSuccesses: 3 }).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+  f.remote.set("zone-0", { ...f.remote.get("zone-0")!, content: "192.0.2.99" });
+  await f.d.update(db.dnsRecords).set({ content: "192.0.2.99" }).where(eq(db.dnsRecords.managedByPoolId, pool.id));
+  const [latestPool] = await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, pool.id));
+  const decisionRevision = latestPool!.decisionRevision + 1;
+  await f.d.update(db.endpointPools).set({ decisionRevision }).where(eq(db.endpointPools.id, pool.id));
+  await f.d.insert(db.reconcileIntents).values({ poolId: pool.id, eventId: randomUUID(), policyRevision: latestPool!.policyRevision, decisionRevision, trigger: "repair", source: "failover" });
+  await f.plan(); await f.execute();
+  expect(f.remote.get("zone-0")?.content).toBe(f.address.address);
+});
+
+it.each(["authorization", "version", "live", "manual_authority"] as const)("manual DNS dispatch rechecks %s after planning", async change => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.service.publish(incident.id); await f.plan();
+  if (change === "authorization") await f.d.update(db.instanceAuthorizations).set({ managed: false, revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  if (change === "version") await f.d.update(db.managedAddressSlots).set({ currentVersion: 2 }).where(eq(db.managedAddressSlots.id, f.slot.id));
+  if (change === "live") f.live.interfaces[0]!.addresses[0]!.address = "192.0.2.99";
+  if (change === "manual_authority") {
+    const ops = await f.d.select().from(db.operations).where(eq(db.operations.resourceId, f.pools[0]!.id));
+    for (const op of ops) {
+      const steps = await f.d.select().from(db.operationSteps).where(eq(db.operationSteps.operationId, op.id));
+      for (const step of steps) await f.d.update(db.operationSteps).set({ input: { ...step.input, cloud: { ...(step.input.cloud as Record<string, unknown>), manualIncidentId: randomUUID() } } }).where(eq(db.operationSteps.id, step.id));
+    }
+    f.state.failSecond = true;
+  }
+  await f.execute(); expect(f.writes).toEqual([]);
+});
 it("retries only failed DNS provider operations, records children and never allocates during partial publication", async () => {
   const f = await dnsFixture();
   await f.service.publishSlot(f.slot.id);

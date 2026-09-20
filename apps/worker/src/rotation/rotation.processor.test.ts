@@ -79,6 +79,60 @@ async function evidence(f: Awaited<ReturnType<typeof fixture>>, decision: "succe
   const [slot] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id));
   await connection.db.update(addressHealthStates).set({ addressId: slot!.candidateAddressId ?? slot!.currentAddressId, addressVersion: version ?? (slot!.candidateAddressId ? slot!.candidateVersion : slot!.currentVersion), healthState: decision === "success" ? "healthy" : decision === "failure" ? "unhealthy" : "unknown", latestDecision: decision, consecutiveFailures: decision === "failure" ? 3 : 0, consecutiveSuccesses: decision === "success" ? 3 : 0, lastAppliedSequence: 10, lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000), lastRoundId: randomUUID() }).where(eq(addressHealthStates.id, f.health.id));
 }
+
+async function manualFixture(withHealth = false) {
+  const f = await fixture();
+  await connection.db.update(rotationIncidents).set({ trigger: "manual", healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null }).where(eq(rotationIncidents.id, f.incident.id));
+  await connection.db.update(rotationBudgetSegments).set({ maxAttempts: 1 }).where(eq(rotationBudgetSegments.id, f.incident.currentSegmentId));
+  await connection.db.update(rotationPolicies).set({ enabled: false }).where(eq(rotationPolicies.slotId, f.slot.id));
+  if (withHealth) await evidence(f, "success");
+  else {
+    await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.id, f.health.id));
+    await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.id, f.healthPolicy.id));
+    await connection.db.delete(healthCheckConfigs).where(eq(healthCheckConfigs.id, f.config.id));
+  }
+  return f;
+}
+
+it.each([false, true])("manual change performs one cloud attempt with no failure requirement (health configured: %s)", async withHealth => {
+  const f = await manualFixture(withHealth);
+  await drive(f, 8);
+  expect(f.state.count).toBe(1);
+  expect(f.state.writes).toHaveLength(2);
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toMatchObject([{ status: "pending", addressVersion: 2 }]);
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  expect(incident).toMatchObject({ trigger: "manual", phase: "publish", status: "active", healthPolicyId: null });
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ maxAttempts: 1, attemptsUsed: 1 }]);
+  const states = await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));
+  if (withHealth) expect(states[0]).toMatchObject({ latestDecision: "unknown", consecutiveSuccesses: 0 });
+  else expect(states).toEqual([]);
+});
+
+it("manual change observes lost cloud responses without allocating another address", async () => {
+  const f = await manualFixture(); f.state.lostResponse = true;
+  await drive(f, 8);
+  expect(f.state.count).toBe(1);
+  expect(f.state.observations).toHaveLength(2);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "publish" });
+});
+
+it("manual change advances a same-address initial verification placeholder without probes", async () => {
+  const f = await manualFixture();
+  await connection.db.update(managedAddressSlots).set({ currentVersion: 0, candidateAddressId: f.address.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, f.slot.id));
+  await drive(f, 8);
+  expect(f.state.count).toBe(1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "publish", addressVersion: 2 });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentAddressId: f.address.id, currentVersion: 0, candidateVersion: 2 });
+});
+
+it("manual change still blocks new writes after instance authorization is revoked", async () => {
+  const f = await manualFixture(); await drive(f, 1);
+  await connection.db.update(instanceAuthorizations).set({ managed: false, revision: 2 }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await drive(f, 2);
+  expect(f.state.writes).toEqual([]);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", errorCode: "authorization_revoked" });
+});
 it("commits a plan before effects, persists receipts and requires fresh exact-version external consensus before publication", async () => {
   const f = await fixture();
   await drive(f, 1);

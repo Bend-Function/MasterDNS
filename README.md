@@ -10,6 +10,8 @@ PRD v1.0、架构和数据模型已经确认。当前实现包含本地多用户
 
 云计算账号支持 AWS AccessKey/部署身份、Azure Service Principal 和 Linode Personal Access Token。地址绑定与监控不要求开启轮换；所有轮换及停机/重启/释放权限均需显式授权。Azure 支持符合条件的现有 NIC IP 配置 IPv4/IPv6；Linode 仅支持唯一旧版配置、Network Helper 已启用的 IPv4，SLAAC IPv6 只绑定与监控。Linode 额外 IPv4 需获批配额并产生费用，换址和释放后的清理会分别重启实例。
 
+AWS EC2 / Lightsail 的公网 IPv4 可在实例详情中点击“更换 IPv4”手动换址一次。先保存实例管理与 IPv4 换址授权；无需启用自动轮换策略或配置外部探测。系统确认云端新地址后更新关联 DNS，进度页分别展示云端观察、DNS 发布与旧地址清理；手动发布不会被标记为通过外部连通性验证。请求重试复用同一次操作，恢复执行不增加换址次数。
+
 能力、权限和恢复边界见 [Azure](docs/providers/azure.md)、[Linode](docs/providers/linode.md)；离线测试与待验收项见 [验收记录](docs/validation/azure-linode.md)。这些实现不代表已通过真实云写入或生产部署验收。
 
 ## Docker Compose

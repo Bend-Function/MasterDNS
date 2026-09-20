@@ -9,7 +9,7 @@ export const demoCloudScopes: CloudScope[] = [
 export const demoCloudInstances: CloudInstanceRow[] = [{
   account: demoCloudAccounts[0]!,
   instance: { id: "cloud-instance-1", accountId: "cloud-account-1", service: "ec2", region: "ap-southeast-2", externalId: "i-0a12bc34de56f7890", name: "edge-auckland-01", state: "running", metadata: { present: true, availabilityZone: "ap-southeast-2a" }, scanGeneration: 4, lastSeenAt: demoNow, createdAt: demoNow, updatedAt: demoNow },
-  authorization: { instanceId: "cloud-instance-1", revision: 3, managed: true, allowIpv4Rotation: false, allowIpv6Rotation: false, allowStopStart: false, allowReleaseAddress: false, updatedAt: demoNow },
+  authorization: { instanceId: "cloud-instance-1", revision: 3, managed: true, allowIpv4Rotation: true, allowIpv6Rotation: false, allowStopStart: false, allowReleaseAddress: false, updatedAt: demoNow },
   inScope: true,
   addresses: [{ id: "address-v4", interfaceId: "interface-1", family: "4", address: "203.0.113.18", kind: "host", origin: "user" }, { id: "address-v6", interfaceId: "interface-1", family: "6", address: "2001:db8::18", kind: "host", origin: "user" }],
 }];

@@ -1,5 +1,5 @@
 import { ApiError } from "./api";
-import type { AddressSlot, AuthorizationPayload, CloudAccount, CloudAddress, CloudAuthorization, CloudInstanceRow, CloudScope } from "./cloud-types";
+import type { AddressSlot, AuthorizationPayload, CloudAccount, CloudAddress, CloudAuthorization, CloudInstance, CloudInstanceRow, CloudScope } from "./cloud-types";
 import type { IntentKey } from "./intent-key";
 
 type SlotContext = { accountEnabled: boolean; instancePresent: boolean; managed: boolean };
@@ -102,6 +102,39 @@ export function cloudRotationBlock(slot: AddressSlot, authorization: CloudAuthor
   if (slot.capability.requiresStop && !authorization.allowStopStart) return "该槽位换址需要停止、启动或重启实例，请先授予停机权限";
   return null;
 }
+
+type ManualIpv4RotationContext = {
+  accountEnabled: boolean;
+  provider: CloudAccount["provider"];
+  service: CloudInstance["service"];
+  instancePresent: boolean;
+  savedAuthorization: CloudAuthorization | null;
+  draftAuthorization: CloudAuthorization;
+};
+
+export function manualIpv4RotationEligibility(slot: AddressSlot, context: ManualIpv4RotationContext): { visible: boolean; reason: string | null } {
+  const visible = context.provider === "aws"
+    && ["ec2", "lightsail"].includes(context.service)
+    && slot.slot.family === "4"
+    && slot.capability?.reason !== "private_ipv4_unsupported";
+  if (!visible) return { visible: false, reason: null };
+  if (authorizationChanged(context.savedAuthorization, context.draftAuthorization)) return { visible: true, reason: "请先保存当前授权更改" };
+  if (!context.accountEnabled) return { visible: true, reason: "云账号已停用" };
+  if (!context.instancePresent) return { visible: true, reason: "云端实例已不存在" };
+  if (!slot.inScope) return { visible: true, reason: "槽位已不在管理范围内" };
+  if (!slot.currentAddress) return { visible: true, reason: "尚未观察到当前公网 IPv4" };
+  if (!slot.capability?.available) return { visible: true, reason: capabilityReason(slot.capability?.reason) };
+  if (!context.savedAuthorization?.managed || !context.savedAuthorization.allowIpv4Rotation) return { visible: true, reason: "请先保存“允许 IPv4 换址”授权" };
+  return { visible: true, reason: null };
+}
+
+function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuthorization): boolean {
+  if (!saved) return authorizationFields.some((field) => draft[field]);
+  return authorizationFields.some((field) => saved[field] !== draft[field]);
+}
+
+const authorizationFields = ["managed", "allowIpv4Rotation", "allowIpv6Rotation", "allowStopStart", "allowReleaseAddress"] as const;
+
 export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean): string | null {
   if (!slot.capability?.requiresStop) return null;
   if (slot.ref?.service === "linode") return `Linode 换址将重启实例，使 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? "已授权释放用户原有 IPv4，DNS 发布并满足清理条件后，清理还会再次重启实例。" : "未授权释放用户原有 IPv4。"}此释放开关仅控制用户原有地址；系统创建的地址（包括失败候选和后续换下的旧地址）仍可自动清理，在停机授权有效时可能导致多次额外重启和服务中断。额外 IPv4 需获批配额并产生费用。`;

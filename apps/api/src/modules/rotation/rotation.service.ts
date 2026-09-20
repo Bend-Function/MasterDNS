@@ -1,7 +1,8 @@
 import { rotationDisplay } from "./rotation-display.js";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq } from "drizzle-orm";
-import { auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, createRotationIncident, databaseNow, lockRotationContext, lockRotationHealth, managedAddressSlots, resumeRotationIncident, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, type RotationTransaction } from "@masterdns/db";
+import { auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, createManualRotationIncident, createRotationIncident, databaseNow, lockRotationContext, lockRotationHealth, managedAddressSlots, resumeRotationIncident, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, type RotationTransaction } from "@masterdns/db";
+import { randomUUID } from "node:crypto";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import type { AuthUser } from "../../auth/auth.types.js";
@@ -41,6 +42,14 @@ export class RotationService {
       const h = await lockRotationHealth(tx, c);
       // The client never supplies a failure-event identity or budget authority.
       return createRotationIncident(tx, c, `health-${h.state?.lastRoundId ?? "missing"}-${c.addressVersion}`, actor.id);
+    }));
+    await this.wake(result.id); return result;
+  }
+  async startManual(actor: AuthUser, slotId: string, key: string) {
+    const owned = await this.ownedSlot(actor, slotId);
+    const result = await this.transaction(async tx => withCloudRequest(tx, { key, actorUserId: actor.id, ownerUserId: owned.ownerUserId, action: "rotation.manual", request: { slotId } }, async () => {
+      const c = await lockRotationContext(tx, slotId);
+      return createManualRotationIncident(tx, c, `manual-${randomUUID()}`, actor.id);
     }));
     await this.wake(result.id); return result;
   }

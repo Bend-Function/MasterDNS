@@ -108,6 +108,7 @@ tbody tr:hover { background: #fafcfb; }
 .table-primary { display: grid; gap: 3px; min-width: 150px; }
 .table-primary strong { color: var(--text); font-size: 12px; font-weight: 700; overflow-wrap: anywhere; }
 .table-primary small, .muted { color: var(--muted); font-size: 11px; }
+.slot-address { white-space: nowrap; }
 .mono { font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace; font-size: 11px; overflow-wrap: anywhere; }
 .provider-mark { width: 26px; height: 26px; display: inline-grid; place-items: center; border-radius: 4px; color: #fff; font-size: 10px; font-weight: 800; text-transform: uppercase; }
 .provider-cf { background: #d96b14; }

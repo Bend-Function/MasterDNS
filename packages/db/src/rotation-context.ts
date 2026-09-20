@@ -30,9 +30,9 @@ export async function lockRotationContext(tx: RotationTransaction, slotId: strin
     addressVersion: slot.candidateAddressId ? slot.candidateVersion : slot.currentVersion };
 }
 export type RotationContext = Awaited<ReturnType<typeof lockRotationContext>>;
-export function rotationAuthorizationError(c: RotationContext): string | undefined {
+export function rotationAuthorizationError(c: RotationContext, trigger: "health" | "manual" = "health"): string | undefined {
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed) return "authorization_revoked";
-  if (!c.policy?.enabled || !(c.slot.family === "4" ? c.authorization.allowIpv4Rotation : c.authorization.allowIpv6Rotation)) return "family_disabled";
+  if ((trigger === "health" && !c.policy?.enabled) || !(c.slot.family === "4" ? c.authorization.allowIpv4Rotation : c.authorization.allowIpv6Rotation)) return "family_disabled";
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
   if (!c.iface || !c.address || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration) return "resource_not_found";
   if (c.conflictingManager) return "conflicting_manager";

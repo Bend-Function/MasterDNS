@@ -15,6 +15,7 @@ export type RotationIncident = {
   slotId: string;
   family: "4" | "6";
   sourceEventId: string;
+  trigger?: "health" | "manual";
   status: "active" | "paused" | "exhausted" | "complete";
   phase: "cloud" | "candidate" | "publish" | "cleanup" | "complete";
   currentSegmentId: string;

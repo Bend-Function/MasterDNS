@@ -6,8 +6,6 @@ import {
   cloudEndpointLinks,
   rotationPublications,
   lockRotationContexts,
-  lockRotationHealth,
-  healthRevisions,
   bindingAssignments,
   bindingEndpointHealth,
   dnsRecords,
@@ -29,6 +27,7 @@ import { Job, Worker } from "bullmq";
 import { DatabaseService } from "../database.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
 import { reconcileOperationSource } from "./reconcile-source.js";
+import { assertPublicationContext, publicationEvidence } from "../rotation/rotation-publication.service.js";
 
 type PendingStep = {
   providerAccountId: string;
@@ -58,7 +57,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
 
   private async process(job: Job<PoolReconcileJob>) {
     const outcome = await this.database.db.transaction(async (tx) => {
-      const linkedSlots = await tx.select({ slotId: cloudEndpointLinks.slotId }).from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId)).where(eq(endpoints.poolId, job.data.poolId));
+      const linkedSlots = await tx.select({ slotId: cloudEndpointLinks.slotId, endpointId: cloudEndpointLinks.endpointId, family: cloudEndpointLinks.family }).from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId)).where(eq(endpoints.poolId, job.data.poolId));
       const cloudContexts = await lockRotationContexts(tx, linkedSlots.map(l => l.slotId));
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${job.data.poolId}))`);
       const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, job.data.poolId)).limit(1);
@@ -101,6 +100,20 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
       ]);
       const assignmentRows = assignments.map((row) => row.binding_assignments);
       const bindingsWithHealthOverrides = new Set(bindingCheckRows.flatMap((row) => row.domainBindingId ? [row.domainBindingId] : []));
+      // Manual eligibility is an explicit publication decision for one exact
+      // address version, not a stored successful health observation.
+      const manualAddresses = new Set<string>();
+      for (const link of linkedSlots) {
+        const c = cloudContexts.get(link.slotId);
+        if (!c || c.slot.candidateAddressId || !addresses.some(row => row.endpoint_addresses.endpointId === link.endpointId && row.endpoint_addresses.family === link.family && row.endpoint_addresses.address === c.address?.address)) continue;
+        const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, c.addressVersion)));
+        if (!publication?.context?.manualIncidentId || publication.status === "applied" || !publication.children.some(child =>
+          child.poolId === pool.id && child.eventId === job.data.eventId && child.policyRevision === pool.policyRevision && child.decisionRevision === job.data.decisionRevision)) continue;
+        try {
+          const evidence = await assertPublicationContext(tx, c, publication);
+          if (evidence.manualIncidentId) manualAddresses.add(`${link.endpointId}:${link.family}`);
+        } catch { /* A revoked or superseded manual decision grants no eligibility. */ }
+      }
       const decision = evaluateStrategy({
         eventId: job.data.eventId,
         trigger: job.data.trigger,
@@ -111,7 +124,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           id: endpoint.id,
           priority: endpoint.priority,
           lifecycle: endpoint.lifecycle,
-          healthState: job.data.force && endpoint.lifecycle === "enabled" ? "healthy" : endpoint.healthState,
+          healthState: (job.data.force || manualAddresses.has(`${endpoint.id}:4`)) && endpoint.lifecycle === "enabled" ? "healthy" : endpoint.healthState,
           activeBindingCount: assignmentRows.filter((assignment) => assignment.endpointId === endpoint.id && assignment.applied).length,
           addressFamilies: addresses
             .filter((row) => row.endpoint_addresses.endpointId === endpoint.id)
@@ -126,7 +139,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
             requiredAddressFamily: binding.recordType === "AAAA" ? "6" : "4",
             endpointHealthStates: Object.fromEntries(poolEndpoints.map((endpoint) => [
               endpoint.id,
-              job.data.force && endpoint.lifecycle === "enabled"
+              (job.data.force || manualAddresses.has(`${endpoint.id}:${binding.recordType === "AAAA" ? "6" : "4"}`)) && endpoint.lifecycle === "enabled"
                 ? "healthy"
                 : bindingsWithHealthOverrides.has(binding.id)
                   ? healthForCurrentBindingAddress(binding.id, endpoint.id, binding.recordType, bindingHealthRows, addresses)
@@ -242,11 +255,11 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         if (!link) throw new Error("cloud_endpoint_link_missing");
         const c = cloudContexts.get(link.slotId);
         if (!c) throw new Error("cloud_endpoint_links_changed");
-        const h = await lockRotationHealth(tx, c);
-        if (c.slot.candidateAddressId || !h.success || c.address?.address !== (step.input.record as DnsRecordInput).content) throw new Error("cloud_address_not_verified");
+        if (c.slot.candidateAddressId || c.address?.address !== (step.input.record as DnsRecordInput).content) throw new Error("cloud_address_not_verified");
         const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, c.addressVersion)));
         if (!publication) throw new Error("cloud_publication_missing");
-        step.input.cloud = { publicationId: publication.id, slotId: c.slot.id, addressId: c.address.id, addressVersion: c.addressVersion, authorizationRevision: c.authorization?.revision, physicalKey: c.physicalKey, ...healthRevisions(h) };
+        const h = await assertPublicationContext(tx, c, publication.context?.manualIncidentId || publication.status !== "applied" ? publication : undefined);
+        step.input.cloud = { publicationId: publication.id, slotId: c.slot.id, addressId: c.address.id, addressVersion: c.addressVersion, authorizationRevision: c.authorization?.revision, physicalKey: c.physicalKey, ...publicationEvidence(h) };
       }
 
       const [operation] = await tx.insert(operations).values({
