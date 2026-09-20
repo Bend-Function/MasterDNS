@@ -12,6 +12,10 @@ test-results/
 !.env.example
 *.pem
 *.key
+backups/
+masterdns-backups/
+*.dump
+*.dump.partial
 
 *.log
 .DS_Store

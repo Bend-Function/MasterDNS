@@ -13,6 +13,14 @@ node_modules
 coverage
 playwright-report
 test-results
+backups
+**/backups
+masterdns-backups
+**/masterdns-backups
+*.dump
+**/*.dump
+*.dump.partial
+**/*.dump.partial
 **/test-credentials*
 .env
 .env.*

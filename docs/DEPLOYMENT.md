@@ -114,8 +114,8 @@ IPv4 与 IPv6 使用独立健康策略和轮换开关。实例 `managed` 授权�
 (
   set -eu
   umask 077
-  backup_dir="backups/$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p backups
+  backup_dir="../masterdns-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p ../masterdns-backups
   mkdir "$backup_dir"
   cp .env "$backup_dir/.env"
   git rev-parse HEAD > "$backup_dir/app-revision.txt"
@@ -141,7 +141,7 @@ IPv4 与 IPv6 使用独立健康策略和轮换开关。实例 `managed` 授权�
   # 同时停止其他部署副本、手工 migration 和直接连接数据库的写入者。
   docker compose exec -T postgres createdb -U masterdns --template=template0 masterdns_restore
   docker compose exec -T postgres pg_restore --exit-on-error --single-transaction \
-    -U masterdns -d masterdns_restore < backups/SELECT_BACKUP/masterdns.dump
+    -U masterdns -d masterdns_restore < ../masterdns-backups/SELECT_BACKUP/masterdns.dump
   docker compose exec -T postgres psql -X -v ON_ERROR_STOP=1 -U masterdns -d masterdns_restore \
     -c 'SELECT id, hash, created_at FROM drizzle.__drizzle_migrations ORDER BY id'
 )
@@ -188,6 +188,22 @@ SQL
 
 ## 10. 升级与回退
 
+已有的单实例 Git + Docker Compose 部署可在项目目录执行：
+
+```bash
+bash update.sh
+```
+
+首次需要获取脚本时先执行 `git pull --ff-only origin master`。后续脚本自动获取 `origin/master`、只允许快进更新，并拒绝未提交的受跟踪文件修改及本地 master 分叉；不会自动 stash 或覆盖本地修改。当前分支、本地 master 或远端 master 中有受 Git 跟踪的 `.env` 时，也会在切换前拒绝更新以保护现有配置。脚本使用当前 `.env` 和正常 Compose 项目选择，要求 API、Worker、Web 各有一个已有容器，以及支持 `up --wait --wait-timeout` 的 Docker Compose v2。多副本部署需先统一维护窗口、停止其他写入者，再按手工流程操作。
+
+默认备份放在项目同级的 `masterdns-backups/时间-随机串/`，可用 `MASTERDNS_BACKUP_ROOT` 指定其他**项目外**目录。备份包含 `.env`、Compose 配置、升级前检出的源码版本、旧容器的实际镜像 ID、数据库 dump 和迁移记录；旧镜像添加独立备份标签，避免构建覆盖标签后难以定位。检出源码版本与运行镜像 ID 分别记录，不假定二者一定相同。备份文件受限为当前用户访问，仍应按密钥管理要求加密归档。
+
+脚本先构建并只读预检，随后停止 Web/API/Worker/migrate、备份数据库、再次预检、执行迁移，最后等待 API 健康并启动 Web/Worker。`MASTERDNS_UPDATE_WAIT_TIMEOUT` 可调整启动等待时间，默认 180 秒。任何命令失败都会停止后续操作并报告阶段及备份路径；迁移失败后不会自动启动或回滚应用。数据库备份失败时保留 `.partial` 文件用于诊断，它不代表有效备份。仅停止应用服务，保留 PostgreSQL、Redis 及数据卷。
+
+同一检出目录的并发更新由 Git 目录下 `masterdns-update.lock` 拒绝。正常退出或可捕获信号会释放本次锁；断电/强制终止留下的锁不会自动抢占，需根据其中 PID 确认没有更新进程后再处理。更新前确保可用磁盘空间容纳数据库备份和新旧镜像。可用 `pnpm test:update` 在临时 Git 仓库和模拟 Docker 上运行升级脚本回归，不操作实际部署。
+
+以下为需要手工控制时的等价流程：
+
 升级前按上一节保存旧镜像的不可变 ID、代码版本、Agent 版本和匹配密钥，并备份 `.env`。先构建新版本并只读预检；旧服务停止后再取一致的回退备份，重新预检并显式执行迁移。整个命令块中任一步失败都会退出，不启动新服务：
 
 ```bash
@@ -200,8 +216,8 @@ SQL
   docker compose run --rm --no-deps migrate node packages/db/dist/preflight-cli.js
   docker compose stop web api worker migrate
   # 同时停止其他应用副本与直接写入者；postgres、redis 继续运行。
-  backup_dir="backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
-  mkdir -p backups
+  backup_dir="../masterdns-backups/pre-upgrade-$(date -u +%Y%m%dT%H%M%SZ)"
+  mkdir -p ../masterdns-backups
   mkdir "$backup_dir"
   cp .env "$backup_dir/.env"
   docker compose exec -T postgres pg_dump -U masterdns -d masterdns -Fc > "$backup_dir/masterdns.dump.partial"

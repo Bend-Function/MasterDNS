@@ -31,6 +31,8 @@ docker compose up --build
 
 首次启动由 `migrate` 服务执行全部 migration，并仅在空用户表中创建初始管理员。运行状态可用 `docker compose ps` 查看；API 健康检查会同时验证 PostgreSQL 与 Redis。
 
+已有部署升级到 `master`：在项目目录运行 `bash update.sh`。首次获取脚本可先执行 `git pull --ff-only origin master`。脚本保留原 `.env`，在项目外备份配置/数据库并保留旧镜像，完成预检后停服、迁移，等待 API 健康后启动 Web/Worker。失败时停止后续步骤；详细限制与恢复方法见部署手册的“升级与回退”。
+
 ## 本地校验
 
 需要 Node.js 22 和 pnpm 11：
