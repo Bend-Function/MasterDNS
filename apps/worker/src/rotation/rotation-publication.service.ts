@@ -288,7 +288,9 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId))
           .innerJoin(endpointPools, eq(endpointPools.id, endpoints.poolId))
           .where(eq(cloudEndpointLinks.slotId, slotId));
-        if (!links.length && !h.manualIncidentId) throw new Error("publication_has_no_links");
+        // A verified rotation may finish before its first DNS binding is created.
+        // Initial binding candidates still require a link when there is no incident.
+        if (!links.length && !existing?.incidentId) throw new Error("publication_has_no_links");
         if (links.some((r) => r.endpoint.addressMode !== "cloud" || r.pool.ownerUserId !== c.account.ownerUserId))
           throw new Error("publication_owner_changed");
         const poolIds = [...new Set(links.map((r) => r.pool.id))].sort();

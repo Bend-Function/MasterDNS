@@ -35,6 +35,7 @@ vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).
 import { RotationStore } from "./rotation-store.js";
 import { RotationProcessor } from "./rotation.processor.js";
 import { RotationRecoveryService } from "./rotation-recovery.service.js";
+import { RotationPublicationService } from "./rotation-publication.service.js";
 
 async function fixture(family: "4" | "6" = "4") {
   const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
@@ -93,6 +94,81 @@ async function manualFixture(withHealth = false) {
   }
   return f;
 }
+
+async function publishingFixture(family: "4" | "6" = "4") {
+  const f = await fixture(family);
+  await drive(f, 8);
+  await evidence(f, "success");
+  await f.processor.run(f.incident.id);
+  const publication = new RotationPublicationService({ db: connection.db } as never, f.runtime as never);
+  const processor = new RotationProcessor(f.store, f.runtime as never, {} as never, publication);
+  return { ...f, processor };
+}
+
+it.each(["4", "6"] as const)("publishes a verified IPv%s health rotation without DNS links and without another allocation", async family => {
+  const f = await publishingFixture(family);
+  const writes = [...f.state.writes];
+  const [candidate] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id));
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "cleanup", errorCode: null });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentAddressId: candidate!.candidateAddressId, currentVersion: 2, candidateAddressId: null });
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toMatchObject([{ status: "applied", children: [] }]);
+  expect(f.state.writes).toEqual(writes);
+  expect(f.state.count).toBe(1);
+});
+
+it("resumes a paused unbound publication, waits for fresh evidence, and keeps its original candidate and attempt", async () => {
+  const f = await publishingFixture();
+  const [before] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  const writes = [...f.state.writes];
+  await f.store.pause(f.incident.id, "rotation_runtime_failed");
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", errorCode: "rotation_runtime_failed" });
+  await connection.db.update(addressHealthStates).set({ evidenceExpiresAt: new Date(0) }).where(eq(addressHealthStates.id, f.health.id));
+  await connection.db.transaction(async tx => resumeRotationIncident(tx, await lockRotationContext(tx, f.slot.id), f.incident.id, f.owner.id));
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "publish", currentAttemptId: before!.currentAttemptId });
+  await evidence(f, "success");
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "cleanup", currentAttemptId: before!.currentAttemptId });
+  expect(f.state.writes).toEqual(writes);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
+});
+
+it("waits instead of pausing when publication evidence expires during cloud inspection", async () => {
+  const f = await publishingFixture();
+  const inspect = f.adapter.inspect;
+  f.adapter.inspect = async ref => {
+    await connection.db.update(addressHealthStates).set({ evidenceExpiresAt: new Date(0) }).where(eq(addressHealthStates.id, f.health.id));
+    return inspect(ref);
+  };
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "publish" });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).not.toBeNull();
+  f.adapter.inspect = inspect;
+  await evidence(f, "success");
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup" });
+  expect(f.state.count).toBe(1);
+});
+
+it("keeps an explicitly paused publication paused even when its candidate is healthy", async () => {
+  const f = await publishingFixture();
+  await connection.db.update(rotationIncidents).set({ status: "paused", pausedByUserId: f.owner.id, errorCode: null }).where(eq(rotationIncidents.id, f.incident.id));
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", phase: "publish", pausedByUserId: f.owner.id, errorCode: null });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).not.toBeNull();
+});
+
+it("still publishes manual rotations without health configuration or DNS links", async () => {
+  const f = await manualFixture();
+  await drive(f, 8);
+  const publication = new RotationPublicationService({ db: connection.db } as never, f.runtime as never);
+  const processor = new RotationProcessor(f.store, f.runtime as never, {} as never, publication);
+  await processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "cleanup", errorCode: null });
+  expect(f.state.count).toBe(1);
+});
 
 it.each([false, true])("manual change performs one cloud attempt with no failure requirement (health configured: %s)", async withHealth => {
   const f = await manualFixture(withHealth);

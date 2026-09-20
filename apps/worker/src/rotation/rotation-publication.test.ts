@@ -29,6 +29,12 @@ it("does not publish stale evidence or a cloud address absent from fresh provide
   await f.service.recover();
   expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toHaveLength(0);
 });
+it("requires a DNS link for initial verification without a rotation incident", async () => {
+  const f = await fixture();
+  await f.d.delete(db.cloudEndpointLinks).where(eq(db.cloudEndpointLinks.slotId, f.slot.id));
+  await expect(f.service.publishSlot(f.slot.id)).rejects.toThrow("publication_has_no_links");
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentVersion: 0, candidateAddressId: f.address.id });
+});
 it("normalizes Cloudflare automatic TTL and retains an unknown automatic sentinel conservatively", () => {
   expect(effectiveOldTtl(1, "cloudflare")).toBe(300);
   expect(effectiveOldTtl(1, "unknown")).toBe(86400);

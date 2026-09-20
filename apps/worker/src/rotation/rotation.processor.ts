@@ -27,8 +27,20 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
       const run = await this.store.read(incidentId, lease);
       const action = run.action;
       if (run.incident.phase === "publish" || run.incident.phase === "cleanup") {
+        if (run.incident.phase === "publish" && !run.publication?.promotedAt) {
+          if (run.incident.status === "paused" || run.incident.pausedByUserId) { await this.store.defer(incidentId); return; }
+          // Health may expire between candidate verification and publication.
+          // Wait for the same candidate; never bypass the health state machine.
+          if (run.incident.trigger === "health" && action.kind !== "publish") { await this.store.settle(incidentId, lease); return; }
+        }
         await this.store.release(lease);
-        if (run.incident.phase === "publish") await this.publication?.publish(incidentId);
+        if (run.incident.phase === "publish") {
+          try { await this.publication?.publish(incidentId); }
+          catch (error) {
+            // Inspection can outlive otherwise fresh evidence. Keep probing.
+            if (!(error instanceof Error && error.message === "fresh_external_success_required")) throw error;
+          }
+        }
         else await this.cleanup?.complete(incidentId);
         await this.store.defer(incidentId); return;
       }
