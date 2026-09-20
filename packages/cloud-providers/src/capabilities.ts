@@ -28,6 +28,7 @@ export function evaluateCapabilities(slot: SlotRef, inventory: CloudInventory): 
   if (address === undefined) return unavailable("address_not_found");
   if (isIP(slot.address) !== slot.family) return unavailable("invalid_address");
   if (slot.family === 4) {
+    if (address.metadata?.awsAddressScope === "private") return unavailable("private_ipv4_unsupported");
     const [first = 0, second = 0] = slot.address.split(".").map(Number);
     if (first === 10 || first === 127 || first === 0 || first >= 224 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168) || (first === 169 && second === 254) || (first === 100 && second >= 64 && second <= 127)) return unavailable("private_ipv4_unsupported");
     if (ref.service === "ec2" && !address.allocationId && !address.primary) return unavailable("secondary_interface_unsupported");

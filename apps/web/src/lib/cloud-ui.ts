@@ -73,6 +73,7 @@ export function cloudServiceLabel(service: import("@masterdns/contracts/cloud").
 }
 export function capabilityReason(reason?: string) {
   return ({
+    private_ipv4_unsupported: "私网或保留 IPv4 地址不支持自动轮换，请使用公网 IPv4 槽位",
     inventory_mismatch: "清单身份不匹配", interface_not_found: "网卡已不存在", address_not_found: "地址已不存在", lightsail_ipv6_only: "IPv6-only 套餐不支持", secondary_interface_unsupported: "不支持次要网卡", primary_ipv6_immutable: "Primary IPv6 不可轮换，可绑定与监控",
     linode_slaac_ipv6_immutable: "Linode SLAAC IPv6 为硬件派生地址，不可轮换；可绑定与监控",
     linode_network_helper_required: "需要在唯一旧版配置中预先启用 Network Helper；MasterDNS 不会自动修改网络配置",

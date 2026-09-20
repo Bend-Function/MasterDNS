@@ -103,9 +103,9 @@ describe("EC2 read adapter", () => {
           id: "eni-01",
           deviceIndex: 0,
           addresses: [
-            { address: "10.0.0.4", family: 4, primary: true },
-            { address: "10.0.0.5", family: 4, primary: false },
-            { address: "198.51.100.10", family: 4, primary: false, allocationId: "eipalloc-01", privateAddress: "10.0.0.5" },
+            { address: "10.0.0.4", family: 4, primary: true, metadata: { awsAddressScope: "private" } },
+            { address: "10.0.0.5", family: 4, primary: false, metadata: { awsAddressScope: "private" } },
+            { address: "198.51.100.10", family: 4, primary: false, allocationId: "eipalloc-01", privateAddress: "10.0.0.5", metadata: { awsAddressScope: "public" } },
             { address: "2001:db8::4", family: 6, primary: true },
           ],
         }],
@@ -308,8 +308,8 @@ describe("Lightsail read adapter", () => {
         state: "running",
         ipv6Only: false,
         interfaces: [{ id: "primary", addresses: [
-          { address: "10.0.1.4", family: 4, primary: true },
-          { address: "203.0.113.4", family: 4, primary: true, allocationId: "web-static" },
+          { address: "10.0.1.4", family: 4, primary: true, metadata: { awsAddressScope: "private" } },
+          { address: "203.0.113.4", family: 4, primary: true, allocationId: "web-static", metadata: { awsAddressScope: "public" } },
           { address: "2001:db8::10", family: 6, primary: true },
         ] }],
       }],

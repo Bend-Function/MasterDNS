@@ -18,7 +18,7 @@ function ec2Addresses(networkInterface: InstanceNetworkInterface | NetworkInterf
   const addresses: CloudAddress[] = [];
   for (const address of networkInterface.PrivateIpAddresses ?? []) {
     if (address.PrivateIpAddress !== undefined) {
-      addresses.push({ address: address.PrivateIpAddress, family: 4, primary: address.Primary ?? false });
+      addresses.push({ address: address.PrivateIpAddress, family: 4, primary: address.Primary ?? false, metadata: { awsAddressScope: "private" } });
     }
     if (address.Association?.PublicIp !== undefined) {
       const association = address.Association as typeof address.Association & { AllocationId?: string };
@@ -26,6 +26,7 @@ function ec2Addresses(networkInterface: InstanceNetworkInterface | NetworkInterf
         address: address.Association.PublicIp,
         family: 4,
         primary: address.Primary ?? false,
+        metadata: { awsAddressScope: "public" },
       };
       if (association.AllocationId !== undefined) publicAddress.allocationId = association.AllocationId;
       if (address.PrivateIpAddress !== undefined) publicAddress.privateAddress = address.PrivateIpAddress;
@@ -75,10 +76,10 @@ export function mapLightsailInstance(
   if (instance.arn === undefined || instance.name === undefined) return undefined;
   const addresses: CloudAddress[] = [];
   if (instance.privateIpAddress !== undefined) {
-    addresses.push({ address: instance.privateIpAddress, family: 4, primary: true });
+    addresses.push({ address: instance.privateIpAddress, family: 4, primary: true, metadata: { awsAddressScope: "private" } });
   }
   if (instance.publicIpAddress !== undefined) {
-    const address: CloudAddress = { address: instance.publicIpAddress, family: 4, primary: true };
+    const address: CloudAddress = { address: instance.publicIpAddress, family: 4, primary: true, metadata: { awsAddressScope: "public" } };
     const staticIp = staticIps.find((candidate) => candidate.attachedTo === instance.name && candidate.ipAddress === instance.publicIpAddress);
     if (staticIp?.name !== undefined) address.allocationId = staticIp.name;
     if (staticIp?.arn !== undefined) address.resourceId = staticIp.arn;

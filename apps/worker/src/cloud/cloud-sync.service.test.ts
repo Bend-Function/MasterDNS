@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
 import { encryptJson } from "@masterdns/crypto";
-import type { CloudAdapter, CloudInventory } from "@masterdns/cloud-providers";
+import { Ec2CloudAdapter, LightsailCloudAdapter, evaluateCapabilities, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 vi.mock("@masterdns/cloud-providers", async (importOriginal) => ({
   ...await importOriginal<typeof import("@masterdns/cloud-providers")>(),
   createCloudAdapter: ({ credentials }: { credentials: { accessKeyId?: string } }) => ({ verifyIdentity: async () => ({ externalAccountId: credentials.accessKeyId?.startsWith("other-") ? "999999999999" : "123456789012" }) }),
@@ -36,7 +36,105 @@ async function fixture() {
   const service = new CloudSyncService({ db: connection.db } as never, runtime as never, {} as never);
   return { account: account!, item, adapter, runtime, service };
 }
+
+async function awsInventory(accountId: string, service: "ec2" | "lightsail", privateIpAddress = "10.0.0.4") {
+  const credentials = { kind: "access_key" as const, accessKeyId: "test-key", secretAccessKey: "test-secret" };
+  const adapter = service === "ec2"
+    ? new Ec2CloudAdapter(accountId, credentials, { ec2Send: async () => ({ Reservations: [{ Instances: [{
+      InstanceId: "i-test", State: { Name: "running" }, NetworkInterfaces: [{
+        NetworkInterfaceId: "eni-test", Attachment: { DeviceIndex: 0 },
+        PrivateIpAddresses: [{ PrivateIpAddress: privateIpAddress, Primary: true, Association: { PublicIp: "198.51.100.10" } }],
+      }],
+    }] }] }) })
+    : new LightsailCloudAdapter(accountId, credentials, { lightsailSend: async command => command.constructor.name === "GetInstancesCommand"
+      ? { instances: [{ arn: "arn:aws:lightsail:us-east-1:123456789012:Instance/test", name: "test", state: { name: "running" }, privateIpAddress, publicIpAddress: "198.51.100.10", ipAddressType: "dualstack" }] }
+      : { staticIps: [] } });
+  return (await adapter.discover("us-east-1")).items[0]!;
+}
+
 describe("complete cloud scope sync", () => {
+  it("keeps EC2 private addresses from publicly routable CIDRs separate from public associations", async () => {
+    const f = await fixture();
+    const item = await awsInventory(f.account.id, "ec2", "11.0.0.4");
+    f.adapter.discover.mockResolvedValue({ items: [item] });
+    await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
+    const slots = await connection.db.select({ slot: managedAddressSlots, address: cloudAddresses.address }).from(managedAddressSlots)
+      .innerJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
+      .innerJoin(cloudInterfaces, eq(managedAddressSlots.interfaceId, cloudInterfaces.id))
+      .innerJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id)).where(eq(cloudInstances.accountId, f.account.id));
+    expect(slots.map(row => row.address).sort()).toEqual(["11.0.0.4", "198.51.100.10"]);
+    expect(evaluateCapabilities({ ...item.ref, slotId: slots[0]!.slot.id, interfaceId: item.interfaces[0]!.id, address: "11.0.0.4", family: 4 }, item)).toMatchObject({ available: false, reason: "private_ipv4_unsupported" });
+  });
+
+  it.each((["ec2", "lightsail"] as const).flatMap(service => [false, true].map(publicFirst => ({ service, publicFirst }))))("creates independent private and public primary IPv4 slots for $service (public first: $publicFirst)", async ({ service, publicFirst }) => {
+    const f = await fixture();
+    const item = await awsInventory(f.account.id, service);
+    if (publicFirst) item.interfaces[0]!.addresses.reverse();
+    f.adapter.discover.mockResolvedValue({ items: [item] });
+    expect(await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+    const slots = await connection.db.select({ slot: managedAddressSlots, address: cloudAddresses.address }).from(managedAddressSlots)
+      .innerJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
+      .innerJoin(cloudInterfaces, eq(managedAddressSlots.interfaceId, cloudInterfaces.id))
+      .innerJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id)).where(eq(cloudInstances.accountId, f.account.id));
+    expect(slots.map(row => row.address).sort()).toEqual(["10.0.0.4", "198.51.100.10"]);
+    const publicSlot = slots.find(row => row.address === "198.51.100.10")!.slot;
+    expect(evaluateCapabilities({ ...item.ref, slotId: publicSlot.id, interfaceId: item.interfaces[0]!.id, address: "198.51.100.10", family: 4 }, item)).toMatchObject({ available: true });
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const after = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, publicSlot.interfaceId));
+    expect(after).toHaveLength(2);
+    expect(after.find(slot => slot.id === publicSlot.id)).toMatchObject(publicSlot);
+  });
+
+  it.each(["ec2", "lightsail"] as const)("preserves a %s public slot through candidate observation and rotation", async service => {
+    const f = await fixture();
+    const item = await awsInventory(f.account.id, service);
+    f.adapter.discover.mockResolvedValue({ items: [item] });
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [row] = await connection.db.select({ slot: managedAddressSlots }).from(managedAddressSlots)
+      .innerJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
+      .innerJoin(cloudInterfaces, eq(managedAddressSlots.interfaceId, cloudInterfaces.id))
+      .innerJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id))
+      .where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudAddresses.address, "198.51.100.10")));
+    const slot = row!.slot;
+    const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: slot.interfaceId, family: "4", kind: "host", address: "198.51.100.20", origin: "system", remoteAllocationId: "owned-allocation", scanGeneration: 1 }).returning();
+    await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, slot.id));
+    item.interfaces[0]!.addresses[1]!.address = "198.51.100.20";
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const pending = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, slot.interfaceId));
+    expect(pending).toHaveLength(2);
+    expect(pending.find(value => value.id === slot.id)).toMatchObject({ currentAddressId: slot.currentAddressId, currentVersion: 0, candidateAddressId: candidate!.id, candidateVersion: 1 });
+    await connection.db.update(managedAddressSlots).set({ currentAddressId: candidate!.id, currentVersion: 1, candidateAddressId: null }).where(eq(managedAddressSlots.id, slot.id));
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const after = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, slot.interfaceId));
+    expect(after).toHaveLength(2);
+    expect(after.find(value => value.id === slot.id)).toMatchObject({ currentAddressId: candidate!.id, currentVersion: 1 });
+    const [address] = await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.id, candidate!.id));
+    expect(address).toMatchObject({ origin: "system", remoteAllocationId: "owned-allocation" });
+  });
+
+  it.each(["ec2", "lightsail"] as const)("repairs a legacy private primary collision for %s without repointing the old slot", async service => {
+    const f = await fixture();
+    const item = await awsInventory(f.account.id, service);
+    const addresses = item.interfaces[0]!.addresses;
+    item.interfaces[0]!.addresses = [addresses[0]!];
+    f.adapter.discover.mockResolvedValue({ items: [item] });
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [instance] = await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id));
+    const [iface] = await connection.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.instanceId, instance!.id));
+    const [old] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, iface!.id));
+    expect(old).toMatchObject({ name: "primary" });
+    // Previous releases did not persist the provider's private/public role.
+    await connection.db.update(cloudAddresses).set({ metadata: {} }).where(eq(cloudAddresses.interfaceId, iface!.id));
+    // Exercise an already-versioned slot; discovery must not reset its identity or pointers.
+    await connection.db.update(managedAddressSlots).set({ currentVersion: 3 }).where(eq(managedAddressSlots.id, old!.id));
+    item.interfaces[0]!.addresses = addresses;
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const after = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, iface!.id));
+    expect(after).toHaveLength(2);
+    expect(after.find(slot => slot.id === old!.id)).toMatchObject({ currentAddressId: old!.currentAddressId, currentVersion: 3, candidateAddressId: null });
+    expect(await connection.db.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, instance!.id))).toEqual([]);
+  });
+
   it("scans only saved provider services and persists exact provider metadata including long IDs", async () => {
     const f = await fixture();
     await connection.db.update(cloudAccounts).set({ provider: "azure" }).where(eq(cloudAccounts.id, f.account.id));

@@ -125,7 +125,21 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
                   or(eq(managedAddressSlots.currentAddressId, address.id), eq(managedAddressSlots.candidateAddressId, address.id)),
                 )).limit(1);
                 if (existingSlot) continue;
-                await tx.insert(managedAddressSlots).values({ interfaceId: iface.id, family, name: observed.primary ? "primary" : observed.address, currentAddressId: address.id })
+                let name = observed.primary ? "primary" : observed.address;
+                if (observed.primary && family === "4" && (service === "ec2" || service === "lightsail")) {
+                  const [primary] = await tx.select({ metadata: cloudAddresses.metadata }).from(managedAddressSlots)
+                    .leftJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
+                    .where(and(eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family), eq(managedAddressSlots.name, "primary"))).limit(1);
+                  // AWS reports both private and public IPv4 as primary. Keep legacy
+                  // slots and their bindings intact, adding only the missing role.
+                  const metadata = primary?.metadata?.providerMetadata;
+                  const primaryScope = metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>).awsAddressScope : undefined;
+                  const observedScope = observed.metadata?.awsAddressScope;
+                  if ((primaryScope === "private" || primaryScope === "public") && (observedScope === "private" || observedScope === "public") && primaryScope !== observedScope) {
+                    name = `primary-${observedScope}`;
+                  }
+                }
+                await tx.insert(managedAddressSlots).values({ interfaceId: iface.id, family, name, currentAddressId: address.id })
                   .onConflictDoNothing({ target: [managedAddressSlots.interfaceId, managedAddressSlots.family, managedAddressSlots.name] });
               }
             }
