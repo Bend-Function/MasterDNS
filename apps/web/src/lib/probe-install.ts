@@ -1,6 +1,31 @@
 const RELEASE_BASE_URL = "https://github.com/Bend-Function/MasterDNS-Agent/releases/download";
 const PINNED_VERSION = /^v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u;
 
+export type ProbeAgentConfigInput = {
+  serverUrl: string;
+  probeId: string;
+  maxConcurrency: number;
+};
+
+export function createProbeAgentConfigJson(input: ProbeAgentConfigInput & { platform?: "linux" | "manual" }): string {
+  const server = new URL(input.serverUrl);
+  if (server.protocol !== "https:" || server.username || server.password) {
+    throw new Error("Agent 配置需要不含用户名和密码的 HTTPS API 地址");
+  }
+  const manual = input.platform === "manual";
+  return JSON.stringify({
+    serverUrl: server.toString().replace(/\/$/u, ""),
+    caFile: "",
+    probeId: input.probeId,
+    tokenFile: manual ? "./runtime-token" : "/etc/masterdns-agent/runtime-token",
+    stateDir: manual ? "./state" : "/var/lib/masterdns-agent",
+    maxConcurrency: Math.min(input.maxConcurrency, 64),
+    allowIpv4: true,
+    allowIpv6: true,
+    allowedPrivateCidrs: [],
+  }, null, 2);
+}
+
 export type ProbeInstallInstructions = {
   installToken: string;
   expiresAt: string;

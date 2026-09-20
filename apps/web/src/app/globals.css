@@ -206,6 +206,8 @@ tbody tr:hover { background: #fafcfb; }
 .agent-install section { display: grid; gap: 7px; }
 .agent-install strong { font-size: 11px; }
 .agent-install small { color: var(--muted); font-size: 11px; }
+.agent-config-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px; }
+.agent-install pre.code-box { margin: 0; }
 .secret-box { padding: 12px; overflow: auto; color: #202825; background: #fff8dd; border: 1px solid #ead48d; border-radius: 5px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
 .capability-list { display: flex; gap: 5px; flex-wrap: wrap; }
 .capability-list span { padding: 3px 6px; border-radius: 4px; font-size: 10px; white-space: nowrap; }

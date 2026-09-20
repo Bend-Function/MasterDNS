@@ -4,16 +4,17 @@ import { Ban, Copy, Plus, RadioTower, RefreshCw, UsersRound } from "lucide-react
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
 import { RelativeTime } from "../../components/relative-time";
+import { ProbeAgentConfig } from "../../components/probe-agent-config";
 import { useSession } from "../../components/session-context";
 import { Button, Dialog, EmptyState, Field, IconButton, LoadingState, MetricStrip, PageHeader, StatusBadge } from "../../components/ui";
 import { API_URL, api, formatDate, jsonBody, UI_PREVIEW } from "../../lib/api";
 import { demoProbeGroups, demoProbes } from "../../lib/probe-demo";
 import { demoNow } from "../../lib/demo";
-import { createProbeInstallInstructions, type ProbeInstallInstructions } from "../../lib/probe-install";
+import { createProbeInstallInstructions, type ProbeAgentConfigInput, type ProbeInstallInstructions } from "../../lib/probe-install";
 import type { ProbeAgent, ProbeGroup } from "../../lib/probe-types";
 import { createRequestGeneration } from "../../lib/session-state";
 
-type InstallView = { probeName: string; token: string; expiresAt: string; instructions: ProbeInstallInstructions | null; instructionError: string | null };
+type InstallView = { probeName: string; token: string; expiresAt: string; configInput: ProbeAgentConfigInput; instructions: ProbeInstallInstructions | null; instructionError: string | null };
 
 export default function ProbesPage() {
   const { user } = useSession();
@@ -47,10 +48,11 @@ export default function ProbesPage() {
       if (!mutations.current.isCurrent(generation)) return;
       const version = UI_PREVIEW ? "v1.4.2" : process.env.NEXT_PUBLIC_PROBE_AGENT_VERSION ?? "";
       const serverUrl = UI_PREVIEW ? "https://dns.example.com" : resolveServerUrl();
+      const configInput = { serverUrl, probeId: probe.id, maxConcurrency: probe.maxConcurrency };
       try {
-        setInstallView({ probeName: probe.name, token: payload.installToken, expiresAt: payload.expiresAt, instructions: createProbeInstallInstructions({ version, serverUrl, installToken: payload.installToken, expiresAt: payload.expiresAt }), instructionError: null });
+        setInstallView({ probeName: probe.name, token: payload.installToken, expiresAt: payload.expiresAt, configInput, instructions: createProbeInstallInstructions({ version, serverUrl, installToken: payload.installToken, expiresAt: payload.expiresAt }), instructionError: null });
       } catch (value) {
-        setInstallView({ probeName: probe.name, token: payload.installToken, expiresAt: payload.expiresAt, instructions: null, instructionError: message(value, "当前无法生成安装步骤") });
+        setInstallView({ probeName: probe.name, token: payload.installToken, expiresAt: payload.expiresAt, configInput, instructions: null, instructionError: message(value, "当前无法生成安装步骤") });
       }
       setBusyId(null); await load();
     } catch (value) { if (mutations.current.isCurrent(generation)) setError(message(value, "安装 Token 生成失败")); }
@@ -104,5 +106,5 @@ function GroupDialog({ target, probes, actorId, onClose, onSaved }: { target: Pr
 }
 
 function resolveServerUrl() { if (API_URL.startsWith("https://")) return API_URL; return window.location.protocol === "https:" ? window.location.origin : API_URL; }
-function InstallDetails({ view }: { view: InstallView }) { return <div className="agent-install">{view.instructionError ? <div className="inline-error" role="alert">{view.instructionError}</div> : <><section><strong>安装固定版本</strong><div className="code-box">{view.instructions?.installCommand}</div></section><section><strong>以低权限账号注册</strong><div className="code-box">{view.instructions?.enrollCommand}</div><small>运行后通过标准输入粘贴一次性 Token。</small></section><section><strong>启动服务</strong><div className="code-box">{view.instructions?.startCommand}</div></section></>}<section><strong>一次性安装 Token</strong><div className="secret-box">{view.token}</div><small>有效期至 {formatDate(view.expiresAt)}。关闭窗口后不再显示。</small></section></div>; }
+function InstallDetails({ view }: { view: InstallView }) { return <div className="agent-install"><ProbeAgentConfig key={view.token} input={view.configInput} />{view.instructionError ? <div className="inline-error" role="alert">{view.instructionError}</div> : <><section><strong>Linux 安装固定版本</strong><div className="code-box">{view.instructions?.installCommand}</div></section><section><strong>Linux 以低权限账号注册</strong><div className="code-box">{view.instructions?.enrollCommand}</div><small>运行后通过标准输入粘贴一次性 Token。</small></section><section><strong>Linux 启动服务</strong><div className="code-box">{view.instructions?.startCommand}</div></section></>}<section><strong>一次性安装 Token</strong><div className="secret-box">{view.token}</div><small>有效期至 {formatDate(view.expiresAt)}。关闭窗口后不再显示。</small></section></div>; }
 function message(value: unknown, fallback: string) { return value instanceof Error ? value.message : fallback; }
