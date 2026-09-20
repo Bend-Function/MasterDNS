@@ -1,4 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
+import { getCloudTargetsForSlots } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { externalHealthCheckConfigSchema, healthCheckConfigSchema } from "@masterdns/contracts";
 import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, resetHealthEvidence, type HealthTargetIdentity, type ProbeTransaction } from "@masterdns/db";
@@ -83,7 +84,14 @@ export class HealthPoliciesService {
       const [config] = await this.database.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, policy.configId));
       visible.push({ ...policy, state: state ?? null, states, config: config ?? null });
     }
-    return visible;
+    const targets = await getCloudTargetsForSlots(this.database.db, visible.flatMap(policy => policy.slotId ? [policy.slotId] : []));
+    return visible.map(policy => {
+      const cloudTarget = policy.slotId ? targets.get(policy.slotId) ?? null : null;
+      const address = cloudTarget?.candidateAddress ?? cloudTarget?.currentAddress;
+      const version = cloudTarget?.candidateAddress ? cloudTarget.slot.candidateVersion : cloudTarget?.slot.currentVersion;
+      const state = policy.slotId && (policy.state?.addressId !== address?.id || policy.state?.addressVersion !== version) ? null : policy.state;
+      return { ...policy, state, cloudTarget };
+    });
   }
   async rounds(actor: AuthUser, policyId: string) {
     const [policy] = await this.database.db.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId));

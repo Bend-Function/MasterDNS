@@ -97,6 +97,7 @@ export type CloudCapability = {
 };
 
 export type AddressSlot = {
+  cloudTarget?: CloudTargetSummary | null;
   slot: {
     id: string;
     interfaceId: string;
@@ -112,3 +113,11 @@ export type AddressSlot = {
 };
 
 export type AuthorizationPayload = Omit<CloudAuthorization, "instanceId" | "updatedAt">;
+
+export type CloudTargetSummary = {
+  account: Pick<CloudAccount, "id" | "name" | "provider">;
+  instance: Pick<CloudInstance, "id" | "name" | "externalId" | "service" | "region">;
+  slot: { id: string; name: string; family: "4" | "6"; currentVersion: number; candidateVersion: number };
+  currentAddress: { id: string; address: string } | null;
+  candidateAddress: { id: string; address: string } | null;
+};

@@ -1,4 +1,5 @@
 import { rotationDisplay } from "./rotation-display.js";
+import { getCloudTargetsForSlots } from "@masterdns/db";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, createManualRotationIncident, createRotationIncident, databaseNow, lockRotationContext, lockRotationHealth, managedAddressSlots, resumeRotationIncident, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, type RotationTransaction } from "@masterdns/db";
@@ -54,7 +55,9 @@ export class RotationService {
     await this.wake(result.id); return result;
   }
   async list(actor: AuthUser) {
-    return this.database.db.select().from(rotationIncidents).where(actor.role === "admin" ? undefined : eq(rotationIncidents.ownerUserId, actor.id)).orderBy(desc(rotationIncidents.createdAt)).limit(200);
+    const rows = await this.database.db.select().from(rotationIncidents).where(actor.role === "admin" ? undefined : eq(rotationIncidents.ownerUserId, actor.id)).orderBy(desc(rotationIncidents.createdAt)).limit(200);
+    const targets = await getCloudTargetsForSlots(this.database.db, rows.map(row => row.slotId));
+    return rows.map(row => ({ ...row, cloudTarget: targets.get(row.slotId) ?? null }));
   }
   async detail(actor: AuthUser, id: string) {
     const incident = await this.ownedIncident(actor, id);
@@ -66,7 +69,8 @@ export class RotationService {
       this.database.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, id)),
     ]);
     const display = await this.database.db.transaction(tx => rotationDisplay(tx, incident.slotId));
-    return { incident, segments, attempts, steps, resources, publications, ...display };
+    const targets = await getCloudTargetsForSlots(this.database.db, [incident.slotId]);
+    return { incident: { ...incident, cloudTarget: targets.get(incident.slotId) ?? null }, segments, attempts, steps, resources, publications, ...display };
   }
   async pause(actor: AuthUser, id: string) {
     const owned = await this.ownedIncident(actor, id);

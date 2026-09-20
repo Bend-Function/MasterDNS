@@ -11,6 +11,7 @@ export const healthPolicyInputSchema = z.object({
   networkPolicy: z.object({ allowedPrivateCIDRs: z.array(z.union([z.cidrv4(), z.cidrv6()])).min(1).max(64) }).strict().optional(),
 }).strict().superRefine((p, c) => {
   if (!!p.slotId === !!p.endpointId) c.addIssue({ code: "custom", message: "Choose exactly one target" });
+  if (p.slotId && p.mode === "local") c.addIssue({ code: "custom", path: ["mode"], message: "Cloud slots require external probe authority" });
   if (p.mode !== "local" && !p.groupId) c.addIssue({ code: "custom", path: ["groupId"], message: "External votes require a probe group" });
   if (p.checkIntervalSeconds < p.executionWindowSeconds || p.resultExpirySeconds < p.executionWindowSeconds) c.addIssue({ code: "custom", message: "Interval and expiry must cover the execution window" });
 });

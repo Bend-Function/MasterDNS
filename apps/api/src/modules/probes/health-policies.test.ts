@@ -44,17 +44,30 @@ it("creates slot config without any linked endpoint and enforces family and owne
  await expect(service.slotConfig(stranger.actor as never, slot!.id)).rejects.toMatchObject({ status: 404 });
  const input = { slotId: slot!.id, family: "4", configId: config.id, mode: "external", groupId: f.group.id };
  expect(await service.save(actor, input)).toMatchObject({ slotId: slot!.id, endpointId: null });
+ const [listed] = await service.list(actor);
+ expect(listed!.cloudTarget).toEqual({
+   account: { id: account!.id, name: "test", provider: "aws" },
+   instance: { id: instance!.id, name: null, externalId: "i-test", service: "ec2", region: "test" },
+   slot: { id: slot!.id, name: "primary", family: "4", currentVersion: 0, candidateVersion: 0 },
+   currentAddress: { id: address!.id, address: "192.0.2.20" }, candidateAddress: null,
+ });
+ expect(await service.list(stranger.actor as never)).toEqual([]);
  await expect(service.save(actor, { ...input, family: "6" })).rejects.toMatchObject({ status: 400 });
  expect(await connection.db.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, slot!.id))).toHaveLength(1);
  const http = await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-long-header": "b", "x-a": "a" } } });
  const expiresAt = new Date(Date.now()+60000);
- const [state] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
+ const [state] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", addressId: address!.id, addressVersion: 0, latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
+ expect((await service.list(actor))[0]!.state?.id).toBe(state!.id);
+ const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: nic!.id, kind: "host", family: "4", address: "192.0.2.21", origin: "system", scanGeneration: 1 }).returning();
+ await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, slot!.id));
+ const [changed] = await service.list(actor);
+ expect(changed!.state).toBeNull();
+ expect(changed!.cloudTarget?.candidateAddress).toEqual({ id: candidate!.id, address: "192.0.2.21" });
  const repeated = await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-a": "a", "x-long-header": "b" } } });
  expect(repeated.revision).toBe(http.revision);
  expect((await service.saveSlotConfig(actor, slot!.id, { config: { type: "http", headers: { "x-long-header": "b", "x-a": "a" } } })).revision).toBe(http.revision);
  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, state!.id)))[0]).toMatchObject({ latestDecision: "success", evidenceExpiresAt: expiresAt });
- const local = await service.save(actor, { ...input, configId: http.id, mode: "local", consensus: { mode: "at_least", minimumValid: 2, failureVotes: 2 } });
- expect(local).toMatchObject({ mode: "local", groupId: null, consensus: { mode: "all", minimumValid: 1 } });
+ await expect(service.save(actor, { ...input, configId: http.id, mode: "local" })).rejects.toThrow("Cloud slots require external probe authority");
 });
 it("preserves revision and evidence for reordered JSONB consensus and HTTP headers", async () => {
  const f = await fixture(connection.db); const actor = f.actor as never;

@@ -77,7 +77,7 @@ export function evaluateStrategy(context: StrategyContext): StrategyDecision {
 function evaluateHealthySet(context: StrategyContext, healthy: StrategyEndpoint[]): StrategyDecision {
   let noHealthyEndpoints = false;
   const decisions = context.bindings.flatMap((binding): BindingDecision[] => {
-    const available = healthyForBinding(binding, healthy, healthy);
+    const available = healthyForBinding(binding, healthy, context.endpoints);
     const preserveCurrentOnRecovery = context.trigger === "recovery"
       && (context.recoveryMode === "keep_current" || context.recoveryMode === "manual");
     const availableCurrent = available.filter((endpoint) => binding.currentEndpointIds.includes(endpoint.id));

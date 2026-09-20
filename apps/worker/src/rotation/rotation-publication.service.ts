@@ -5,6 +5,7 @@ import { and, asc, eq, inArray, isNull, ne, notExists, sql } from "drizzle-orm";
 import {
   addressHealthStates,
   resetHealthEvidence,
+  refreshPoolHealth,
   cloudEndpointLinks,
   managedAddressSlots,
   endpointPools,
@@ -347,7 +348,10 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .set({ currentAddressId: current.address!.id, currentVersion: c.addressVersion, candidateAddressId: null, updatedAt: h.now })
           .where(eq(managedAddressSlots.id, slotId));
         const children: Publication["children"] = [];
-        for (const id of poolIds) children.push(await this.intent(tx, id, h.now));
+        for (const id of poolIds) {
+          await refreshPoolHealth(tx, id);
+          children.push(await this.intent(tx, id, h.now));
+        }
         const values = {
           status: "in_flight" as const,
           children,
@@ -414,7 +418,14 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .from(operations)
           .where(eq(operations.idempotencyKey, `pool:${child.poolId}:revision:${child.policyRevision}:event:${child.eventId}`));
         if (pool.policyRevision !== child.policyRevision || pool.decisionRevision !== child.decisionRevision) {
-          children.push(await this.intent(tx, pool.id, new Date()));
+          // Every slot in a Pool must converge on the same current decision.
+          // Creating an intent per observer makes sibling publications invalidate
+          // each other forever. Reuse the durable current decision when present.
+          const [current] = await tx.select().from(reconcileIntents).where(and(
+            eq(reconcileIntents.poolId, pool.id), eq(reconcileIntents.policyRevision, pool.policyRevision),
+            eq(reconcileIntents.decisionRevision, pool.decisionRevision),
+          )).limit(1);
+          children.push(current ? { poolId: pool.id, eventId: current.eventId, policyRevision: current.policyRevision, decisionRevision: current.decisionRevision } : await this.intent(tx, pool.id, new Date()));
           done = false;
           continue;
         }

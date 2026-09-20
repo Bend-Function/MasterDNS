@@ -162,7 +162,10 @@ it("filters all queries by owner and redacts plans, receipts and encrypted crede
   const attemptId = randomUUID();
   await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident.id, segmentId: incident.currentSegmentId, sequence: 1, beforeInventory: { authorization: "secret-header" } });
   await connection.db.insert(rotationSteps).values({ id: `${attemptId}:0:test`, attemptId, sequence: 0, plan: { id: "test", action: "test", resourceKey: "test", arguments: { token: "secret-token" }, destructive: false }, receipt: { secret: "secret-receipt" } });
-  const detail = JSON.stringify(await service.detail(f.actor, incident.id));
+  const result = await service.detail(f.actor, incident.id);
+  expect(result.incident.cloudTarget).toMatchObject({ account: { id: f.account.id, name: "AWS" }, instance: { id: f.instance.id }, currentAddress: { address: "192.0.2.1" } });
+  expect((await service.list(f.actor))[0]!.cloudTarget).toEqual(result.incident.cloudTarget);
+  const detail = JSON.stringify(result);
   for (const secret of ["secret-header", "secret-token", "secret-receipt", "secret-ciphertext"]) expect(detail).not.toContain(secret);
   expect(await service.list(other.actor)).toHaveLength(0);
   await expect(service.detail(other.actor, incident.id)).rejects.toMatchObject({ status: 404 });

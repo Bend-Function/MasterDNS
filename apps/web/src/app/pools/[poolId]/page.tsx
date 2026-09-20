@@ -22,6 +22,7 @@ import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
 import { useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../../components/console-layout";
+import { CloudSourcePicker } from "../../../components/cloud-source-picker";
 import { RelativeTime } from "../../../components/relative-time";
 import {
   Button,
@@ -39,6 +40,8 @@ import { useResource } from "../../../hooks/use-resource";
 import { api, formatDate, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { createPreviewDdnsInstall, type DdnsInstallPayload } from "../../../lib/ddns-install";
 import { demoPoolDetail, demoZones } from "../../../lib/demo";
+import { cloudTargetAddresses, cloudTargetLabel } from "../../../lib/cloud-ui";
+import { createIntentKey } from "../../../lib/intent-key";
 import type { Binding, Endpoint, HealthCheck, Pool, PoolDetail, ZoneListRow } from "../../../lib/types";
 
 type Tab = "nodes" | "bindings" | "checks" | "history";
@@ -150,6 +153,10 @@ export default function PoolDetailPage() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [agentInstall, setAgentInstall] = useState<DdnsInstallPayload | null>(null);
   const [endpointDraft, setEndpointDraft] = useState<EndpointDraft>(endpointInitial);
+  const [cloudSlotId, setCloudSlotId] = useState("");
+  const [cloudRecordType, setCloudRecordType] = useState<"A" | "AAAA">("A");
+  const [cloudIntent] = useState(createIntentKey);
+  const [notice, setNotice] = useState<string | null>(null);
   const [bindingDraft, setBindingDraft] = useState<BindingDraft>(bindingInitial);
   const [checkDraft, setCheckDraft] = useState<CheckDraft>(checkInitial);
   const [poolDraft, setPoolDraft] = useState<PoolDraft | null>(null);
@@ -180,6 +187,7 @@ export default function PoolDetailPage() {
 
   const openEndpointEditor = (endpoint?: Endpoint) => {
     setActionError(null);
+    setCloudSlotId(""); cloudIntent.reset();
     setEndpointEditor(endpoint ?? "new");
     setEndpointDraft(endpoint ? {
       name: endpoint.name,
@@ -194,6 +202,18 @@ export default function PoolDetailPage() {
 
   const saveEndpoint = async (event: FormEvent) => {
     event.preventDefault();
+    if (endpointEditor === "new" && endpointDraft.addressMode === "cloud") {
+      if (!cloudSlotId) { setActionError("请选择云地址槽位"); return; }
+      setBusy(true); setActionError(null);
+      try {
+        if (!UI_PREVIEW) await api(`/v1/pools/${poolId}/cloud-endpoints`, { method: "POST", headers: { "idempotency-key": cloudIntent.current() }, ...jsonBody({ slotId: cloudSlotId }) });
+        cloudIntent.reset(); setEndpointEditor(null);
+        setNotice("云节点已加入 Pool。外部地址策略验证通过后，可供本 Pool 的域名故障转移使用。");
+        await reload();
+      } catch (value) { setActionError(value instanceof Error ? value.message : "云节点添加失败"); }
+      finally { setBusy(false); }
+      return;
+    }
     if (endpointDraft.addressMode === "static" && !endpointDraft.ipv4.trim() && !endpointDraft.ipv6.trim()) {
       setActionError("静态节点至少需要一个 IP 地址");
       return;
@@ -388,6 +408,7 @@ export default function PoolDetailPage() {
       </div>
     </div>
     {actionError && <div className="inline-error" role="alert">{actionError}</div>}
+    {notice && <p className="fieldset-note" role="status">{notice} <Link href="/health">配置或查看地址健康策略</Link></p>}
     <MetricStrip items={[
       { label: "节点", value: data.endpoints.length, detail: `${data.endpoints.filter((endpoint) => endpoint.healthState === "healthy").length} 个健康` },
       { label: "域名绑定", value: data.bindings.length, detail: `${new Set(data.bindings.map((binding) => binding.provider)).size} 个云厂商` },
@@ -403,18 +424,18 @@ export default function PoolDetailPage() {
     </nav>
 
     {tab === "nodes" && <section className="surface">
-      <header className="surface-header"><div><h2>节点</h2><p>静态地址和 DDNS 动态地址</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => openEndpointEditor()}>添加</Button></header>
+      <header className="surface-header"><div><h2>节点</h2><p>静态、DDNS 与多云地址，共用本 Pool 的故障转移策略</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => openEndpointEditor()}>添加</Button></header>
       {data.endpoints.length === 0 ? <EmptyState title="Pool 中没有节点" /> : <div className="table-wrap"><table>
         <thead><tr><th>节点</th><th>当前地址</th><th>模式</th><th>健康</th><th>连续结果</th><th>最近检查</th><th aria-label="操作" /></tr></thead>
         <tbody>{data.endpoints.map((endpoint) => <tr key={endpoint.id}>
-          <td><div className="table-primary"><strong>{endpoint.name}</strong><small>优先级 {endpoint.priority} · {lifecycleLabel(endpoint.lifecycle)}</small></div></td>
-          <td><div className="address-stack">{endpoint.addresses.filter((address) => address.state === "current").map((address) => <span className="mono" key={address.id}>IPv{address.family} {address.address}</span>)}{endpoint.addresses.some((address) => address.state === "candidate") && <span className="status status-warning">候选地址待验证</span>}</div></td>
-          <td>{endpoint.addressMode === "ddns" ? <span><RadioTower size={13} /> DDNS</span> : "静态"}</td>
+          <td><div className="table-primary"><strong>{endpointName(data.endpoints, endpoint.id)}</strong><small>优先级 {endpoint.priority} · {lifecycleLabel(endpoint.lifecycle)}</small></div></td>
+          <td><div className="address-stack">{endpoint.addresses.filter((address) => address.state === "current").map((address) => <span className="mono" key={address.id}>IPv{address.family} {address.address}</span>)}{endpoint.addresses.some((address) => address.state === "candidate") && <span className="status status-warning">候选地址待验证</span>}{endpoint.cloudTargets?.map(target => <small key={target.slot.id}>{cloudTargetAddresses(target)}{!endpoint.addresses.some(address => address.state === "current" && address.family === target.slot.family) && " · 等待验证与发布"}</small>)}</div></td>
+          <td>{endpoint.addressMode === "ddns" ? <span><RadioTower size={13} /> DDNS</span> : endpoint.addressMode === "cloud" ? "云地址" : "静态"}</td>
           <td><StatusBadge value={endpoint.healthState} /></td>
           <td><span className="muted">+{endpoint.consecutiveSuccesses} / -{endpoint.consecutiveFailures}</span></td>
           <td className="muted"><RelativeTime value={endpoint.lastCheckedAt} /></td>
           <td><div className="row-actions">
-            <IconButton label="立即检查" disabled={busy} onClick={() => void mutate(`/v1/pools/${poolId}/endpoints/${endpoint.id}/check`)}><Activity size={15} /></IconButton>
+            {endpoint.addressMode === "cloud" ? <Link className="icon-button" href="/health" aria-label="云地址外部健康策略"><Activity size={15} /></Link> : <IconButton label="立即检查" disabled={busy} onClick={() => void mutate(`/v1/pools/${poolId}/endpoints/${endpoint.id}/check`)}><Activity size={15} /></IconButton>}
             {endpoint.addressMode === "ddns" && <IconButton label="安装 DDNS Agent" disabled={busy} onClick={() => void installAgent(endpoint)}><RadioTower size={15} /></IconButton>}
             <IconButton label="编辑节点" onClick={() => openEndpointEditor(endpoint)}><Edit3 size={15} /></IconButton>
             <IconButton label="删除节点" onClick={() => { setActionError(null); setDeletingEndpoint(endpoint); }}><Trash2 size={15} /></IconButton>
@@ -432,17 +453,31 @@ export default function PoolDetailPage() {
           <td><span className={`provider-mark ${binding.provider === "cloudflare" ? "provider-cf" : "provider-ali"}`}>{binding.provider === "cloudflare" ? "CF" : "ALI"}</span></td>
           <td>{endpointName(data.endpoints, binding.originalEndpointId)}</td>
           <td>{binding.assignments.filter((assignment) => assignment.applied).map((assignment) => endpointName(data.endpoints, assignment.endpointId)).join(", ") || "未发布"}</td>
-          <td><StatusBadge value={binding.state} /></td>
+          <td>{binding.awaitingVerification ? <span className="status status-warning">等待地址验证</span> : <StatusBadge value={binding.state} />}{binding.healthState && <small className="muted">地址健康：<StatusBadge value={binding.healthState} /></small>}</td>
           <td>{binding.ttl}s</td>
           <td><div className="row-actions"><IconButton label="编辑绑定" onClick={() => openBindingEditor(binding)}><Edit3 size={15} /></IconButton><IconButton label="删除绑定" onClick={() => { setActionError(null); setDeletingBinding(binding); }}><Trash2 size={15} /></IconButton></div></td>
         </tr>)}</tbody>
       </table></div>}
     </section>}
 
-    {tab === "checks" && <div className="content-grid">
+    {tab === "checks" && <><section className="surface">
+      <header className="surface-header"><div><h2>地址健康策略与外部 Agent</h2><p>云节点继承共享槽位策略；域名专属检查在下方独立配置。</p></div><Link className="button button-secondary" href="/health">配置地址策略</Link></header>
+      {(data.addressHealthPolicies?.length ?? 0) === 0 ? <EmptyState title="尚未关联地址健康策略，请为云槽位配置外部 Agent 策略" /> : <div className="table-wrap"><table>
+        <thead><tr><th>目标</th><th>探测模式 / 组</th><th>状态</th><th>最近轮次</th><th>最近检查</th><th aria-label="操作" /></tr></thead>
+        <tbody>{data.addressHealthPolicies?.map(policy => <tr key={policy.id}>
+          <td><div className="table-primary"><strong>{policy.cloudTarget ? cloudTargetLabel(policy.cloudTarget) : endpointName(data.endpoints, policy.endpointId)}</strong><small>{policy.cloudTarget ? cloudTargetAddresses(policy.cloudTarget) : `IPv${policy.family}`}</small></div></td>
+          <td>{policy.mode === "mixed" ? "本地 + 外部 Agent" : policy.mode === "external" ? "外部 Agent" : "本地"}<small className="muted">{policy.group?.name ?? (policy.mode === "local" ? "本机探测" : "未配置探测组")}</small></td>
+          <td>{policy.evidenceStatus === "current" ? <StatusBadge value={policy.state?.healthState ?? "unknown"} /> : <span className="status status-warning">{policy.evidenceStatus === "expired" ? "证据已过期" : "等待有效结果"}</span>}</td>
+          <td>{policy.latestRound ? <span>#{policy.latestRound.sequence} · {policy.latestRound.status === "pending" ? "探测中" : policy.latestRound.consensusResult === "success" ? "通过" : policy.latestRound.consensusResult === "failure" ? "失败" : "结果不足"}<small className="muted">{policy.latestRound.memberIds.filter(id => id !== "local").length} 个外部 Agent · {policy.latestRound.address}</small></span> : "尚未开始"}</td>
+          <td><RelativeTime value={policy.state?.lastCheckedAt} /></td>
+          <td><Link href="/health">策略与投票明细</Link></td>
+        </tr>)}</tbody>
+      </table></div>}
+      {data.endpoints.flatMap(endpoint => endpoint.cloudTargets ?? []).filter(target => !data.addressHealthPolicies?.some(policy => policy.slotId === target.slot.id)).map(target => <p className="fieldset-note" key={target.slot.id}>{cloudTargetLabel(target)} · {cloudTargetAddresses(target)}：尚未配置外部地址策略，等待验证。<Link href="/health">配置</Link></p>)}
+    </section><div className="content-grid">
       <section className="surface">
-        <header className="surface-header"><div><h2>检查配置</h2><p>Pool 默认，可由节点或域名覆盖</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => { setActionError(null); setCheckDraft(checkInitial); setCheckOpen(true); }}>添加</Button></header>
-        {data.healthChecks.length === 0 ? <EmptyState title="未配置健康检查" /> : <div className="table-wrap"><table>
+        <header className="surface-header"><div><h2>本地检查配置</h2><p>Pool 默认用于普通节点；域名覆盖检查按对应地址独立判断。</p></div><Button variant="secondary" icon={<Plus size={14} />} onClick={() => { setActionError(null); setCheckDraft(checkInitial); setCheckOpen(true); }}>添加</Button></header>
+        {data.healthChecks.length === 0 ? <EmptyState title="未配置本地检查" /> : <div className="table-wrap"><table>
           <thead><tr><th>范围</th><th>Checker</th><th>目标</th><th>超时</th><th>状态</th><th aria-label="操作" /></tr></thead>
           <tbody>{data.healthChecks.map((check) => <tr key={check.id}>
             <td>{checkScopeLabel(check, data)}</td>
@@ -454,8 +489,8 @@ export default function PoolDetailPage() {
           </tr>)}</tbody>
         </table></div>}
       </section>
-      <aside className="surface"><header className="surface-header"><div><h2>最近结果</h2><p>最新 100 条探测</p></div></header><ul className="compact-list">{data.healthResults.slice(0, 12).map(({ result, endpointName: name }) => <li key={result.id}><div><strong>{name}</strong><small>{result.success ? `${result.latencyMs}ms` : result.errorCode ?? "失败"}</small></div><StatusBadge value={result.success ? "healthy" : "failed"} /></li>)}</ul></aside>
-    </div>}
+      <aside className="surface"><header className="surface-header"><div><h2>最近本地结果</h2><p>外部 Agent 结果显示在上方地址策略中</p></div></header><ul className="compact-list">{data.healthResults.slice(0, 12).map(({ result, endpointName: name }) => <li key={result.id}><div><strong>{name}</strong><small>{result.success ? `${result.latencyMs}ms` : result.errorCode ?? "失败"}</small></div><StatusBadge value={result.success ? "healthy" : "failed"} /></li>)}</ul></aside>
+    </div></>}
 
     {tab === "history" && <div className="content-grid">
       <section className="surface"><header className="surface-header"><div><h2>故障与调度事件</h2><p>健康证据与策略决定</p></div><ShieldAlert size={16} /></header><ul className="event-list">{data.events.map((event) => <li key={event.id}><strong>{event.eventType}</strong><span>{formatDate(event.createdAt)} · {JSON.stringify(event.evidence).slice(0, 160)}</span></li>)}</ul></section>
@@ -465,12 +500,11 @@ export default function PoolDetailPage() {
     <Dialog open={endpointEditor !== null} title={endpointEditor === "new" ? "添加节点" : "编辑节点"} onClose={() => setEndpointEditor(null)} footer={<><Button variant="secondary" onClick={() => setEndpointEditor(null)}>取消</Button><Button type="submit" form="endpoint-form" disabled={busy}>{endpointEditor === "new" ? "添加节点" : "保存节点"}</Button></>}>
       <form id="endpoint-form" className="field-grid" onSubmit={saveEndpoint}>
         <DialogActionError message={actionError} />
-        <Field label="节点名称"><input value={endpointDraft.name} onChange={(event) => setEndpointDraft({ ...endpointDraft, name: event.target.value })} required /></Field>
-        <Field label="地址模式"><select value={endpointDraft.addressMode} disabled={endpointEditor !== "new" && endpointEditor?.addressMode !== "ddns"} onChange={(event) => setEndpointDraft({ ...endpointDraft, addressMode: event.target.value as Endpoint["addressMode"] })}><option value="static">静态地址</option><option value="ddns">DDNS Agent</option></select></Field>
-        <Field label="优先级"><input type="number" min={0} value={endpointDraft.priority} onChange={(event) => setEndpointDraft({ ...endpointDraft, priority: Number(event.target.value) })} /></Field>
-        <Field label="运行状态"><select value={endpointDraft.lifecycle} onChange={(event) => setEndpointDraft({ ...endpointDraft, lifecycle: event.target.value })}><option value="enabled">启用</option><option value="maintenance">维护</option><option value="draining">排空</option><option value="disabled">停用</option></select></Field>
+        <Field label="地址模式"><select value={endpointDraft.addressMode} disabled={endpointEditor !== "new" && endpointEditor?.addressMode !== "ddns"} onChange={(event) => { setCloudSlotId(""); cloudIntent.reset(); setEndpointDraft({ ...endpointDraft, addressMode: event.target.value as Endpoint["addressMode"] }); }}><option value="static">静态地址</option><option value="ddns">DDNS Agent</option>{(endpointEditor === "new" || endpointDraft.addressMode === "cloud") && <option value="cloud">云服务器地址</option>}</select></Field>
+        {endpointEditor === "new" && endpointDraft.addressMode === "cloud" ? <><Field label="地址族"><select value={cloudRecordType} onChange={(event) => { setCloudRecordType(event.target.value as "A" | "AAAA"); setCloudSlotId(""); cloudIntent.reset(); }}><option value="A">IPv4</option><option value="AAAA">IPv6</option></select></Field><CloudSourcePicker key={cloudRecordType} recordType={cloudRecordType} ownerUserId={pool.ownerUserId} value={cloudSlotId} onChange={value => { setCloudSlotId(value); cloudIntent.reset(); }} /><p className="fieldset-note span-2">可重复添加不同云账号的机器。验证通过后，Pool 会按优先级和域名策略在这些节点之间切换。</p></> : <><Field label="节点名称"><input value={endpointDraft.name} onChange={(event) => setEndpointDraft({ ...endpointDraft, name: event.target.value })} required /></Field><Field label="优先级"><input type="number" min={0} value={endpointDraft.priority} onChange={(event) => setEndpointDraft({ ...endpointDraft, priority: Number(event.target.value) })} /></Field><Field label="运行状态"><select value={endpointDraft.lifecycle} onChange={(event) => setEndpointDraft({ ...endpointDraft, lifecycle: event.target.value })}><option value="enabled">启用</option><option value="maintenance">维护</option><option value="draining">排空</option><option value="disabled">停用</option></select></Field></>}
         {endpointDraft.addressMode === "static" && <><Field label="IPv4"><input className="mono" placeholder="203.0.113.10" value={endpointDraft.ipv4} required={!endpointDraft.ipv6} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv4: event.target.value })} /></Field><Field label="IPv6"><input className="mono" placeholder="2001:db8::10" value={endpointDraft.ipv6} required={!endpointDraft.ipv4} onChange={(event) => setEndpointDraft({ ...endpointDraft, ipv6: event.target.value })} /></Field></>}
-        {endpointEditor !== "new" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" role="switch" aria-checked={endpointDraft.forceApply} checked={endpointDraft.forceApply} onChange={(event) => setEndpointDraft({ ...endpointDraft, forceApply: event.target.checked })} /></label>}
+        {endpointDraft.addressMode === "cloud" && endpointEditor !== "new" && <p className="fieldset-note span-2">地址由云槽位维护；可调整名称、优先级和运行状态。<Link href="/health">查看外部健康策略</Link></p>}
+        {endpointEditor !== "new" && endpointDraft.addressMode !== "cloud" && <label className="switch-row span-2"><span>忽略当前健康状态并强制发布</span><input type="checkbox" role="switch" aria-checked={endpointDraft.forceApply} checked={endpointDraft.forceApply} onChange={(event) => setEndpointDraft({ ...endpointDraft, forceApply: event.target.checked })} /></label>}
       </form>
     </Dialog>
 
@@ -480,7 +514,7 @@ export default function PoolDetailPage() {
         <Field label="Zone"><select value={bindingDraft.zoneId} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, zoneId: event.target.value })} required><option value="">选择 Zone</option>{zones.data?.map((row) => <option key={row.zone.id} value={row.zone.id}>{row.zone.nameAscii} · {row.provider}</option>)}</select></Field>
         <Field label="记录类型"><select value={bindingDraft.recordType} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, recordType: event.target.value as Binding["recordType"] })}><option>A</option><option>AAAA</option></select></Field>
         <Field label="完整域名"><input placeholder="api.example.com" value={bindingDraft.fqdn} disabled={bindingEditor !== "new"} onChange={(event) => setBindingDraft({ ...bindingDraft, fqdn: event.target.value })} required /></Field>
-        <Field label="原始节点"><select value={bindingDraft.originalEndpointId} onChange={(event) => setBindingDraft({ ...bindingDraft, originalEndpointId: event.target.value })} required={pool.strategy !== "healthy_set" || bindingDraft.takeoverExisting}><option value="">{pool.strategy === "healthy_set" ? "由健康集合决定" : "选择节点"}</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>
+        <Field label="原始节点"><select value={bindingDraft.originalEndpointId} onChange={(event) => setBindingDraft({ ...bindingDraft, originalEndpointId: event.target.value })} required={pool.strategy !== "healthy_set" || bindingDraft.takeoverExisting}><option value="">{pool.strategy === "healthy_set" ? "由健康集合决定" : "选择节点"}</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpointName(data.endpoints, endpoint.id)}</option>)}</select></Field>
         <Field label="TTL"><input type="number" min={1} value={bindingDraft.ttl} onChange={(event) => setBindingDraft({ ...bindingDraft, ttl: Number(event.target.value) })} /></Field>
         {bindingEditor === "new" && <div className="switch-row"><span>接管现有同名记录</span><Switch checked={bindingDraft.takeoverExisting} label="切换接管现有同名记录" onCheckedChange={(takeoverExisting) => setBindingDraft({ ...bindingDraft, takeoverExisting })} /></div>}
         {selectedProvider === "cloudflare" && <div className="switch-row"><span>Cloudflare Proxy</span><Switch checked={bindingDraft.proxied} label="切换 Cloudflare Proxy" onCheckedChange={(proxied) => setBindingDraft({ ...bindingDraft, proxied })} /></div>}
@@ -493,7 +527,7 @@ export default function PoolDetailPage() {
       <form id="check-form" className="field-grid" onSubmit={createCheck}>
         <DialogActionError message={actionError} />
         <Field label="作用范围"><select value={checkDraft.scope} onChange={(event) => setCheckDraft({ ...checkDraft, scope: event.target.value as CheckDraft["scope"], scopeId: "" })}><option value="pool">Pool 默认</option><option value="endpoint">节点覆盖</option><option value="binding">域名绑定覆盖</option></select></Field>
-        {checkDraft.scope === "endpoint" && <Field label="节点"><select value={checkDraft.scopeId} onChange={(event) => setCheckDraft({ ...checkDraft, scopeId: event.target.value })} required><option value="">选择节点</option>{data.endpoints.map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpoint.name}</option>)}</select></Field>}
+        {checkDraft.scope === "endpoint" && <Field label="节点"><select value={checkDraft.scopeId} onChange={(event) => setCheckDraft({ ...checkDraft, scopeId: event.target.value })} required><option value="">选择普通节点</option>{data.endpoints.filter(endpoint => endpoint.addressMode !== "cloud").map((endpoint) => <option key={endpoint.id} value={endpoint.id}>{endpointName(data.endpoints, endpoint.id)}</option>)}</select></Field>}
         {checkDraft.scope === "binding" && <Field label="域名绑定"><select value={checkDraft.scopeId} onChange={(event) => setCheckDraft({ ...checkDraft, scopeId: event.target.value })} required><option value="">选择域名</option>{data.bindings.map((binding) => <option key={binding.id} value={binding.id}>{binding.fqdn}</option>)}</select></Field>}
         <Field label="Checker"><select value={checkDraft.type} onChange={(event) => setCheckDraft({ ...checkDraft, type: event.target.value as CheckDraft["type"] })}><option value="http">HTTP / HTTPS</option><option value="tcp">TCP Connect</option></select></Field>
         {checkDraft.type === "http" && <Field label="协议"><select value={checkDraft.protocol} onChange={(event) => setCheckDraft({ ...checkDraft, protocol: event.target.value as CheckDraft["protocol"] })}><option value="https">HTTPS</option><option value="http">HTTP</option></select></Field>}
@@ -615,5 +649,6 @@ function lifecycleLabel(value: string) {
 }
 
 function endpointName(endpoints: Endpoint[], id: string | null) {
-  return endpoints.find((endpoint) => endpoint.id === id)?.name ?? (id ? id.slice(0, 8) : "-");
+  const endpoint = endpoints.find(candidate => candidate.id === id);
+  return endpoint?.cloudTargets?.length ? endpoint.cloudTargets.map(cloudTargetLabel).join(" / ") : endpoint?.name ?? (id ? id.slice(0, 8) : "-");
 }

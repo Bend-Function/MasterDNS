@@ -15,6 +15,9 @@ export class DnsController {
   @Get(":zoneId/records")
   records(@CurrentUser() actor: AuthUser, @Param("zoneId") zoneId: string) { return this.dns.listRecords(actor, zoneId); }
 
+  @Get(":zoneId/bindings")
+  bindings(@CurrentUser() actor: AuthUser, @Param("zoneId") zoneId: string) { return this.dns.listBindings(actor, zoneId); }
+
   @Post(":zoneId/sync")
   sync(@CurrentUser() actor: AuthUser, @Param("zoneId") zoneId: string) { return this.dns.syncZone(actor, zoneId); }
 

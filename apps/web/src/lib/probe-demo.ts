@@ -1,4 +1,5 @@
 import { demoNow, demoUser } from "./demo";
+import { demoCloudTarget } from "./cloud-demo";
 import type { AddressHealthPolicy, ProbeAgent, ProbeGroup, ProbeObservationStat, ProbeRound } from "./probe-types";
 
 export const demoProbes: ProbeAgent[] = [
@@ -7,6 +8,7 @@ export const demoProbes: ProbeAgent[] = [
 ];
 export const demoProbeGroups: ProbeGroup[] = [{ id: "group-global", ownerUserId: demoUser.id, name: "Global IPv4", revision: 3, memberIds: demoProbes.map((probe) => probe.id), createdAt: demoNow }];
 export const demoHealthPolicies: AddressHealthPolicy[] = [{
+  cloudTarget: demoCloudTarget,
   id: "policy-slot-v4", slotId: "slot-v4", endpointId: null, family: "4", configId: "health-config-v4", mode: "external", groupId: "group-global", revision: 2,
   consensus: { mode: "majority", minimumValid: 2 }, checkIntervalSeconds: 15, executionWindowSeconds: 10, resultExpirySeconds: 60, successThreshold: 3, failureThreshold: 3, networkPolicy: null, updatedAt: demoNow,
   config: { id: "health-config-v4", slotId: "slot-v4", poolId: null, endpointId: null, domainBindingId: null, checkerType: "https" as "http", config: { type: "http", protocol: "https", method: "GET", path: "/health", expectedStatusMin: 200, expectedStatusMax: 399, headers: {}, followRedirects: true, verifyTls: true, timeoutMs: 3000 }, enabled: true, revision: 1, createdAt: demoNow, updatedAt: demoNow },

@@ -70,6 +70,25 @@ async function fixture(managed = false) {
 }
 
 describe("cloud account and authorization API", () => {
+  it("lists only latest inventory IPs and labels current and candidate slots without credentials", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudInstances).set({ scanGeneration: 2, name: "edge" }).where(eq(cloudInstances.id, f.instance.id));
+    await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, f.iface.id));
+    const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "192.0.2.20", origin: "system", scanGeneration: 2 }).returning();
+    await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, f.slot.id));
+    const [instance] = await service.instances(f.actor, f.account.id);
+    expect(instance!.addresses.map(address => address.address)).toEqual(["192.0.2.20"]);
+    const [slot] = await service.slots(f.actor, f.instance.id);
+    expect(slot!.cloudTarget).toEqual({
+      account: { id: f.account.id, name: "AWS", provider: "aws" },
+      instance: { id: f.instance.id, name: "edge", externalId: "i-test", service: "ec2", region: "us-east-1" },
+      slot: { id: f.slot.id, name: "primary", family: "4", currentVersion: 0, candidateVersion: 1 },
+      currentAddress: { id: f.address.id, address: "192.0.2.10" },
+      candidateAddress: { id: candidate!.id, address: "192.0.2.20" },
+    });
+    await connection.db.update(cloudInstances).set({ metadata: { present: false } }).where(eq(cloudInstances.id, f.instance.id));
+    expect((await service.instances(f.actor, f.account.id))[0]!.addresses).toEqual([]);
+  });
   it("encrypts provider credentials and keeps provider hints and audit payloads secret-free", async () => {
     const f = await fixture();
     const azure = { kind: "azure_service_principal" as const, tenantId: "11111111-1111-4111-8111-111111111111", subscriptionId: "22222222-2222-4222-8222-222222222222", clientId: "33333333-3333-4333-8333-333333333333", clientSecret: "azure-client-secret" };

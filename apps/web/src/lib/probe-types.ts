@@ -1,4 +1,5 @@
 import type { ConsensusPolicy, HealthCheckConfig } from "@masterdns/contracts";
+import type { CloudTargetSummary } from "./cloud-types";
 
 export type ProbeAgent = {
   id: string;
@@ -64,6 +65,7 @@ export type AddressHealthState = {
 };
 
 export type AddressHealthPolicy = {
+  cloudTarget?: CloudTargetSummary | null;
   id: string;
   slotId: string | null;
   endpointId: string | null;

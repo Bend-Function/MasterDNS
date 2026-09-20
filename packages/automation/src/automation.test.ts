@@ -287,6 +287,20 @@ describe("pool strategy", () => {
     expect(result.decisions).toEqual([]);
   });
 
+  it("applies healthy-set binding overrides before base health while retaining lifecycle and family guards", () => {
+    const result = evaluateStrategy(context({
+      strategy: "healthy_set",
+      endpoints: [
+        { id: "a", priority: 1, lifecycle: "enabled", healthState: "unhealthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "b", priority: 2, lifecycle: "disabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["4"] },
+        { id: "c", priority: 3, lifecycle: "enabled", healthState: "healthy", activeBindingCount: 0, addressFamilies: ["6"] },
+      ],
+      bindings: [{ id: "site", currentEndpointIds: [], requiredAddressFamily: "4", endpointHealthStates: { a: "healthy", b: "healthy", c: "healthy" } }],
+    }));
+    expect(result.noHealthyEndpoints).toBe(false);
+    expect(result.decisions[0]?.desiredEndpointIds).toEqual(["a"]);
+  });
+
   it("preserves assignment counts when one binding has no healthy candidate", () => {
     const result = evaluateStrategy(context({
       selectionMode: "least_assigned",

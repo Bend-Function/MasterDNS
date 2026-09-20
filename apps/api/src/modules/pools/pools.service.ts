@@ -4,6 +4,17 @@ import { BadRequestException, ConflictException, Injectable, NotFoundException }
 import { healthCheckConfigSchema, type HealthCheckConfig, type HealthCheckJob, type PoolReconcileJob } from "@masterdns/contracts";
 import {
   captureCloudPolicyLinks,
+  addressHealthPolicies,
+  addressHealthStates,
+  cloudEndpointLinks,
+  cloudAccounts,
+  cloudInstances,
+  cloudInterfaces,
+  managedAddressSlots,
+  getCloudTargetsForSlots,
+  getPoolHealthSummaries,
+  probeGroups,
+  probeRounds,
   prepareCloudPolicyRestore,
   lockRotationContexts,
   auditLogs,
@@ -30,6 +41,7 @@ import { z } from "zod";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
+import { cloudRequestKey, withCloudRequest } from "../cloud/cloud-idempotency.js";
 import type {
   CreateBindingInput,
   CreateEndpointInput,
@@ -139,14 +151,13 @@ export class PoolsService {
       .orderBy(asc(endpointPools.name));
     const poolIds = pools.map((pool) => pool.id);
     if (poolIds.length === 0) return [];
-    const [endpointRows, bindingRows] = await Promise.all([
-      this.database.db.select({ poolId: endpoints.poolId, state: endpoints.healthState }).from(endpoints).where(inArray(endpoints.poolId, poolIds)),
+    const [health, bindingRows] = await Promise.all([
+      getPoolHealthSummaries(this.database.db, poolIds),
       this.database.db.select({ poolId: domainBindings.poolId }).from(domainBindings).where(inArray(domainBindings.poolId, poolIds)),
     ]);
     return pools.map((pool) => ({
       ...pool,
-      endpointCount: endpointRows.filter((row) => row.poolId === pool.id).length,
-      healthyEndpointCount: endpointRows.filter((row) => row.poolId === pool.id && row.state === "healthy").length,
+      ...health.get(pool.id),
       bindingCount: bindingRows.filter((row) => row.poolId === pool.id).length,
     }));
   }
@@ -185,12 +196,51 @@ export class PoolsService {
       this.database.db.select().from(failoverEvents).where(eq(failoverEvents.poolId, poolId)).orderBy(desc(failoverEvents.createdAt)).limit(100),
       this.database.db.select().from(policyVersions).where(eq(policyVersions.poolId, poolId)).orderBy(desc(policyVersions.version)).limit(50),
     ]);
+    const endpointIds = endpointRows.map(endpoint => endpoint.id);
+    const links = endpointIds.length ? await this.database.db.select().from(cloudEndpointLinks).where(inArray(cloudEndpointLinks.endpointId, endpointIds)) : [];
+    const slotIds = [...new Set(links.map(link => link.slotId))];
+    const [health, cloudTargets, policies] = await Promise.all([
+      getPoolHealthSummaries(this.database.db, [poolId]),
+      getCloudTargetsForSlots(this.database.db, slotIds),
+      endpointIds.length ? this.database.db.select({ policy: addressHealthPolicies, config: healthCheckConfigs, group: probeGroups }).from(addressHealthPolicies)
+        .innerJoin(healthCheckConfigs, eq(healthCheckConfigs.id, addressHealthPolicies.configId))
+        .leftJoin(probeGroups, eq(probeGroups.id, addressHealthPolicies.groupId))
+        .where(or(inArray(addressHealthPolicies.endpointId, endpointIds), inArray(addressHealthPolicies.slotId, slotIds))) : [],
+    ]);
+    const policyIds = policies.map(row => row.policy.id);
+    const [states, rounds] = policyIds.length ? await Promise.all([
+      this.database.db.select().from(addressHealthStates).where(inArray(addressHealthStates.policyId, policyIds)),
+      this.database.db.selectDistinctOn([probeRounds.policyId]).from(probeRounds).where(inArray(probeRounds.policyId, policyIds)).orderBy(probeRounds.policyId, desc(probeRounds.sequence)),
+    ]) : [[], []];
+    const summary = health.get(poolId)!;
     return {
-      pool,
-      endpoints: endpointRows.map((endpoint) => ({ ...endpoint, addresses: addresses.filter((row) => row.address.endpointId === endpoint.id).map((row) => row.address) })),
-      bindings: bindings.map((row) => ({ ...row.binding, zoneName: row.zoneName, provider: row.provider, assignments: assignments.filter((item) => item.assignment.domainBindingId === row.binding.id).map((item) => item.assignment) })),
+      pool: { ...pool, ...summary },
+      endpoints: endpointRows.map((endpoint) => ({ ...endpoint, healthState: summary.endpointStates[endpoint.id] ?? endpoint.healthState, addresses: addresses.filter((row) => row.address.endpointId === endpoint.id).map((row) => row.address),
+        cloudTargets: links.filter(link => link.endpointId === endpoint.id).flatMap(link => cloudTargets.get(link.slotId) ? [cloudTargets.get(link.slotId)!] : []) })),
+      bindings: bindings.map((row) => ({ ...row.binding, healthState: summary.bindingStates[row.binding.id] ?? "unknown",
+        awaitingVerification: summary.bindingStates[row.binding.id] === "unknown"
+          && !assignments.some(item => item.assignment.domainBindingId === row.binding.id && item.assignment.applied)
+          && links.some(link => link.family === (row.binding.recordType === "AAAA" ? "6" : "4") && !addresses.some(item => item.address.endpointId === link.endpointId && item.address.family === link.family && item.address.state === "current")),
+        zoneName: row.zoneName, provider: row.provider, assignments: assignments.filter((item) => item.assignment.domainBindingId === row.binding.id).map((item) => item.assignment) })),
       healthChecks: checks,
       healthResults: results,
+      addressHealthPolicies: policies.map(({ policy, config, group }) => {
+        const target = policy.slotId ? cloudTargets.get(policy.slotId) : undefined;
+        const addressId = target ? (target.candidateAddress ?? target.currentAddress)?.id
+          : addresses.find(row => row.address.endpointId === policy.endpointId && row.address.family === policy.family && row.address.state === "current")?.address.id;
+        const state = states.find(row => row.policyId === policy.id && row.addressId === addressId) ?? null;
+        const currentEvidence = !!state && config.enabled && (!policy.slotId || policy.mode !== "local")
+          && (policy.mode === "local" || !!group && group.ownerUserId === pool.ownerUserId)
+          && (state.healthState !== "healthy" || state.consecutiveSuccesses >= policy.successThreshold)
+          && (state.healthState !== "unhealthy" || state.consecutiveFailures >= policy.failureThreshold)
+          && state.policyRevision === policy.revision && state.configId === config.id && state.configVersion === config.revision
+          && state.groupRevision === (group?.revision ?? null)
+          && (!target || state.addressVersion === (target.candidateAddress ? target.slot.candidateVersion : target.slot.currentVersion));
+        return { ...policy, config, state, group: group ? { id: group.id, name: group.name } : null, cloudTarget: target ?? null,
+          endpointIds: policy.endpointId ? [policy.endpointId] : links.filter(link => link.slotId === policy.slotId).map(link => link.endpointId),
+          evidenceStatus: !currentEvidence || state.latestDecision === "unknown" || !state.evidenceExpiresAt ? "waiting" : state.evidenceExpiresAt <= new Date() ? "expired" : "current",
+          latestRound: rounds.find(round => round.policyId === policy.id) ?? null };
+      }),
       events,
       policyVersions: versions,
     };
@@ -402,6 +452,40 @@ export class PoolsService {
       await tx.delete(endpointPools).where(eq(endpointPools.id, poolId));
     });
     return { deleted: true };
+  }
+
+  async addCloudEndpoint(actor: AuthUser, poolId: string, slotId: string, idempotencyKey: string) {
+    const key = cloudRequestKey(idempotencyKey);
+    const ownedPool = await this.findOwnedPool(actor, poolId);
+    return this.database.db.transaction(async tx => {
+      const [source] = await tx.select({ ownerUserId: cloudAccounts.ownerUserId }).from(managedAddressSlots)
+        .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+        .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
+        .innerJoin(cloudAccounts, eq(cloudAccounts.id, cloudInstances.accountId))
+        .where(and(eq(managedAddressSlots.id, slotId), eq(cloudAccounts.ownerUserId, ownedPool.ownerUserId)));
+      if (!source) throw new NotFoundException("云地址与 Pool 必须属于同一用户");
+      // Cloud hierarchy precedes the Pool lock, matching publication and recovery.
+      const c = (await lockRotationContexts(tx, [slotId])).get(slotId)!;
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, poolId)).for("update");
+      if (!pool || c.account.ownerUserId !== pool.ownerUserId || (actor.role !== "admin" && pool.ownerUserId !== actor.id)) throw new NotFoundException("IP Pool 不存在");
+      return withCloudRequest(tx, { key, actorUserId: actor.id, ownerUserId: pool.ownerUserId, action: "pool.cloud_endpoint.create", request: { poolId, slotId } }, async () => {
+        if (!c.account.enabled || !c.authorization?.managed) throw new ConflictException("云实例尚未授权管理或云账号已停用");
+        if (!c.scope || !c.iface || !c.address || c.address.kind !== "host" || isIP(c.address.address) !== Number(c.slot.family)
+          || (c.account.regions !== null && !c.account.regions.includes(c.instance.region)) || c.instance.metadata.present === false
+          || c.instance.scanGeneration !== c.scope.generation || c.iface.scanGeneration !== c.scope.generation || c.address.scanGeneration !== c.scope.generation) throw new ConflictException("云地址不在最新有效清单中，请先同步云实例");
+        const [existing] = await tx.select({ id: endpoints.id }).from(endpoints).innerJoin(cloudEndpointLinks, eq(cloudEndpointLinks.endpointId, endpoints.id))
+          .where(and(eq(endpoints.poolId, poolId), eq(cloudEndpointLinks.slotId, slotId)));
+        if (existing) throw new ConflictException("该云地址槽位已加入此 Pool");
+        const [endpoint] = await tx.insert(endpoints).values({ poolId, name: `${c.account.name} - ${c.instance.name ?? c.instance.externalId}`.slice(0, 120), addressMode: "cloud" }).returning();
+        await tx.insert(cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId, family: c.slot.family });
+        // Observed IPs stay out of endpointAddresses until versioned external verification.
+        await this.recordPolicyChange(actor, poolId, "endpoint.cloud_create", undefined, { endpoint, slotId }, pool.ownerUserId, tx);
+        const [updated] = await tx.update(endpointPools).set({ decisionRevision: sql`${endpointPools.decisionRevision} + 1`, updatedAt: new Date() }).where(eq(endpointPools.id, poolId)).returning();
+        await tx.insert(reconcileIntents).values({ eventId: randomUUID(), poolId, policyRevision: updated!.policyRevision, decisionRevision: updated!.decisionRevision, trigger: "configuration", source: "user", force: false });
+        return { endpoint: endpoint!, awaitingExternalVerification: true };
+      });
+    });
   }
 
   async createEndpoint(actor: AuthUser, poolId: string, input: CreateEndpointInput) {
@@ -622,62 +706,68 @@ export class PoolsService {
     return updated;
   }
 
-  async deleteBinding(actor: AuthUser, poolId: string, bindingId: string) {
-    const pool = await this.findOwnedPool(actor, poolId);
-    const binding = await this.findBinding(poolId, bindingId);
-    const published = await this.database.db.select({ assignment: bindingAssignments, record: dnsRecords })
-      .from(bindingAssignments).innerJoin(dnsRecords, eq(bindingAssignments.dnsRecordId, dnsRecords.id))
-      .where(and(eq(bindingAssignments.domainBindingId, bindingId), eq(bindingAssignments.applied, true)));
-    if (published.length === 0) {
-      await this.database.db.delete(domainBindings).where(eq(domainBindings.id, bindingId));
-      await this.recordPolicyChange(actor, poolId, "binding.delete", binding, undefined, pool.ownerUserId);
-      return { deleted: true };
-    }
-    const [zone] = await this.database.db.select({ zone: zones, providerAccountId: providerAccounts.id })
-      .from(zones).innerJoin(providerAccounts, eq(zones.providerAccountId, providerAccounts.id))
-      .where(eq(zones.id, binding.zoneId)).limit(1);
-    if (!zone) throw new NotFoundException("绑定对应的 Zone 不存在");
-    const operation = await this.database.db.transaction(async (tx) => {
-      const [created] = await tx.insert(operations).values({
-        ownerUserId: pool.ownerUserId,
-        actorUserId: actor.id,
-        source: "user",
-        idempotencyKey: `binding-delete:${binding.id}:${randomUUID()}`,
-        resourceType: "domain_binding",
-        resourceId: binding.id,
-        policyRevision: pool.policyRevision,
-        beforeSnapshot: binding,
+  async deleteBinding(actor: AuthUser, poolId: string, bindingId: string, unpublishedOnly = false) {
+    await this.findOwnedPool(actor, poolId);
+    const original = await this.findBinding(poolId, bindingId);
+    const result = await this.queues.withDnsZoneLock(original.zoneId, (lease) => this.database.db.transaction(async (tx) => {
+      // The zone lease excludes provider writes; the Pool lock excludes new plans.
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.select().from(endpointPools).where(and(eq(endpointPools.id, poolId), actor.role === "admin" ? undefined : eq(endpointPools.ownerUserId, actor.id))).for("update");
+      const [binding] = await tx.select().from(domainBindings).where(and(eq(domainBindings.id, bindingId), eq(domainBindings.poolId, poolId))).for("update");
+      if (!pool || !binding || binding.zoneId !== original.zoneId) throw new NotFoundException("域名绑定不存在");
+      const [pending] = await tx.select({ id: operationSteps.id }).from(operationSteps).where(and(
+        eq(operationSteps.zoneId, binding.zoneId),
+        sql`${operationSteps.input}->>'bindingId' = ${binding.id}`,
+        inArray(operationSteps.status, ["pending", "running"]),
+      )).limit(1);
+      if (pending) throw new ConflictException("该绑定的 DNS 变更正在排队或执行，请等待操作完成后再删除");
+      const [uncertain] = await tx.select({ id: operationSteps.id }).from(operationSteps).where(and(
+        eq(operationSteps.zoneId, binding.zoneId),
+        sql`${operationSteps.input}->>'bindingId' = ${binding.id}`,
+        inArray(operationSteps.status, ["failed", "skipped"]),
+        inArray(operationSteps.action, ["create", "update"]),
+        sql`${operationSteps.attempts} > 0`,
+      )).limit(1);
+      // A remote write can succeed before verification or persistence fails. No
+      // local assignment does not establish that the provider has no record.
+      if (uncertain) throw new ConflictException("DNS 写入结果尚未确认，请先恢复或核对失败的 DNS 操作");
+      lease.assertOwned();
+      const published = await tx.select({ assignment: bindingAssignments, record: dnsRecords })
+        .from(bindingAssignments).innerJoin(dnsRecords, eq(bindingAssignments.dnsRecordId, dnsRecords.id))
+        .where(and(eq(bindingAssignments.domainBindingId, bindingId), eq(bindingAssignments.applied, true)));
+      if (unpublishedOnly && published.length > 0) throw new ConflictException("该绑定已完成发布，请刷新页面并在 Pool 中确认删除已发布记录");
+      if (published.length === 0) {
+        await tx.delete(domainBindings).where(eq(domainBindings.id, bindingId));
+        await this.recordPolicyChange(actor, poolId, "binding.delete", binding, undefined, pool.ownerUserId, tx);
+        lease.assertOwned();
+        return { deleted: true as const };
+      }
+      const [zone] = await tx.select({ zone: zones, providerAccountId: providerAccounts.id })
+        .from(zones).innerJoin(providerAccounts, eq(zones.providerAccountId, providerAccounts.id))
+        .where(eq(zones.id, binding.zoneId)).limit(1);
+      if (!zone) throw new NotFoundException("绑定对应的 Zone 不存在");
+      const [operation] = await tx.insert(operations).values({
+        ownerUserId: pool.ownerUserId, actorUserId: actor.id, source: "user",
+        idempotencyKey: `binding-delete:${binding.id}:${randomUUID()}`, resourceType: "domain_binding",
+        resourceId: binding.id, policyRevision: pool.policyRevision, beforeSnapshot: binding,
       }).returning();
-      if (!created) throw new Error("Binding delete operation insert returned no row");
+      if (!operation) throw new Error("Binding delete operation insert returned no row");
       await tx.insert(operationSteps).values(published.map(({ assignment, record }, index) => ({
-        operationId: created.id,
-        sequence: index + 1,
-        providerAccountId: zone.providerAccountId,
-        zoneId: zone.zone.id,
-        dnsRecordId: record.id,
-        action: "delete" as const,
-        input: {
-          zoneExternalId: zone.zone.externalId,
-          recordExternalId: record.externalId,
-          management: "managed",
-          poolId,
-          bindingId,
-          endpointId: assignment.endpointId,
-          assignmentMode: pool.strategy === "healthy_set" ? "set" : "single",
-          deleteBinding: true,
-        },
+        operationId: operation.id, sequence: index + 1, providerAccountId: zone.providerAccountId,
+        zoneId: zone.zone.id, dnsRecordId: record.id, action: "delete" as const,
+        input: { zoneExternalId: zone.zone.externalId, recordExternalId: record.externalId, management: "managed",
+          poolId, bindingId, endpointId: assignment.endpointId,
+          assignmentMode: pool.strategy === "healthy_set" ? "set" : "single", deleteBinding: true },
       })));
       await tx.update(domainBindings).set({ state: "switching", updatedAt: new Date() }).where(eq(domainBindings.id, bindingId));
-      return created;
+      lease.assertOwned();
+      return operation;
+    }));
+    if ("deleted" in result) return result;
+    await this.queues.operations.add("execute-operation", { operationId: result.id }, {
+      jobId: result.id, attempts: 5, backoff: { type: "exponential", delay: 1_000 }, removeOnComplete: 5_000, removeOnFail: 5_000,
     });
-    await this.queues.operations.add("execute-operation", { operationId: operation.id }, {
-      jobId: operation.id,
-      attempts: 5,
-      backoff: { type: "exponential", delay: 1_000 },
-      removeOnComplete: 5_000,
-      removeOnFail: 5_000,
-    });
-    return operation;
+    return result;
   }
 
   async createHealthCheck(actor: AuthUser, poolId: string, scope: "pool" | "endpoint" | "binding", scopeId: string | undefined, config: HealthCheckConfig) {
@@ -769,8 +859,8 @@ export class PoolsService {
     return { queued: true, eventId, ...revision };
   }
 
-  private async recordPolicyChange(actor: AuthUser, poolId: string, reason: string, before: unknown, after: unknown, ownerOverride?: string) {
-    return this.database.db.transaction(async (tx) => {
+  private async recordPolicyChange(actor: AuthUser, poolId: string, reason: string, before: unknown, after: unknown, ownerOverride?: string, transaction?: DatabaseTransaction) {
+    const apply = async (tx: DatabaseTransaction) => {
       const [pool] = await tx.update(endpointPools).set({ policyRevision: sql`${endpointPools.policyRevision} + 1`, updatedAt: new Date() })
         .where(eq(endpointPools.id, poolId)).returning();
       if (!pool) throw new NotFoundException("IP Pool 不存在");
@@ -797,7 +887,8 @@ export class PoolsService {
         afterSnapshot: after,
       });
       return pool;
-    });
+    };
+    return transaction ? apply(transaction) : this.database.db.transaction(apply);
   }
 
   private async checkBelongsToPool(check: typeof healthCheckConfigs.$inferSelect, poolId: string) {

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { applyHealthResult } from "@masterdns/automation";
 import type { HealthState, PoolReconcileJob } from "@masterdns/contracts";
-import { cloudEndpointLinks, lockRotationContext, lockRotationHealth, addressHealthPolicies, addressHealthStates, healthTargetWhere, bindingEndpointHealth, ddnsAgents, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthCheckResults, reconcileIntents, type MasterDnsDatabase } from "@masterdns/db";
+import { cloudEndpointLinks, lockRotationContext, lockRotationHealth, addressHealthPolicies, addressHealthStates, healthTargetWhere, refreshPoolHealth, bindingEndpointHealth, ddnsAgents, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthCheckResults, reconcileIntents, type MasterDnsDatabase } from "@masterdns/db";
 import { and, eq, ne, sql } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 type Transaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
@@ -204,36 +204,7 @@ export class HealthResultService {
         }).where(eq(endpoints.id, current.id));
       }
 
-      if (target.binding) {
-        const bindingStates = await tx.select({
-          state: bindingEndpointHealth.healthState,
-          endpointId: bindingEndpointHealth.endpointId,
-          endpointAddressId: bindingEndpointHealth.endpointAddressId,
-          recordType: domainBindings.recordType,
-        })
-          .from(bindingEndpointHealth)
-          .innerJoin(domainBindings, eq(bindingEndpointHealth.domainBindingId, domainBindings.id))
-          .where(eq(domainBindings.poolId, currentPool.id));
-        const currentAddresses = await tx.select({
-          id: endpointAddresses.id,
-          endpointId: endpointAddresses.endpointId,
-          family: endpointAddresses.family,
-        }).from(endpointAddresses)
-          .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id))
-          .where(and(eq(endpoints.poolId, currentPool.id), eq(endpointAddresses.state, "current")));
-        const currentAddressIds = new Set(currentAddresses.map((address) => `${address.endpointId}:${address.family}:${address.id}`));
-        const currentBindingStates = bindingStates.filter((item) => item.endpointAddressId
-          && currentAddressIds.has(`${item.endpointId}:${item.recordType === "AAAA" ? "6" : "4"}:${item.endpointAddressId}`));
-        await tx.update(endpointPools).set({
-          state: aggregatePoolState(currentBindingStates.map((item) => item.state)),
-          updatedAt: new Date(),
-        }).where(eq(endpointPools.id, currentPool.id));
-      } else if (!checkingCandidate || promoted) {
-        const poolEndpoints = await tx.select({ state: endpoints.healthState }).from(endpoints)
-          .where(eq(endpoints.poolId, currentPool.id));
-        await tx.update(endpointPools).set({ state: aggregatePoolState(poolEndpoints.map((item) => item.state)), updatedAt: new Date() })
-          .where(eq(endpointPools.id, currentPool.id));
-      }
+      if (target.binding || !checkingCandidate || promoted) await refreshPoolHealth(tx, currentPool.id);
 
       const transition = promoted
         ? { trigger: "repair" as const }

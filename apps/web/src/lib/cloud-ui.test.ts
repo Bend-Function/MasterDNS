@@ -1,7 +1,22 @@
 import { describe, expect, it, vi } from "vitest";
-import type { AddressSlot, CloudAuthorization } from "./cloud-types";
-import { authorizationPayload, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
+import type { AddressSlot, CloudAuthorization, CloudTargetSummary } from "./cloud-types";
+import { authorizationPayload, cloudTargetLabel, cloudTargetAddresses, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
 import { createIntentKey } from "./intent-key";
+
+it("identifies cloud targets and distinguishes candidate IPv6 from the current address", () => {
+  const target: CloudTargetSummary = {
+    account: { id: "account", name: "Production", provider: "aws" },
+    instance: { id: "instance", name: null, externalId: "i-edge", service: "ec2", region: "us-east-1" },
+    slot: { id: "slot", name: "primary", family: "6", currentVersion: 1, candidateVersion: 2 },
+    currentAddress: { id: "old", address: "2001:db8::1" },
+    candidateAddress: { id: "new", address: "2001:db8::2" },
+  };
+  expect(cloudTargetLabel(target)).toBe("Production - i-edge");
+  expect(cloudTargetAddresses(target)).toBe("IPv6 · 当前 2001:db8::1 · 候选待验证 2001:db8::2");
+  expect(cloudTargetAddresses({ ...target, candidateAddress: target.currentAddress })).toBe("IPv6 · 待验证 2001:db8::1");
+  expect(cloudTargetAddresses({ ...target, slot: { ...target.slot, currentVersion: 0 }, candidateAddress: null })).toBe("IPv6 · 当前待验证 2001:db8::1");
+  expect(cloudTargetAddresses({ ...target, currentAddress: null, candidateAddress: null })).toBe("IPv6 · 暂无当前地址");
+});
 
 const slot = (overrides: Partial<AddressSlot> = {}): AddressSlot => ({
   slot: {

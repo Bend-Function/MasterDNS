@@ -4,6 +4,8 @@ import { z } from "zod";
 
 const nullableIp = (family: 4 | 6) => z.union([z.string().refine((value) => isIP(value) === family, `必须是有效的 IPv${family} 地址`), z.null()]);
 
+export const createCloudEndpointSchema = z.object({ slotId: z.uuid() }).strict();
+
 export const createPoolSchema = z.object({
   name: z.string().trim().min(1).max(120),
   description: z.string().trim().max(2000).optional(),

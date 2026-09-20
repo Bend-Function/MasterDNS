@@ -1,8 +1,21 @@
 import { ApiError } from "./api";
+import type { CloudTargetSummary } from "./cloud-types";
 import type { AddressSlot, AuthorizationPayload, CloudAccount, CloudAddress, CloudAuthorization, CloudInstance, CloudInstanceRow, CloudScope } from "./cloud-types";
 import type { IntentKey } from "./intent-key";
 
 type SlotContext = { accountEnabled: boolean; instancePresent: boolean; managed: boolean };
+
+export function cloudTargetLabel(target: CloudTargetSummary) {
+  return `${target.account.name} - ${target.instance.name || target.instance.externalId}`;
+}
+
+export function cloudTargetAddresses(target: CloudTargetSummary) {
+  if (target.candidateAddress && target.candidateAddress.id === target.currentAddress?.id) return `IPv${target.slot.family} · 待验证 ${target.candidateAddress.address}`;
+  const current = target.currentAddress ? `${target.slot.currentVersion > 0 ? "当前" : "当前待验证"} ${target.currentAddress.address}` : "暂无当前地址";
+  const candidate = target.candidateAddress && target.candidateAddress.id !== target.currentAddress?.id
+    ? ` · 候选待验证 ${target.candidateAddress.address}` : "";
+  return `IPv${target.slot.family} · ${current}${candidate}`;
+}
 
 export function selectableCloudSlots(recordType: "A" | "AAAA", slots: AddressSlot[], context: SlotContext = { accountEnabled: true, instancePresent: true, managed: true }) {
   const family = recordType === "A" ? "4" : "6";

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { getCloudTargetsForSlots } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
@@ -92,7 +93,16 @@ export class CloudService {
     const account = await this.findAccount(actor, accountId);
     const rows = await this.database.db.select({ instance: cloudInstances, authorization: instanceAuthorizations }).from(cloudInstances)
       .leftJoin(instanceAuthorizations, eq(instanceAuthorizations.instanceId, cloudInstances.id)).where(eq(cloudInstances.accountId, accountId)).orderBy(asc(cloudInstances.region), asc(cloudInstances.name));
-    return rows.map((row) => ({ ...row, inScope: account.regions === null || account.regions.includes(row.instance.region) }));
+    const addresses = await this.database.db.select({ instanceId: cloudInstances.id, address: cloudAddresses }).from(cloudAddresses)
+      .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, cloudAddresses.interfaceId))
+      .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
+      .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInterfaces.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.kind, "host")));
+    const byInstance = new Map<string, typeof cloudAddresses.$inferSelect[]>();
+    for (const row of addresses) {
+      const values = byInstance.get(row.instanceId) ?? [];
+      values.push(row.address); byInstance.set(row.instanceId, values);
+    }
+    return rows.map((row) => ({ ...row, addresses: row.instance.metadata.present === false ? [] : byInstance.get(row.instance.id) ?? [], inScope: account.regions === null || account.regions.includes(row.instance.region) }));
   }
 
   async instance(actor: AuthUser, instanceId: string) {
@@ -133,9 +143,10 @@ export class CloudService {
       .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
       .leftJoin(cloudAddresses, eq(cloudAddresses.id, managedAddressSlots.currentAddressId))
       .where(eq(cloudInterfaces.instanceId, instanceId));
+    const targets = await getCloudTargetsForSlots(this.database.db, rows.map(row => row.slot.id));
     return rows.map(({ slot, currentAddress, interfaceExternalId }) => {
       const ref: SlotRef | null = currentAddress ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: currentAddress.address, family: slot.family === "4" ? 4 : 6 } : null;
-      return { slot, currentAddress, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
+      return { slot, currentAddress, cloudTarget: targets.get(slot.id) ?? null, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
     });
   }
 

@@ -1,8 +1,11 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post } from "@nestjs/common";
+import { Body, Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Post, Query } from "@nestjs/common";
+import { ZodBody } from "../../common/zod-body.decorator.js";
+import { cloudRequestKey } from "../cloud/cloud-idempotency.js";
 import { CurrentUser } from "../../auth/auth.decorators.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 import {
   createBindingSchema,
+  createCloudEndpointSchema,
   createEndpointSchema,
   createHealthCheckSchema,
   createPoolSchema,
@@ -57,6 +60,11 @@ export class PoolsController {
     return this.pools.createEndpoint(actor, poolId, createEndpointSchema.parse(body));
   }
 
+  @Post(":poolId/cloud-endpoints")
+  addCloudEndpoint(@CurrentUser() actor: AuthUser, @Param("poolId", ParseUUIDPipe) poolId: string, @ZodBody(createCloudEndpointSchema) input: { slotId: string }, @Headers("idempotency-key") key: string | undefined) {
+    return this.pools.addCloudEndpoint(actor, poolId, input.slotId, cloudRequestKey(key));
+  }
+
   @Patch(":poolId/endpoints/:endpointId")
   updateEndpoint(@CurrentUser() actor: AuthUser, @Param("poolId") poolId: string, @Param("endpointId") endpointId: string, @Body() body: unknown) {
     return this.pools.updateEndpoint(actor, poolId, endpointId, updateEndpointSchema.parse(body));
@@ -83,8 +91,8 @@ export class PoolsController {
   }
 
   @Delete(":poolId/bindings/:bindingId")
-  deleteBinding(@CurrentUser() actor: AuthUser, @Param("poolId") poolId: string, @Param("bindingId") bindingId: string) {
-    return this.pools.deleteBinding(actor, poolId, bindingId);
+  deleteBinding(@CurrentUser() actor: AuthUser, @Param("poolId") poolId: string, @Param("bindingId") bindingId: string, @Query("unpublishedOnly") unpublishedOnly?: string) {
+    return this.pools.deleteBinding(actor, poolId, bindingId, unpublishedOnly === "true");
   }
 
   @Post(":poolId/checks")

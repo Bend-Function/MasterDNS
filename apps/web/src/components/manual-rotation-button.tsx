@@ -95,7 +95,7 @@ export function ManualRotationButton({ account, instance, slot, savedAuthorizati
         <p>{UI_PREVIEW ? "真实操作会更换当前地址一次，并更新绑定到此槽位的 DNS 记录；不会执行外部可达性验证，换址和 DNS 生效期间服务可能短暂中断。" : "系统会更换当前地址一次，并更新绑定到此槽位的 DNS 记录。此次手动操作不执行外部可达性验证，换址和 DNS 生效期间服务可能短暂中断。"}</p>
         {error && <div className="inline-error" role="alert">{error}</div>}
         <dl>
-          <dt>实例</dt><dd>{instance.name ?? instance.externalId}</dd>
+          <dt>云账号 / 实例</dt><dd>{account.name} - {instance.name ?? instance.externalId}</dd>
           <dt>云服务</dt><dd>{cloudServiceLabel(instance.service)} · {instance.region}</dd>
           <dt>当前公网 IPv4</dt><dd className="mono">{slot.currentAddress?.address ?? "暂无观测数据"}</dd>
           <dt>换址次数</dt><dd>1 次</dd>

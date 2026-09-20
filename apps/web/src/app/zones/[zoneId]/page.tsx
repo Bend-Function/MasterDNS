@@ -11,14 +11,23 @@ import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState
 import { useResource } from "../../../hooks/use-resource";
 import { api, jsonBody, UI_PREVIEW } from "../../../lib/api";
 import { demoNow, demoZones } from "../../../lib/demo";
+import { demoCloudSlots } from "../../../lib/cloud-demo";
 import { createIntentKey } from "../../../lib/intent-key";
-import { submitCloudIntent } from "../../../lib/cloud-ui";
+import { cloudTargetAddresses, cloudTargetLabel, submitCloudIntent } from "../../../lib/cloud-ui";
 import type { DnsRecord, ZoneListRow } from "../../../lib/types";
+import type { ZoneBinding } from "../../../lib/zone-bindings";
 
 const previewRecords: DnsRecord[] = [
   { id: "rec-1", zoneId: "zone-1", externalId: "cf-001", type: "A", name: "api.edge.example.com", content: "192.0.2.37", ttl: 60, priority: null, providerMetadata: { proxied: false }, management: "managed", managedByPoolId: "pool-1", lastSyncedAt: demoNow, deletedAt: null },
   { id: "rec-2", zoneId: "zone-1", externalId: "cf-002", type: "CNAME", name: "www.edge.example.com", content: "edge.example.com", ttl: 300, priority: null, providerMetadata: { proxied: true }, management: "unmanaged", managedByPoolId: null, lastSyncedAt: demoNow, deletedAt: null },
 ];
+
+const previewBindings: ZoneBinding[] = [{
+  id: "binding-pending", poolId: "pool-1", poolName: "Public edge pool", fqdn: "pending.edge.example.com", recordType: "A",
+  state: "healthy", published: false, inProgress: false, cancellationBlocked: false,
+  waitingReason: "等待外部 Agent 对当前地址完成连续成功验证",
+  cloudSources: demoCloudSlots[0]?.cloudTarget ? [demoCloudSlots[0].cloudTarget] : [],
+}];
 
 type RecordDraft = {
   type: string;
@@ -47,6 +56,7 @@ const initialDraft: RecordDraft = {
 export default function ZoneRecordsPage() {
   const { zoneId } = useParams<{ zoneId: string }>();
   const recordsResource = useResource<DnsRecord[]>(`/v1/zones/${zoneId}/records`, previewRecords);
+  const bindingsResource = useResource<ZoneBinding[]>(`/v1/zones/${zoneId}/bindings`, previewBindings);
   const zones = useResource<ZoneListRow[]>("/v1/zones", demoZones);
   const { data, setData, loading, error, reload } = recordsResource;
   const [search, setSearch] = useState("");
@@ -57,6 +67,8 @@ export default function ZoneRecordsPage() {
   const [syncing, setSyncing] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
+  const [createdPoolId, setCreatedPoolId] = useState<string | null>(null);
+  const [deletingBinding, setDeletingBinding] = useState<ZoneBinding | null>(null);
   const [source, setSource] = useState<"manual" | "cloud">("manual");
   const [cloudSlotId, setCloudSlotId] = useState("");
   const [takeoverConfirmed, setTakeoverConfirmed] = useState(false);
@@ -69,6 +81,7 @@ export default function ZoneRecordsPage() {
     saveIntentKey.current.reset();
     setActionError(null);
     setActionNotice(null);
+    setCreatedPoolId(null);
     setSource("manual");
     setCloudSlotId("");
     setTakeoverConfirmed(false);
@@ -95,13 +108,14 @@ export default function ZoneRecordsPage() {
         if (!cloudSlotId || !["A", "AAAA"].includes(draft.type)) throw new Error("请选择匹配地址族的云地址槽位");
         if (editing !== "new" && !takeoverConfirmed) throw new Error("请确认将现有记录转换为 Pool 受管记录");
         if (!UI_PREVIEW) {
-          const result = await submitCloudIntent(saveIntentKey.current, (key) => api<{ awaitingExternalVerification: boolean }>(`/v1/address-slots/${cloudSlotId}/bindings`, {
+          const result = await submitCloudIntent(saveIntentKey.current, (key) => api<{ awaitingExternalVerification: boolean; pool: { id: string } }>(`/v1/address-slots/${cloudSlotId}/bindings`, {
             method: "POST",
             headers: { "idempotency-key": key },
             ...jsonBody({ zoneId, fqdn: draft.name, recordType: draft.type, takeoverExisting: editing !== "new" }),
           }));
           setActionNotice(result.awaitingExternalVerification ? "云地址来源已绑定，正在等待外部验证；尚未确认发布。" : "云地址来源已绑定。");
-          await reload();
+          setCreatedPoolId(result.pool.id);
+          await Promise.all([reload(), bindingsResource.reload()]);
         } else {
           setActionNotice("云地址来源已绑定，正在等待外部验证；尚未确认发布。");
         }
@@ -174,12 +188,29 @@ export default function ZoneRecordsPage() {
     setDeleting(record);
   };
 
+  const removeBinding = async () => {
+    if (!deletingBinding) return;
+    setSaving(true);
+    setActionError(null);
+    try {
+      if (!UI_PREVIEW) {
+        await api(`/v1/pools/${deletingBinding.poolId}/bindings/${deletingBinding.id}?unpublishedOnly=true`, { method: "DELETE" });
+        await Promise.all([reload(), bindingsResource.reload()]);
+      }
+      setDeletingBinding(null);
+      setActionNotice("已取消未发布的域名绑定。");
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : "取消绑定失败");
+      await bindingsResource.reload();
+    } finally { setSaving(false); }
+  };
+
   const sync = async () => {
     setSyncing(true);
     setActionError(null);
     try {
       if (!UI_PREVIEW) await api(`/v1/zones/${zoneId}/sync`, { method: "POST" });
-      await reload();
+      await Promise.all([reload(), bindingsResource.reload()]);
     } catch (syncError) {
       setActionError(syncError instanceof Error ? syncError.message : "同步 Zone 失败");
     } finally {
@@ -196,7 +227,19 @@ export default function ZoneRecordsPage() {
       <div className="detail-actions"><Button variant="secondary" icon={<RefreshCw size={14} />} disabled={syncing} onClick={() => void sync()}>{syncing ? "已入队" : "同步云端"}</Button><Button icon={<Plus size={15} />} onClick={() => openEditor()}>添加记录</Button></div>
     </div>
     {actionError && <div className="inline-error" role="alert">{actionError}</div>}
-    {actionNotice && <div className="inline-notice" role="status">{actionNotice}</div>}
+    {actionNotice && <div className="inline-notice" role="status">{actionNotice}{createdPoolId && <> <Link href={`/pools/${createdPoolId}`}>打开对应 Pool 管理绑定</Link></>}</div>}
+    {bindingsResource.error && <div className="surface"><ErrorState message={bindingsResource.error} onRetry={() => void bindingsResource.reload()} /></div>}
+    {!!bindingsResource.data?.length && <section className="surface">
+      <header className="surface-header"><div><h2>受管域名绑定</h2><p>未发布的绑定仍保留在这里；验证通过后才会出现在下方 DNS 记录中。</p></div><Button variant="secondary" icon={<RefreshCw size={14} />} onClick={() => void Promise.all([reload(), bindingsResource.reload()])}>刷新状态</Button></header>
+      <div className="table-wrap"><table><thead><tr><th>域名</th><th>地址来源</th><th>发布状态</th><th>管理</th></tr></thead><tbody>
+        {bindingsResource.data.filter(binding => `${binding.fqdn} ${binding.recordType} ${binding.poolName}`.toLowerCase().includes(search.toLowerCase())).map(binding => <tr key={binding.id}>
+          <td><div className="table-primary"><strong>{binding.fqdn}</strong><small>{binding.recordType}</small></div></td>
+          <td>{binding.cloudSources.length ? binding.cloudSources.map(source => <div className="table-primary" key={source.slot.id}><strong>{cloudTargetLabel(source)}</strong><small>{cloudTargetAddresses(source)}</small></div>) : binding.poolName}</td>
+          <td><div className="table-primary"><strong>{binding.published ? "已发布" : "尚未发布"}</strong><small>{binding.waitingReason ?? (binding.state === "failed" ? "协调失败，请查看 Pool 操作记录" : "由 Pool 管理")}</small></div></td>
+          <td><div className="row-actions"><Link href={`/pools/${binding.poolId}`}>管理绑定</Link>{!binding.published && <Button variant="danger" disabled={binding.cancellationBlocked || saving} onClick={() => { setActionError(null); setDeletingBinding(binding); }}>取消绑定</Button>}</div></td>
+        </tr>)}
+      </tbody></table></div>
+    </section>}
     <div className="toolbar"><div className="toolbar-left"><label className="search-box"><Search size={15} /><input aria-label="搜索 DNS 记录" placeholder="名称、类型或内容" value={search} onChange={(event) => setSearch(event.target.value)} /></label></div><div className="toolbar-right"><span className="muted">受管记录需在 IP Pool 中修改</span></div></div>
     {loading ? <div className="surface"><LoadingState /></div> : error ? <div className="surface"><ErrorState message={error} onRetry={() => void reload()} /></div> : records.length === 0 ? <div className="surface"><EmptyState title="没有 DNS 记录" action={<Button icon={<Plus size={14} />} onClick={() => openEditor()}>添加记录</Button>} /></div> : <div className="table-wrap"><table>
       <thead><tr><th>名称</th><th>类型</th><th>内容</th><th>TTL</th><th>厂商属性</th><th>管理方式</th><th>同步</th><th aria-label="操作" /></tr></thead>
@@ -206,7 +249,7 @@ export default function ZoneRecordsPage() {
         <td className="mono">{record.content}</td>
         <td>{record.ttl === 1 ? "自动" : `${record.ttl}s`}</td>
         <td className="muted">{providerMetadataLabel(provider, record.providerMetadata)}</td>
-        <td>{record.management === "managed" ? <span className="status status-warning"><LockKeyhole size={11} />Pool 受管</span> : <span className="status status-neutral"><i />手动</span>}</td>
+        <td>{record.management === "managed" ? <Link href={`/pools/${record.managedByPoolId}`} className="status status-warning"><LockKeyhole size={11} />Pool 受管 · 管理</Link> : <span className="status status-neutral"><i />手动</span>}</td>
         <td className="muted"><RelativeTime value={record.lastSyncedAt} /></td>
         <td><div className="row-actions"><IconButton label="编辑记录" disabled={record.management === "managed"} onClick={() => openEditor(record)}><Edit3 size={15} /></IconButton><IconButton label="删除记录" disabled={record.management === "managed"} onClick={() => openDelete(record)}><Trash2 size={15} /></IconButton></div></td>
       </tr>)}</tbody>
@@ -227,6 +270,9 @@ export default function ZoneRecordsPage() {
       </form>
     </Dialog>
     <Dialog open={deleting !== null} title="删除 DNS 记录" size="small" onClose={() => setDeleting(null)} footer={<><Button variant="secondary" onClick={() => setDeleting(null)}>取消</Button><Button variant="danger" disabled={saving} onClick={() => void remove()}>删除</Button></>}>{actionError && <div className="login-error" role="alert">{actionError}</div>}<p className="confirm-copy">将从云厂商删除 <strong>{deleting?.name}</strong>，操作会保留历史并可通过回滚重新创建。</p></Dialog>
+    <Dialog open={deletingBinding !== null} title="取消未发布绑定" size="small" onClose={() => setDeletingBinding(null)} footer={<><Button variant="secondary" onClick={() => setDeletingBinding(null)}>返回</Button><Button variant="danger" disabled={saving} onClick={() => void removeBinding()}>取消绑定</Button></>}>
+      {actionError && <div className="login-error" role="alert">{actionError}</div>}<p className="confirm-copy">取消 <strong>{deletingBinding?.fqdn}</strong> 的托管配置。发布正在执行或结果尚未确认时，取消会被阻止，请先处理相关 DNS 操作。</p>
+    </Dialog>
   </ConsoleLayout>;
 }
 

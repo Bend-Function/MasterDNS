@@ -1,3 +1,5 @@
+import type { CloudTargetSummary } from "./cloud-types";
+
 export type RotationPolicy = {
   slotId: string;
   enabled: boolean;
@@ -10,6 +12,7 @@ export type RotationPolicy = {
 };
 
 export type RotationIncident = {
+  cloudTarget?: CloudTargetSummary | null;
   id: string;
   ownerUserId: string;
   slotId: string;

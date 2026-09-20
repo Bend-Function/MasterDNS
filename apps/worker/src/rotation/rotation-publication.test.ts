@@ -7,7 +7,9 @@ import { effectiveOldTtl } from "./rotation-publication.service.js";
 import { fixture } from "./rotation-test-utils.js";
 it("publishes initial verified candidates to all linked Pools with both auto switches off and no incident or rotation policy", async () => {
   const f = await fixture();
+  for (const pool of f.pools) await f.d.update(db.endpointPools).set({ state: "unhealthy" }).where(eq(db.endpointPools.id, pool.id));
   await f.service.recover();
+  for (const pool of f.pools) expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, pool.id)))[0]!.state).toBe("healthy");
   expect(await f.d.select().from(db.rotationIncidents)).toHaveLength(0);
   expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({
     currentVersion: 1,
@@ -137,7 +139,8 @@ async function dnsFixture(backup = false) {
       },
     }),
   };
-  const queues = { redis, operations: { add: async () => ({}) }, notifications: { add: async () => ({}) } };
+  const notifications = vi.fn(async () => ({}));
+  const queues = { redis, operations: { add: async () => ({}) }, notifications: { add: notifications } };
   const reconcile = new ReconcileProcessor({ db: f.d } as never, queues as never);
   const operations = new OperationProcessor(
     { db: f.d } as never,
@@ -178,8 +181,30 @@ async function dnsFixture(backup = false) {
       for (const op of ops) await (operations as any).process({ data: { operationId: op.id }, attemptsMade: 0, opts: { attempts: 1 } });
     }
   };
-  return { ...f, writes, state, bindings, plan, execute, remote };
+  return { ...f, writes, state, bindings, plan, execute, remote, reconcile, notifications };
 }
+
+it("keeps initial cloud verification pending without a false outage notification", async () => {
+  const f = await dnsFixture();
+  await (f.reconcile as any).process({ data: { poolId: f.pools[0]!.id, eventId: randomUUID(), trigger: "configuration", force: false } });
+  expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pools[0]!.id)))[0]!.state).toBe("unknown");
+  expect(f.notifications).not.toHaveBeenCalled();
+  expect(await f.d.select().from(db.operations).where(eq(db.operations.resourceId, f.pools[0]!.id))).toEqual([]);
+  expect(await f.d.select().from(db.failoverEvents).where(eq(db.failoverEvents.poolId, f.pools[0]!.id))).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "pool.awaiting_verification" })]));
+  await f.service.publishSlot(f.slot.id);
+  expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pools[0]!.id)))[0]!.state).toBe("healthy");
+});
+
+it("still reports a real outage for an already published cloud binding", async () => {
+  const f = await dnsFixture();
+  await f.service.publishSlot(f.slot.id); await f.plan(); await f.execute();
+  f.notifications.mockClear();
+  await f.d.update(db.endpointAddresses).set({ healthState: "unhealthy" }).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+  await (f.reconcile as any).process({ data: { poolId: f.pools[0]!.id, eventId: randomUUID(), trigger: "failure", force: false } });
+  expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pools[0]!.id)))[0]!.state).toBe("unhealthy");
+  expect(f.notifications).toHaveBeenCalled();
+  expect(await f.d.select().from(db.failoverEvents).where(eq(db.failoverEvents.poolId, f.pools[0]!.id))).toEqual(expect.arrayContaining([expect.objectContaining({ eventType: "pool.no_healthy_endpoint" })]));
+});
 
 async function manualPublication(f: Awaited<ReturnType<typeof fixture>>) {
   await f.d.delete(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
@@ -592,6 +617,21 @@ async function cloudHealthFixture() {
   };
   return { ...f, backups, round, results, health };
 }
+
+it("preserves binding override failures when external slot success arrives and ignores disabled overrides", async () => {
+  const f = await cloudHealthFixture();
+  const binding = f.bindings[0]!;
+  const [config] = await f.d.insert(db.healthCheckConfigs).values({ domainBindingId: binding.id, checkerType: "tcp", config: { type: "tcp", port: 443 } }).returning();
+  for (const endpoint of [f.endpoints[0]!, f.backups[0]!]) {
+    const [address] = await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, endpoint.id));
+    await f.d.insert(db.bindingEndpointHealth).values({ domainBindingId: binding.id, endpointId: endpoint.id, endpointAddressId: address!.id, healthState: "unhealthy" });
+  }
+  await f.round("success");
+  expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pools[0]!.id)))[0]!.state).toBe("unhealthy");
+  await f.d.update(db.healthCheckConfigs).set({ enabled: false }).where(eq(db.healthCheckConfigs.id, config!.id));
+  await f.round("success");
+  expect((await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pools[0]!.id)))[0]!.state).toBe("healthy");
+});
 it("atomically fans three current-slot failures into both Pools and normal backup selection, preserving keep-current recovery", async () => {
   const f = await cloudHealthFixture();
   await f.round("failure");

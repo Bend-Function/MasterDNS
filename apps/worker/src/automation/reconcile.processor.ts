@@ -19,6 +19,7 @@ import {
   operations,
   providerAccounts,
   reconcileIntents,
+  projectPoolHealth,
   zones,
 } from "@masterdns/db";
 import { dnsRecordMatches } from "@masterdns/providers";
@@ -36,6 +37,10 @@ type PendingStep = {
   action: "create" | "update" | "delete";
   input: Record<string, unknown>;
 };
+
+export function isInitialCloudVerification(input: { healthState: string; hasAppliedAssignment: boolean; hasUnpublishedCloudAddress: boolean }) {
+  return input.healthState === "unknown" && !input.hasAppliedAssignment && input.hasUnpublishedCloudAddress;
+}
 
 @Injectable()
 export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
@@ -107,8 +112,10 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         const c = cloudContexts.get(link.slotId);
         if (!c || c.slot.candidateAddressId || !addresses.some(row => row.endpoint_addresses.endpointId === link.endpointId && row.endpoint_addresses.family === link.family && row.endpoint_addresses.address === c.address?.address)) continue;
         const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, c.addressVersion)));
-        if (!publication?.context?.manualIncidentId || publication.status === "applied" || !publication.children.some(child =>
-          child.poolId === pool.id && child.eventId === job.data.eventId && child.policyRevision === pool.policyRevision && child.decisionRevision === job.data.decisionRevision)) continue;
+        // A current fenced Pool decision includes every pending manual address
+        // publication in that Pool, even when another slot superseded its event.
+        if (job.data.decisionRevision === undefined || !publication?.promotedAt || !publication.context?.manualIncidentId
+          || publication.status === "applied" || !publication.children.some(child => child.poolId === pool.id)) continue;
         try {
           const evidence = await assertPublicationContext(tx, c, publication);
           if (evidence.manualIncidentId) manualAddresses.add(`${link.endpointId}:${link.family}`);
@@ -163,11 +170,20 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         return { notifications: [notificationEvent(pool, job.data, decision, "pool.automation_paused")] };
       }
 
+      const healthSummary = projectPoolHealth({ endpoints: poolEndpoints.map(endpoint => ({ ...endpoint, addressFamilies: linkedSlots.filter(link => link.endpointId === endpoint.id).map(link => link.family) })), addresses: addresses.map(row => row.endpoint_addresses), bindings,
+        bindingHealth: bindingHealthRows.map(row => row.health), overrideBindingIds: [...bindingsWithHealthOverrides] });
+      await tx.update(endpointPools).set({ state: healthSummary.state, updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
+
       if (decision.noHealthyEndpoints) {
         const unavailableBindings = decision.decisions.filter((item) => item.reason === "no_healthy_endpoint");
-        const entirePoolUnavailable = bindings.length > 0 && unavailableBindings.length === bindings.length;
-        const eventType = entirePoolUnavailable ? "pool.no_healthy_endpoint" : "binding.no_healthy_endpoint";
-        await tx.update(endpointPools).set({ state: entirePoolUnavailable ? "unhealthy" : "degraded", updatedAt: new Date() }).where(eq(endpointPools.id, pool.id));
+        const failures = unavailableBindings.filter(item => !isInitialCloudVerification({
+          healthState: healthSummary.bindingStates[item.bindingId] ?? "unknown",
+          hasAppliedAssignment: assignmentRows.some(row => row.domainBindingId === item.bindingId && row.applied),
+          hasUnpublishedCloudAddress: linkedSlots.some(link => link.family === (bindings.find(binding => binding.id === item.bindingId)?.recordType === "AAAA" ? "6" : "4")
+            && !addresses.some(row => row.endpoint_addresses.endpointId === link.endpointId && row.endpoint_addresses.family === link.family)),
+        }));
+        const entirePoolUnavailable = bindings.length > 0 && failures.length === bindings.length;
+        const eventType = failures.length === 0 ? "pool.awaiting_verification" : entirePoolUnavailable ? "pool.no_healthy_endpoint" : "binding.no_healthy_endpoint";
         await tx.insert(failoverEvents).values({
           poolId: pool.id,
           endpointId: job.data.endpointId ?? null,
@@ -175,7 +191,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           evidence: eventEvidence(job.data, pool.policyRevision),
           decision,
         });
-        queuedNotifications.push(notificationEvent(pool, job.data, decision, eventType));
+        if (failures.length) queuedNotifications.push(notificationEvent(pool, job.data, decision, eventType));
       }
 
       const bindingIds = decision.decisions.filter((item) => shouldPlanProviderSteps(item.reason)).map((item) => item.bindingId);
