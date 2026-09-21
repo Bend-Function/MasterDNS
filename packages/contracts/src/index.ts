@@ -8,3 +8,5 @@ export * from "./probe-policy.js";
 export * from "./probes.js";
 export * from "./rotation.js";
 export * from "./external-health.js";
+
+export * from "./cloud-rotation-limits.js";

@@ -1,9 +1,11 @@
 "use client";
 
-import { cloudProviderServices, type CloudProvider } from "@masterdns/contracts/cloud";
-import { KeyRound, Pause, Play, Plus, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { cloudProviderServices, type CloudProvider, type CloudService } from "@masterdns/contracts/cloud";
+import { cloudRotationLimitRules, type CloudRotationLimitStatus } from "@masterdns/contracts/cloud-rotation-limits";
+import { Gauge, KeyRound, Pause, Play, Plus, RefreshCw, SlidersHorizontal } from "lucide-react";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { CloudCredentialFields } from "../../components/cloud-credential-fields";
+import { CloudRotationLimits, parseRotationLimitPercent } from "../../components/cloud-rotation-limits";
 import { ConsoleLayout } from "../../components/console-layout";
 import { useSession } from "../../components/session-context";
 import { Button, Dialog, EmptyState, ErrorState, Field, IconButton, LoadingState, PageHeader, StatusBadge } from "../../components/ui";
@@ -34,6 +36,11 @@ function CloudAccountsConsole() {
   const [open, setOpen] = useState(false);
   const [rotateTarget, setRotateTarget] = useState<CloudAccount | null>(null);
   const [regionsTarget, setRegionsTarget] = useState<CloudAccount | null>(null);
+  const [limitTarget, setLimitTarget] = useState<CloudAccount | null>(null);
+  const [limitService, setLimitService] = useState<CloudService>("ec2");
+  const [limitStatus, setLimitStatus] = useState<CloudRotationLimitStatus | null>(null);
+  const [limitPercent, setLimitPercent] = useState("80");
+  const [limitLoading, setLimitLoading] = useState(false);
   const [name, setName] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
   const [regions, setRegions] = useState("");
@@ -43,6 +50,7 @@ function CloudAccountsConsole() {
   const [formError, setFormError] = useState<string | null>(null);
   const createIntent = useRef(createIntentKey());
   const mutations = useRef(createRequestGeneration());
+  const limitRequests = useRef(createRequestGeneration());
   useEffect(() => { const pending = mutations.current; return () => { pending.invalidate(); }; }, []);
 
   useEffect(() => {
@@ -64,6 +72,7 @@ function CloudAccountsConsole() {
   const clearSecrets = () => setDraft((current) => resetCredentialDraft(current));
   const closeCreate = () => { mutations.current.invalidate(); setSaving(false); setOpen(false); setFormError(null); clearSecrets(); };
   const closeRotate = () => { mutations.current.invalidate(); setSaving(false); setRotateTarget(null); setFormError(null); clearSecrets(); };
+  const closeRotationLimits = () => { limitRequests.current.invalidate(); setSaving(false); setLimitLoading(false); setLimitTarget(null); setLimitStatus(null); setFormError(null); };
   const openCreate = () => { if (!me) return; mutations.current.invalidate(); createIntent.current = createIntentKey(); setDraft(emptyCredentialDraft()); setName(""); setRegions(""); setOwnerUserId(me.id); setFormError(null); setOpen(true); };
   const changeProvider = (provider: CloudProvider) => { mutations.current.invalidate(); createIntent.current = createIntentKey(); setDraft((current) => resetCredentialDraft(current, provider)); setRegions(""); setFormError(null); };
   const changeKind = (awsKind: CredentialDraft["awsKind"]) => { setDraft((current) => ({ ...resetCredentialDraft(current), awsKind })); setFormError(null); };
@@ -124,11 +133,51 @@ function CloudAccountsConsole() {
     finally { setBusyId(null); }
   };
 
+  const loadRotationLimits = async (account: CloudAccount, service: CloudService) => {
+    const request = limitRequests.current.invalidate(); setLimitLoading(true); setLimitStatus(null); setFormError(null);
+    try {
+      const value: CloudRotationLimitStatus = UI_PREVIEW
+        ? { service, utilizationPercent: 80, effectivePercent: 80, rules: cloudRotationLimitRules(service), usage: [] }
+        : await api<CloudRotationLimitStatus>(`/v1/cloud-accounts/${account.id}/rotation-limits/${service}`);
+      if (!limitRequests.current.isCurrent(request)) return;
+      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent));
+    } catch (value) { if (limitRequests.current.isCurrent(request)) setFormError(message(value, "换址限制加载失败")); }
+    finally { if (limitRequests.current.isCurrent(request)) setLimitLoading(false); }
+  };
+
+  const openRotationLimits = (account: CloudAccount) => {
+    const service = cloudProviderServices[account.provider][0]!;
+    setLimitTarget(account); setLimitService(service); setLimitPercent("80"); setFormError(null);
+    void loadRotationLimits(account, service);
+  };
+
+  const changeRotationLimitService = (service: CloudService) => {
+    if (!limitTarget || service === limitService) return;
+    setLimitService(service); setLimitPercent("80");
+    void loadRotationLimits(limitTarget, service);
+  };
+
+  const updateRotationLimits = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!limitTarget || saving) return;
+    const utilizationPercent = parseRotationLimitPercent(limitPercent);
+    if (utilizationPercent === null) { setFormError("使用比例必须是 1–100 的整数"); return; }
+    const request = limitRequests.current.current(); setSaving(true); setFormError(null);
+    try {
+      const value: CloudRotationLimitStatus = UI_PREVIEW
+        ? { service: limitService, utilizationPercent, effectivePercent: utilizationPercent, rules: cloudRotationLimitRules(limitService, utilizationPercent), usage: limitStatus?.usage ?? [] }
+        : await api<CloudRotationLimitStatus>(`/v1/cloud-accounts/${limitTarget.id}/rotation-limits/${limitService}`, { method: "PATCH", ...jsonBody({ utilizationPercent }) });
+      if (!limitRequests.current.isCurrent(request)) return;
+      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent));
+    } catch (value) { if (limitRequests.current.isCurrent(request)) setFormError(message(value, "换址限制保存失败")); }
+    finally { if (limitRequests.current.isCurrent(request)) setSaving(false); }
+  };
+
   return <ConsoleLayout><PageHeader title="云计算账号" description="AWS、Azure 与 Linode 云资源清单和凭证，独立于 DNS Provider 账号" actions={<Button icon={<Plus size={15} />} onClick={openCreate}>接入云账号</Button>} />
-    {formError && !open && !rotateTarget && !regionsTarget && <div className="inline-error" role="alert">{formError}</div>}
+    {formError && !open && !rotateTarget && !regionsTarget && !limitTarget && <div className="inline-error" role="alert">{formError}</div>}
     {loading ? <div className="surface"><LoadingState /></div> : error ? <div className="surface"><ErrorState message={error} onRetry={() => void reload()} /></div> : data?.length === 0 ? <div className="surface"><EmptyState title="尚未接入云计算账号" action={<Button onClick={openCreate}>接入云账号</Button>} /></div> : <div className="table-wrap"><table><thead><tr><th>账号</th><th>远端账号 ID</th><th>区域范围</th><th>清单状态</th><th>凭证</th><th>状态</th><th aria-label="操作" /></tr></thead><tbody>{data?.map((account) => {
       const accountScopes = scopes[account.id] ?? []; const failed = accountScopes.filter((scope) => scope.lastError); const scopeError = scopeErrors[account.id];
-      return <tr key={account.id}><td><div className="table-primary"><strong>{account.name}</strong><small>{cloudProviderLabels[account.provider]}</small><small>{me?.role === "admin" ? users.find((user) => user.id === account.ownerUserId)?.username ?? account.ownerUserId : "当前用户"}</small></div></td><td className="mono">{account.externalAccountId ?? "待验证"}</td><td>{account.regions?.join(", ") ?? "Provider 可见区域"}</td><td><div className="table-primary"><strong>{scopeError ? "范围状态加载失败" : failed.length ? `${failed.length} 个区域异常` : accountScopes.length ? "同步完整" : "等待首次同步"}</strong><small>{scopeError ?? failed[0]?.lastError ?? (accountScopes[0]?.lastCompletedAt ? `完成 ${accountScopes.length} 个范围` : "尚无扫描结果")}</small></div></td><td className="muted"><KeyRound size={12} /> {account.credentialHint ?? "已配置"}</td><td><StatusBadge value={account.enabled ? "active" : "disabled"} /></td><td><div className="row-actions"><IconButton label="编辑区域范围" onClick={() => { setRegions(account.regions?.join(", ") ?? ""); setRegionsTarget(account); setFormError(null); }}><SlidersHorizontal size={15} /></IconButton><IconButton label="轮换凭证" onClick={() => { mutations.current.invalidate(); setDraft(emptyCredentialDraft(account.provider)); setRotateTarget(account); setFormError(null); }}><KeyRound size={15} /></IconButton><IconButton label="同步云清单" disabled={busyId === account.id || !account.enabled} onClick={() => void mutate(account, "sync")}><RefreshCw size={15} /></IconButton><IconButton label={account.enabled ? "停用账号" : "启用账号"} disabled={busyId === account.id} onClick={() => void mutate(account, "status")}>{account.enabled ? <Pause size={15} /> : <Play size={15} />}</IconButton></div></td></tr>;
+      return <tr key={account.id}><td><div className="table-primary"><strong>{account.name}</strong><small>{cloudProviderLabels[account.provider]}</small><small>{me?.role === "admin" ? users.find((user) => user.id === account.ownerUserId)?.username ?? account.ownerUserId : "当前用户"}</small></div></td><td className="mono">{account.externalAccountId ?? "待验证"}</td><td>{account.regions?.join(", ") ?? "Provider 可见区域"}</td><td><div className="table-primary"><strong>{scopeError ? "范围状态加载失败" : failed.length ? `${failed.length} 个区域异常` : accountScopes.length ? "同步完整" : "等待首次同步"}</strong><small>{scopeError ?? failed[0]?.lastError ?? (accountScopes[0]?.lastCompletedAt ? `完成 ${accountScopes.length} 个范围` : "尚无扫描结果")}</small></div></td><td className="muted"><KeyRound size={12} /> {account.credentialHint ?? "已配置"}</td><td><StatusBadge value={account.enabled ? "active" : "disabled"} /></td><td><div className="row-actions"><IconButton label="换址限制" disabled={!account.externalAccountId} onClick={() => openRotationLimits(account)}><Gauge size={15} /></IconButton><IconButton label="编辑区域范围" onClick={() => { setRegions(account.regions?.join(", ") ?? ""); setRegionsTarget(account); setFormError(null); }}><SlidersHorizontal size={15} /></IconButton><IconButton label="轮换凭证" onClick={() => { mutations.current.invalidate(); setDraft(emptyCredentialDraft(account.provider)); setRotateTarget(account); setFormError(null); }}><KeyRound size={15} /></IconButton><IconButton label="同步云清单" disabled={busyId === account.id || !account.enabled} onClick={() => void mutate(account, "sync")}><RefreshCw size={15} /></IconButton><IconButton label={account.enabled ? "停用账号" : "启用账号"} disabled={busyId === account.id} onClick={() => void mutate(account, "status")}>{account.enabled ? <Pause size={15} /> : <Play size={15} />}</IconButton></div></td></tr>;
     })}</tbody></table></div>}
     <Dialog open={open} title="接入云账号" onClose={closeCreate} footer={<><Button variant="secondary" onClick={closeCreate}>取消</Button><Button type="submit" form="cloud-account-form" disabled={saving}>{saving ? "正在验证" : "验证并接入"}</Button></>}>
       <form id="cloud-account-form" className="field-grid" onSubmit={create}>
@@ -148,6 +197,13 @@ function CloudAccountsConsole() {
       </form>
     </Dialog>
     <Dialog open={regionsTarget !== null} title="限制扫描区域" onClose={() => setRegionsTarget(null)} footer={<><Button variant="secondary" onClick={() => setRegionsTarget(null)}>取消</Button><Button type="submit" form="cloud-regions-form" disabled={saving}>保存范围</Button></>}><form id="cloud-regions-form" onSubmit={updateRegions}><Field label="区域范围" hint="留空恢复 Provider 可见区域"><textarea value={regions} onChange={(event) => setRegions(event.target.value)} placeholder={cloudScopeExamples[regionsTarget?.provider ?? draft.provider]} /></Field>{formError && <div className="login-error" role="alert">{formError}</div>}</form></Dialog>
+    <Dialog open={limitTarget !== null} title={`换址限制 · ${limitTarget?.name ?? "云账号"}`} size="large" onClose={closeRotationLimits} footer={<><Button variant="secondary" disabled={saving} onClick={closeRotationLimits}>关闭</Button><Button type="submit" form="cloud-rotation-limits-form" disabled={saving || limitLoading || parseRotationLimitPercent(limitPercent) === null}>{saving ? "保存中" : "保存限制"}</Button></>}>
+      <form id="cloud-rotation-limits-form" onSubmit={updateRotationLimits}>
+        <CloudRotationLimits services={limitTarget ? cloudProviderServices[limitTarget.provider] : [limitService]} service={limitService} status={limitStatus} utilizationPercent={limitPercent} disabled={saving || limitLoading} onServiceChange={changeRotationLimitService} onUtilizationPercentChange={(value) => { setLimitPercent(value); setFormError(null); }} />
+        {limitLoading && <LoadingState />}
+        {formError && <div className="login-error" role="alert">{formError}</div>}
+      </form>
+    </Dialog>
   </ConsoleLayout>;
 }
 

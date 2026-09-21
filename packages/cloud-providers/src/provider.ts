@@ -1,4 +1,4 @@
-import type { CloudProvider, CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
+import type { CloudProvider, CloudRef, CloudStep, SlotRef, MonthlyTraffic } from "@masterdns/contracts";
 
 export type AwsCredentials =
   | { kind: "access_key"; accessKeyId: string; secretAccessKey: string; sessionToken?: string }
@@ -66,6 +66,7 @@ export interface CloudAdapter {
   listScopes(): Promise<string[]>;
   discover(region: string, cursor?: string): Promise<CloudPage>;
   inspect(ref: CloudRef): Promise<CloudInventory>;
+  monthlyTraffic?(ref: CloudRef, now?: Date): Promise<MonthlyTraffic>;
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability;
   execute(step: CloudStep): Promise<CloudStepResult>;
   observe(step: CloudStep): Promise<CloudObservationStatus>;
@@ -79,4 +80,5 @@ export type AwsAdapterDependencies = {
   stsSend?: AwsSend;
   ec2Send?: AwsSend;
   lightsailSend?: AwsSend;
+  cloudwatchSend?: AwsSend;
 };

@@ -13,6 +13,7 @@ import { demoCloudAccounts, demoCloudInstances, demoCloudSlots } from "../../lib
 import type { AddressSlot, CloudAccount, CloudInstanceRow } from "../../lib/cloud-types";
 import { cloudTargetAddresses, cloudTargetLabel, cloudErrorMessage, capabilityReason, cloudProviderLabels, cloudRotationBlock, cloudServiceLabel, rotationDowntimeNotice } from "../../lib/cloud-ui";
 import { createRotationIntent } from "../../lib/rotation-action";
+import { rotationLimitWait } from "../../lib/rotation-display";
 import { demoRotationPolicy, demoRotations } from "../../lib/rotation-demo";
 import type { RotationIncident, RotationPolicy } from "../../lib/rotation-types";
 import { createRequestGeneration } from "../../lib/session-state";
@@ -90,5 +91,5 @@ function RotationTargetPicker({ open, accounts, onClose, onSelected }: { open: b
 
 function shortId(value: string) { return value.length > 18 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value; }
 function phaseLabel(value: RotationIncident["phase"]) { return ({ cloud: "云端换址", candidate: "候选复测", publish: "DNS 发布", cleanup: "资源清理", complete: "已完成" } as const)[value]; }
-function waitingLabel(incident: RotationIncident) { if (incident.status === "paused") return "人工暂停，等待恢复"; if (incident.status === "exhausted") return "尝试次数已耗尽"; if (incident.errorCode) return capabilityReason(incident.errorCode); if (incident.phase === "candidate") return "等待固定外部 Cohort 复测"; if (incident.phase === "cloud") return "等待云端读取确认"; if (incident.phase === "publish") return "等待 DNS 写入与远端验证"; if (incident.phase === "cleanup") return "等待清理期限与归属复核"; return "无需等待"; }
+function waitingLabel(incident: RotationIncident) { const limited = rotationLimitWait(incident, []); if (limited) return limited.label; if (incident.status === "paused") return "人工暂停，等待恢复"; if (incident.status === "exhausted") return "尝试次数已耗尽"; if (incident.errorCode) return capabilityReason(incident.errorCode); if (incident.phase === "candidate") return "等待固定外部 Cohort 复测"; if (incident.phase === "cloud") return "等待云端读取确认"; if (incident.phase === "publish") return "等待 DNS 写入与远端验证"; if (incident.phase === "cleanup") return "等待清理期限与归属复核"; return "无需等待"; }
 function message(value: unknown, fallback: string) { return cloudErrorMessage(value, fallback); }

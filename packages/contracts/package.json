@@ -17,6 +17,10 @@
     "./cloud": {
       "types": "./dist/cloud.d.ts",
       "default": "./dist/cloud.js"
+    },
+    "./cloud-rotation-limits": {
+      "types": "./dist/cloud-rotation-limits.d.ts",
+      "default": "./dist/cloud-rotation-limits.js"
     }
   },
   "scripts": {

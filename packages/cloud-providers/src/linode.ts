@@ -1,6 +1,7 @@
 import { isIP } from "node:net";
 import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 import { CloudError } from "./errors.js";
+import { monthlyTrafficResult, trafficNumber } from "./monthly-traffic.js";
 import { LinodeHttp } from "./linode-http.js";
 import { executeLinodeRotation, observeLinodeRotation } from "./linode-rotation.js";
 import type { Capability, CloudAdapter, CloudAddress, CloudInventory, CloudPage, LinodeCredentials } from "./provider.js";
@@ -65,6 +66,20 @@ export class LinodeCloudAdapter implements CloudAdapter {
   }
   private validateRef(ref: CloudRef) {
     if (ref.accountId !== this.accountId || ref.service !== "linode" || !/^[1-9][0-9]*$/.test(ref.instanceId) || !Number.isSafeInteger(Number(ref.instanceId)) || !/^[a-z0-9-]+$/.test(ref.region)) throw new CloudError("remote_identity_changed", false);
+  }
+  async monthlyTraffic(ref: CloudRef, now = new Date()) {
+    this.validateRef(ref);
+    const root = `/linode/instances/${ref.instanceId}/transfer`;
+    const usage = await this.http.request<{ bytes_in?: number; bytes_out?: number }>(`${root}/${now.getUTCFullYear()}/${now.getUTCMonth() + 1}`);
+    // This quota is a contribution to the shared transfer pool, not an isolated VM limit.
+    let gigabytes: number | null = null;
+    try {
+      const quota = await this.http.request<{ quota?: number }>(root);
+      gigabytes = trafficNumber(quota.quota);
+    } catch (error) {
+      if (!(error instanceof CloudError) || !["permission_denied", "rate_limited", "temporary_cloud_error"].includes(error.code)) throw error;
+    }
+    return monthlyTrafficResult("linode", now, trafficNumber(usage.bytes_in), trafficNumber(usage.bytes_out), gigabytes === null ? null : { gigabytes, scope: "account_pool" });
   }
   async discover(region: string, cursor?: string): Promise<CloudPage> {
     if (!/^[a-z0-9-]+$/.test(region)) throw new CloudError("invalid_cursor", false);

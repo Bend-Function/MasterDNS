@@ -38,3 +38,21 @@ export type SlotRef = CloudRef & {
   address: string;
   family: AddressFamily;
 };
+
+/** Month-to-date usage. Null means unavailable, never zero usage. */
+export type MonthlyTraffic = {
+  month: string;
+  periodStart: string;
+  periodEnd: string;
+  fetchedAt: string;
+  source: "cloudwatch" | "lightsail" | "azure_monitor" | "linode";
+  incomingBytes: number | null;
+  outgoingBytes: number | null;
+  totalBytes: number | null;
+  /** Provider-reported GB. Shared allowance cannot be subtracted from one VM's traffic. */
+  allowance: { gigabytes: number; scope: "region_bundle" | "account_pool" } | null;
+};
+
+export type MonthlyTrafficResponse =
+  | { status: "available"; traffic: MonthlyTraffic }
+  | { status: "unavailable"; reason: "account_disabled" | "out_of_scope" | "resource_not_found" | "permission_denied" | "invalid_credentials" | "credentials_expired" | "rate_limited" | "remote_identity_changed" | "query_failed" };

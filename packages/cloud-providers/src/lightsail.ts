@@ -1,5 +1,6 @@
 import {
   GetInstanceCommand,
+  GetInstanceMetricDataCommand,
   GetInstancesCommand,
   GetRegionsCommand,
   GetStaticIpCommand,
@@ -15,6 +16,7 @@ import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js";
 import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
+import { monthPeriod, monthlyTrafficResult, sumTraffic, trafficNumber } from "./monthly-traffic.js";
 import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
 
 type ScopedOriginal =
@@ -144,6 +146,23 @@ export class LightsailCloudAdapter implements CloudAdapter {
     } catch (error) {
       throw normalizeAwsError(error);
     }
+  }
+
+  async monthlyTraffic(ref: CloudRef, now = new Date()) {
+    if (ref.accountId !== this.accountId || ref.service !== "lightsail") throw new CloudError("resource_not_found", false);
+    try {
+      const instanceName = await this.findNameByArn(ref.region, ref.instanceId);
+      const { instance } = await this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName }));
+      if (instance?.arn !== ref.instanceId || instance.name !== instanceName) throw new CloudError("remote_identity_changed", false);
+      const period = monthPeriod(now);
+      const read = async (metricName: "NetworkIn" | "NetworkOut") => {
+        const result = await this.lightsailSend(ref.region, new GetInstanceMetricDataCommand({ instanceName, metricName, startTime: period.start, endTime: period.end, period: 3600, statistics: ["Sum"], unit: "Bytes" }));
+        return sumTraffic((result.metricData ?? []).map((point: { sum?: number }) => point.sum));
+      };
+      const [incoming, outgoing] = await Promise.all([read("NetworkIn"), read("NetworkOut")]);
+      const gigabytes = trafficNumber(instance.networking?.monthlyTransfer?.gbPerMonth);
+      return monthlyTrafficResult("lightsail", now, incoming, outgoing, gigabytes === null ? null : { gigabytes, scope: "region_bundle" });
+    } catch (error) { throw normalizeAwsError(error); }
   }
 
   async inspectScoped(ref: CloudRef, scope: LightsailInspectionScope): Promise<CloudInventory> {

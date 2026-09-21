@@ -29,6 +29,8 @@ import {
   lockRotationHealth,
   healthRevisionMatches,
   rotationAuthorizationError,
+  reserveCloudRotationWrite,
+  recordCloudRotationThrottle,
   type RotationContext,
   type RotationTransaction,
 } from "@masterdns/db";
@@ -199,6 +201,12 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         const allocation = prior.filter(s => s.plan.arguments.phase === "rotation" && s.plan.action.endsWith(".allocate")).at(-1);
         const plan = { ...persisted.plan, arguments: { ...persisted.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })),
           ...(allocation ? { candidateReceipt: allocation.receipt } : {}), allowStop: current.authorization!.allowStopStart } };
+        const admission = await reserveCloudRotationWrite(tx, { accountId: current.account.id, service: current.instance.service, region: current.instance.region, stepId, action: plan.action });
+        if (!admission.allowed) {
+          await tx.update(rotationResources).set({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited", cleanupDueAt: admission.retryAt }).where(eq(rotationResources.id, resource.id));
+          await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: admission.retryAt, updatedAt: now }).where(and(eq(rotationIncidents.id, incident.id), eq(rotationIncidents.phase, "cleanup")));
+          return;
+        }
         await tx
           .update(rotationSteps)
           .set({ plan, status: "in_flight", fence: lease.revision, dispatchedAt: now, updatedAt: now, errorCode: null })
@@ -211,6 +219,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
           .update(rotationLeases)
           .set({ incidentId: resource.incidentId, unresolvedStepId: stepId })
           .where(eq(rotationLeases.physicalKey, lease.physicalKey));
+        await tx.update(rotationIncidents).set({ errorCode: null, updatedAt: now }).where(and(eq(rotationIncidents.id, incident.id), eq(rotationIncidents.errorCode, "rotation_rate_limited"), eq(rotationIncidents.phase, "cleanup")));
         return { ...plan, id: stepId };
       });
       if (!dispatched) return;
@@ -218,7 +227,10 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       try {
         result = await adapter.execute(dispatched);
       } catch (e) {
-        if (e instanceof CloudError && noEffect.has(e.code)) await this.rejectNoEffect(r, dispatched.id, e.code);
+        if (e instanceof CloudError && noEffect.has(e.code)) {
+          await this.rejectNoEffect(r, dispatched.id, e.code, e.retryAfterMs);
+          if (e.code === "rate_limited") return;
+        }
         throw e;
       }
       await this.receipt(r, dispatched.id, result, false);
@@ -462,11 +474,18 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup"), eq(rotationIncidents.errorCode, "cleanup_failed")));
     });
   }
-  private async rejectNoEffect(r: Resource, stepId: string, code: string) {
+  private async rejectNoEffect(r: Resource, stepId: string, code: string, retryAfterMs?: number) {
     await this.database.db.transaction(async (tx) => {
       const [i] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!i) return;
-      await lockRotationContext(tx, i.slotId);
+      const c = await lockRotationContext(tx, i.slotId);
+      const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
+      if (!step || step.status !== "in_flight") return;
+      if (code === "rate_limited") {
+        const retryAt = await recordCloudRotationThrottle(tx, { accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: step.plan.action, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
+        await tx.update(rotationResources).set({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited", cleanupDueAt: retryAt }).where(eq(rotationResources.id, r.id));
+        await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: retryAt }).where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
+      }
       await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code }).where(and(eq(rotationSteps.id, stepId), eq(rotationSteps.status, "in_flight")));
       await tx
         .update(rotationLeases)

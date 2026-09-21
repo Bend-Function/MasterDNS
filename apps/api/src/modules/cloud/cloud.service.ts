@@ -1,10 +1,10 @@
 import { randomUUID } from "node:crypto";
-import { getCloudTargetsForSlots } from "@masterdns/db";
+import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
-import { createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
-import { cloudProviderServices, validCloudRegion, type CloudProvider, type SlotRef } from "@masterdns/contracts";
+import { CloudError, createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
+import { cloudProviderServices, cloudRotationLimitPolicySchema, validCloudRegion, type CloudProvider, type CloudService as CloudServiceName, type SlotRef, type MonthlyTrafficResponse } from "@masterdns/contracts";
 import { decryptJson, encryptJson, parseEncryptionKey } from "@masterdns/crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { env } from "../../config/env.js";
@@ -21,11 +21,46 @@ export function publicCloudAccount(account: Account) {
 @Injectable()
 export class CloudService {
   private readonly encryptionKey = parseEncryptionKey(env.MASTER_ENCRYPTION_KEY);
+  private readonly trafficCache = new Map<string, { expires: number; value: MonthlyTrafficResponse }>();
+  private readonly trafficPending = new Map<string, Promise<MonthlyTrafficResponse>>();
   constructor(private readonly database: DatabaseService, private readonly queues: QueueService) {}
 
   async list(actor: AuthUser) {
     const accounts = await this.database.db.select().from(cloudAccounts).where(actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id)).orderBy(asc(cloudAccounts.createdAt));
     return accounts.map(publicCloudAccount);
+  }
+
+  async rotationLimits(actor: AuthUser, id: string, serviceName: string) {
+    return this.database.db.transaction(async (tx) => {
+      const [account] = await tx.select().from(cloudAccounts).where(and(eq(cloudAccounts.id, id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).limit(1);
+      if (!account) throw new NotFoundException("Cloud account not found");
+      const service = this.rotationLimitService(account.provider, serviceName);
+      if (!account.externalAccountId) throw new ConflictException("Cloud account identity must be verified before configuring rotation limits");
+      return getCloudRotationLimitStatus(tx, account.id, service);
+    });
+  }
+
+  async setRotationLimits(actor: AuthUser, id: string, serviceName: string, input: { utilizationPercent: number }) {
+    const { utilizationPercent } = cloudRotationLimitPolicySchema.parse(input);
+    return this.database.db.transaction(async (tx) => {
+      const [account] = await tx.select().from(cloudAccounts).where(and(eq(cloudAccounts.id, id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).for("update");
+      if (!account) throw new NotFoundException("Cloud account not found");
+      const service = this.rotationLimitService(account.provider, serviceName);
+      if (!account.externalAccountId) throw new ConflictException("Cloud account identity must be verified before configuring rotation limits");
+      const before = await getCloudRotationLimitStatus(tx, account.id, service);
+      const after = await setCloudRotationLimitPolicy(tx, account.id, service, utilizationPercent);
+      await tx.insert(auditLogs).values({
+        ownerUserId: account.ownerUserId,
+        actorUserId: actor.id,
+        source: "user",
+        action: "cloud_account.rotation_limit_policy",
+        resourceType: "cloud_account",
+        resourceId: account.id,
+        beforeSnapshot: rotationLimitAuditSnapshot(before),
+        afterSnapshot: rotationLimitAuditSnapshot(after),
+      });
+      return after;
+    });
   }
 
   async create(actor: AuthUser, input: CreateCloudAccountInput, idempotencyKey: string) {
@@ -150,6 +185,47 @@ export class CloudService {
     });
   }
 
+  async monthlyTraffic(actor: AuthUser, instanceId: string): Promise<MonthlyTrafficResponse> {
+    // Authorize on every request, including cache hits. Read-only visibility does not
+    // require instance management or rotation authorization.
+    const { instance, inScope } = await this.instance(actor, instanceId);
+    const account = await this.findAccount(actor, instance.accountId);
+    if (!account.enabled) return { status: "unavailable", reason: "account_disabled" };
+    if (!inScope) return { status: "unavailable", reason: "out_of_scope" };
+    if (instance.metadata.present === false) return { status: "unavailable", reason: "resource_not_found" };
+    const now = new Date();
+    const key = `${instanceId}:${now.toISOString().slice(0, 7)}:${account.updatedAt.toISOString()}:${instance.updatedAt.toISOString()}`;
+    const cached = this.trafficCache.get(key);
+    if (cached && cached.expires > now.getTime()) return cached.value;
+    const pending = this.trafficPending.get(key);
+    if (pending) return pending;
+    const query = async (): Promise<MonthlyTrafficResponse> => {
+      try {
+        const credentials = decryptJson<CloudCredentials>({ ciphertext: account.credentialCiphertext, iv: account.credentialIv, tag: account.credentialTag, keyVersion: account.credentialKeyVersion }, this.encryptionKey);
+        const adapter = createCloudAdapter({ accountId: account.id, provider: account.provider, service: instance.service, credentials });
+        const identity = await adapter.verifyIdentity();
+        if (!account.externalAccountId || identity.externalAccountId !== account.externalAccountId) return { status: "unavailable", reason: "remote_identity_changed" };
+        if (!adapter.monthlyTraffic) return { status: "unavailable", reason: "query_failed" };
+        const traffic = await adapter.monthlyTraffic({ accountId: account.id, service: instance.service, region: instance.region, instanceId: instance.externalId }, now);
+        const value: MonthlyTrafficResponse = { status: "available", traffic };
+        for (const [entryKey, entry] of this.trafficCache) if (entry.expires <= Date.now()) this.trafficCache.delete(entryKey);
+        if (this.trafficCache.size >= 1000) this.trafficCache.delete(this.trafficCache.keys().next().value!);
+        this.trafficCache.set(key, { expires: Date.now() + 300_000, value });
+        return value;
+      } catch (error) {
+        const reason = error instanceof CloudError ? error.code : "query_failed";
+        switch (reason) {
+          case "permission_denied": case "invalid_credentials": case "credentials_expired": case "rate_limited": case "resource_not_found": case "remote_identity_changed":
+            return { status: "unavailable", reason };
+          default: return { status: "unavailable", reason: "query_failed" };
+        }
+      }
+    };
+    const result = query();
+    this.trafficPending.set(key, result);
+    try { return await result; } finally { this.trafficPending.delete(key); }
+  }
+
   async authorize(actor: AuthUser, instanceId: string, input: CloudAuthorizationInput) {
     // Account -> instance -> authorization is also the lock order used by scans and binding.
     const owned = await this.instance(actor, instanceId);
@@ -188,6 +264,12 @@ export class CloudService {
     if (regions !== null && (regions.length < 1 || regions.length > 100 || new Set(regions).size !== regions.length || regions.some(region => !validCloudRegion(provider, region)))) throw new BadRequestException("Invalid provider region");
   }
 
+  private rotationLimitService(provider: CloudProvider, value: string): CloudServiceName {
+    const service = cloudProviderServices[provider].find((candidate) => candidate === value);
+    if (!service) throw new BadRequestException("Cloud service does not match account provider");
+    return service;
+  }
+
   private encryptedCredentials(credentials: CreateCloudAccountInput["credentials"]) {
     const encrypted = encryptJson(credentials, this.encryptionKey);
     return { credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag, credentialKeyVersion: encrypted.keyVersion, credentialHint: credentials.kind === "role" ? "Deployment identity" : credentials.kind === "access_key" ? `AccessKey ...${credentials.accessKeyId.slice(-4)}` : credentials.kind === "azure_service_principal" ? `Service principal ...${credentials.clientId.slice(-4)}` : "Linode API token" };
@@ -204,6 +286,10 @@ export class CloudService {
       return publicCloudAccount(after!);
     });
   }
+}
+
+function rotationLimitAuditSnapshot(status: { service: CloudServiceName; utilizationPercent: number; effectivePercent: number }) {
+  return { service: status.service, utilizationPercent: status.utilizationPercent, effectivePercent: status.effectivePercent };
 }
 
 function providerMetadata(metadata: Record<string, unknown>): Record<string, unknown> {

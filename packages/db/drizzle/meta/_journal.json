@@ -162,6 +162,13 @@
       "when": 1789872425202,
       "tag": "0022_plain_next_avengers",
       "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1789948924527,
+      "tag": "0023_cloud_rotation_limits",
+      "breakpoints": true
     }
   ]
 }

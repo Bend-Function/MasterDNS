@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { and, eq, inArray } from "drizzle-orm";
-import { afterAll, beforeAll, expect, it } from "vitest";
-import { createDatabase, rotationLeases } from "@masterdns/db";
+import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { createDatabase, rotationLeases, cloudRotationBuckets, recordCloudRotationThrottle } from "@masterdns/db";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease } from "./rotation-lock.js";
 let admin: ReturnType<typeof createDatabase>;
 let connection: ReturnType<typeof createDatabase>;
+let testExternalAccountId = "123456789012";
+beforeEach(() => { testExternalAccountId = String(100000000000 + Number.parseInt(randomUUID().replaceAll("-", "").slice(0, 9), 16)); });
 const name = `rotation_${randomUUID().replaceAll("-", "")}`;
 beforeAll(async () => {
   const root = process.env.MASTERDNS_TEST_DATABASE_URL;
@@ -39,7 +41,7 @@ import { RotationPublicationService } from "./rotation-publication.service.js";
 
 async function fixture(family: "4" | "6" = "4") {
   const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
-  const [account] = await connection.db.insert(cloudAccounts).values({ ownerUserId: owner!.id, provider: "aws", name: "AWS", externalAccountId: "123456789012", credentialCiphertext: "encrypted-secret", credentialIv: "iv", credentialTag: "tag" }).returning();
+  const [account] = await connection.db.insert(cloudAccounts).values({ ownerUserId: owner!.id, provider: "aws", name: "AWS", externalAccountId: testExternalAccountId, credentialCiphertext: "encrypted-secret", credentialIv: "iv", credentialTag: "tag" }).returning();
   await connection.db.insert(cloudScanScopes).values({ accountId: account!.id, service: "ec2", region: "us-east-1", generation: 1 });
   const [instance] = await connection.db.insert(cloudInstances).values({ accountId: account!.id, service: "ec2", region: "us-east-1", externalId: `i-${randomUUID()}`, metadata: { present: true }, scanGeneration: 1 }).returning();
   const [iface] = await connection.db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: `eni-${randomUUID()}`, metadata: { deviceIndex: 0 }, scanGeneration: 1 }).returning();
@@ -252,6 +254,55 @@ it("refunds only a confirmed no-effect rejection and never refunds uncertain tra
   const g = await fixture(); g.state.lostResponse = true; await drive(g, 2);
   expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, g.incident.id)))[0]).toMatchObject({ attemptsUsed: 1 });
 });
+it("honors vendor Retry-After while retaining an uncharged retryable step", async () => {
+  const f = await fixture();
+  const before = Date.now();
+  f.state.error = new CloudError("rate_limited", true, 180_000);
+  await drive(f, 2);
+  const [step] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, f.state.writes[0]!));
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  expect(step).toMatchObject({ status: "rejected_no_effect", errorCode: "rate_limited" });
+  expect(step!.retryAt!.getTime()).toBeGreaterThanOrEqual(before + 180_000);
+  expect(incident).toMatchObject({ status: "active", errorCode: "rotation_rate_limited" });
+  expect(incident!.nextRunAt.getTime()).toBeGreaterThanOrEqual(before + 180_000);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(0);
+  f.state.error = undefined;
+  await drive(f, 2);
+  expect(f.state.writes).toHaveLength(1);
+});
+it.each([false, true])("defers %s manual rotation before dispatch and preserves its attempt budget", async manual => {
+  const f = manual ? await manualFixture() : await fixture();
+  await drive(f, 1);
+  const [step] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, (await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id)))[0]!.id)).orderBy(rotationSteps.sequence);
+  const until = await connection.db.transaction(tx => recordCloudRotationThrottle(tx, { accountId: f.account.id, service: "ec2", region: "us-east-1", stepId: step!.id, action: step!.plan.action, retryAfterMs: 180000 }));
+  // A fresh coordinator sees persistent budget state rather than process-local memory.
+  const restarted = new RotationProcessor(new RotationStore({ db: connection.db } as never), f.runtime as never, {} as never);
+  await restarted.run(f.incident.id);
+  expect(f.state.writes).toHaveLength(0);
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, step!.id)))[0]!.status).toBe("prepared");
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  expect(incident).toMatchObject({ status: "active", errorCode: "rotation_rate_limited" });
+  expect(incident!.nextRunAt.getTime()).toBeGreaterThanOrEqual(until.getTime());
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(0);
+  await connection.db.update(cloudRotationBuckets).set({ cooldownUntil: new Date(0) }).where(eq(cloudRotationBuckets.identityKey, JSON.stringify(["aws", f.account.externalAccountId, "ec2"])));
+  await connection.db.update(rotationIncidents).set({ nextRunAt: new Date(0) }).where(eq(rotationIncidents.id, f.incident.id));
+  await restarted.run(f.incident.id);
+  expect(f.state.writes).toHaveLength(1);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
+});
+it("keeps observing uncertain writes while another instance triggers a shared cooldown", async () => {
+  const f = await fixture();
+  f.state.lostResponse = true;
+  await drive(f, 2);
+  const g = await fixture();
+  g.state.error = new CloudError("rate_limited", true, 180000);
+  await drive(g, 2);
+  await drive(f, 1);
+  expect(f.state.writes).toHaveLength(1);
+  expect(f.state.observations).toHaveLength(1);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
+});
 it("rechecks authorization and configuration after adapter creation and before dispatch", async () => {
   const f = await fixture(); await drive(f, 1);
   f.runtime.adapter = async () => { await connection.db.update(instanceAuthorizations).set({ managed: false, revision: 2 }).where(eq(instanceAuthorizations.instanceId, f.instance.id)); return f.adapter; };
@@ -368,7 +419,7 @@ it("persists a pending Lightsail allocation ARN and carries its identity separat
   await connection.db.update(cloudInterfaces).set({ externalId: "primary" }).where(eq(cloudInterfaces.id, f.iface.id));
   await connection.db.insert(cloudScanScopes).values({ accountId: f.account.id, service: "lightsail", region: "us-east-1", generation: 1 });
   await connection.db.update(cloudAddresses).set({ remoteAllocationId: null }).where(eq(cloudAddresses.id, f.address.id));
-  await connection.db.update(rotationIncidents).set({ physicalKey: JSON.stringify(["aws", "123456789012", "lightsail", "us-east-1", f.instance.externalId]) }).where(eq(rotationIncidents.id, f.incident.id));
+  await connection.db.update(rotationIncidents).set({ physicalKey: JSON.stringify(["aws", f.account.externalAccountId, "lightsail", "us-east-1", f.instance.externalId]) }).where(eq(rotationIncidents.id, f.incident.id));
   const instance = { arn: f.instance.externalId, name: "native", publicIpAddress: f.address.address, ipAddressType: "dualstack", isStaticIp: false };
   let allocation: { name: string; arn: string; ipAddress: string; attachedTo?: string } | undefined;
   let ready = false; const writes: string[] = [];
@@ -421,6 +472,8 @@ it("preserves the same uncharged attempt for a due explicit throttling retry", a
   expect(before!.charged).toBe(false);
   f.state.error = undefined; await drive(f, 1); expect(f.state.writes).toHaveLength(1);
   await connection.db.update(rotationSteps).set({ retryAt: new Date(0) }).where(eq(rotationSteps.id, f.state.writes[0]!));
+  await connection.db.update(rotationIncidents).set({ nextRunAt: new Date(0) }).where(eq(rotationIncidents.id, f.incident.id));
+  await connection.db.update(cloudRotationBuckets).set({ cooldownUntil: new Date(0) }).where(eq(cloudRotationBuckets.identityKey, JSON.stringify(["aws", f.account.externalAccountId, "ec2"])));
   await drive(f, 1);
   expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toMatchObject([{ id: before!.id, charged: true }]);
   expect(f.state.writes).toEqual([f.state.writes[0], f.state.writes[0]]);

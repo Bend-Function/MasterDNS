@@ -72,11 +72,12 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
       cleanupAddressVersion: 1,
     })
     .returning();
-  const state = { writes: 0, observations: 0, observationStatus: "applied" as "applied" | "pending", lost: false, attachedElsewhere: false, beforeInspect: undefined as (() => Promise<void>) | undefined };
+  const state = { writes: 0, observations: 0, observationStatus: "applied" as "applied" | "pending", lost: false, error: undefined as Error | undefined, attachedElsewhere: false, beforeInspect: undefined as (() => Promise<void>) | undefined };
   const adapter = {
     inspect: async () => { await state.beforeInspect?.(); return f.live; },
     execute: async () => {
       state.writes++;
+      if (state.error) throw state.error;
       if (state.attachedElsewhere) throw new Error("resource_ownership_ambiguous");
       if (state.lost) throw new Error("transport_lost");
       return { allocationId: "eipalloc-old" };
@@ -93,6 +94,21 @@ it("retains original user addresses without independent release authorization", 
   const f = await cleanupFixture("user");
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(0);
+});
+it("defers cleanup without dispatch or unresolved effects when the shared budget is cooling down", async () => {
+  const f = await cleanupFixture();
+  const until = await f.d.transaction(tx => db.recordCloudRotationThrottle(tx, { accountId: f.account.id, service: "ec2", region: "us-east-1", stepId: `cleanup:${f.resource.id}`, action: "ec2.eip.release", retryAfterMs: 180000 }));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(0);
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource).toMatchObject({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited" });
+  expect(resource!.cleanupDueAt!.getTime()).toBeGreaterThanOrEqual(until.getTime());
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!)))[0]!.status).toBe("prepared");
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  await f.d.update(db.cloudRotationBuckets).set({ cooldownUntil: new Date(0) }).where(eq(db.cloudRotationBuckets.identityKey, JSON.stringify(["aws", f.account.externalAccountId, "ec2"])));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
 });
 it("manual AWS cleanup needs no probes but still waits for TTL and preserves user release authorization", async () => {
   for (const origin of ["system", "user"] as const) {
@@ -146,7 +162,7 @@ it("retains the current or last attached candidate and a changed slot version", 
   expect(f.state.writes).toBe(0);
 });
 
-import { Ec2CloudAdapter } from "@masterdns/cloud-providers";
+import { CloudError, Ec2CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 it("uses real EC2 cleanup preconditions to preserve an EIP reassociated to a foreign ENI", async () => {
   const f = await cleanupFixture();
   const writes: string[] = [];
@@ -375,12 +391,23 @@ it.each(["pause", "revoke", "config"] as const)("observes an uncertain cleanup a
 async function chainFixture() {
   const f = await cleanupFixture();
   await f.d.update(db.instanceAuthorizations).set({ allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
-  const originalPlan = (f.cleanup as any).plan;
-  (f.cleanup as any).plan = async (...args: any[]) => {
-    const first = await originalPlan.apply(f.cleanup, args);
-    const release = Array.isArray(first) ? first[0] : first;
-    return [release, { ...release, id: `${release.id}:reboot`, action: "linode.instance.reboot" }];
-  };
+  // This fixture tests the durable two-step orchestrator with a fake provider.
+  // Its service must agree with the Linode reboot action now checked at admission.
+  const first = await f.d.transaction(async tx => (f.cleanup as any).plan(tx, await db.lockRotationContext(tx, f.slot.id), f.resource, f.live));
+  const release = first[0];
+  const externalAccountId = randomUUID();
+  await f.d.update(db.cloudAccounts).set({ provider: "linode", externalAccountId }).where(eq(db.cloudAccounts.id, f.account.id));
+  await f.d.update(db.cloudInstances).set({ service: "linode", region: "us-east" }).where(eq(db.cloudInstances.id, f.instance.id));
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  const physicalKey = JSON.stringify(["linode", externalAccountId, "linode", "us-east", f.instance.externalId]);
+  await f.d.update(db.rotationIncidents).set({ physicalKey }).where(eq(db.rotationIncidents.id, f.incident.id));
+  f.incident.physicalKey = physicalKey;
+  f.account.provider = "linode"; f.account.externalAccountId = externalAccountId;
+  const live: CloudInventory = f.live;
+  live.ref.service = "linode"; live.ref.region = "us-east";
+  release.arguments.slot.service = "linode"; release.arguments.slot.region = "us-east";
+  release.arguments.before.ref.service = "linode"; release.arguments.before.ref.region = "us-east";
+  (f.cleanup as any).plan = async () => [{ ...release, action: "linode.ipv4.release" }, { ...release, id: `${release.id}:reboot`, action: "linode.instance.reboot" }];
   return f;
 }
 it("persists the entire cleanup chain before DELETE, advances only on observation, and resumes the original reboot after pause", async () => {
@@ -507,4 +534,19 @@ it("still records an admitted reboot observation after a contradictory late rele
   expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, reboot.id)))[0]!.status).toBe("applied");
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "failed", cleanupStepId: reboot.id, cleanupError: "cleanup_ownership_ambiguous" });
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+});
+
+it("persists a vendor cleanup cooldown without turning it into a failed cleanup", async () => {
+  const f = await cleanupFixture();
+  const before = Date.now();
+  f.state.error = new CloudError("rate_limited", true, 180000);
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource).toMatchObject({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited" });
+  expect(resource!.cleanupDueAt!.getTime()).toBeGreaterThanOrEqual(before + 180000);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!)))[0]).toMatchObject({ status: "rejected_no_effect", errorCode: "rate_limited" });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBeNull();
+  f.state.error = undefined;
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
 });

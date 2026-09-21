@@ -5,6 +5,8 @@ import {
   EC2Client,
 } from "@aws-sdk/client-ec2";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
+import { CloudWatchClient, GetMetricStatisticsCommand } from "@aws-sdk/client-cloudwatch";
+import { monthPeriod, monthlyTrafficResult, sumTraffic } from "./monthly-traffic.js";
 import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
 import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
@@ -103,6 +105,24 @@ export class Ec2CloudAdapter implements CloudAdapter {
     } catch (error) {
       throw normalizeAwsError(error);
     }
+  }
+
+  async monthlyTraffic(ref: CloudRef, now = new Date()) {
+    if (ref.accountId !== this.accountId || ref.service !== "ec2") throw new CloudError("resource_not_found", false);
+    const client = new CloudWatchClient({ ...awsClientOptions, region: ref.region, credentials: this.credentialSource });
+    try {
+      const period = monthPeriod(now);
+      const read = async (MetricName: string) => {
+        // At most 744 hourly samples: below GetMetricStatistics' 1,440-point limit,
+        // and valid for the entire current month, including samples older than 15 days.
+        const command = new GetMetricStatisticsCommand({ Namespace: "AWS/EC2", MetricName, Dimensions: [{ Name: "InstanceId", Value: ref.instanceId }], StartTime: period.start, EndTime: period.end, Period: 3600, Statistics: ["Sum"], Unit: "Bytes" });
+        const result = await (this.dependencies.cloudwatchSend?.(command) ?? client.send(command));
+        return sumTraffic((result.Datapoints ?? []).map((point: { Sum?: number }) => point.Sum));
+      };
+      const [incoming, outgoing] = await Promise.all([read("NetworkIn"), read("NetworkOut")]);
+      return monthlyTrafficResult("cloudwatch", now, incoming, outgoing);
+    } catch (error) { throw normalizeAwsError(error); }
+    finally { client.destroy(); }
   }
 
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability {

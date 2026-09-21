@@ -475,3 +475,6 @@ export const { probeObservationStats, addressHealthPolicies, addressHealthStates
 });
 
 export const { rotationPolicies, rotationIncidents, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications } = defineRotationSchema({ userId: () => users.id, slotId: () => managedAddressSlots.id });
+
+import { defineCloudRotationLimitSchema } from "./cloud-rotation-limits.js";
+export const { cloudRotationLimitPolicies, cloudRotationBuckets, cloudRotationReservations } = defineCloudRotationLimitSchema({ accountId: () => cloudAccounts.id, stepId: () => rotationSteps.id });

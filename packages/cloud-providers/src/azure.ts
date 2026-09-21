@@ -3,6 +3,7 @@ import type { CloudRef, CloudStep, SlotRef } from '@masterdns/contracts';
 import { AzureHttp, COMPUTE_API, NETWORK_API, RESOURCE_API, equalArmId } from './azure-http.js';
 import { executeAzureStep, observeAzureStep } from './azure-rotation.js';
 import { CloudError } from './errors.js';
+import { monthPeriod, monthlyTrafficResult, sumTraffic } from './monthly-traffic.js';
 import type { AzureCredentials, Capability, CloudAdapter, CloudInventory, CloudObservation, CloudPage, CloudStepResult } from './provider.js';
 // Raw ARM objects are kept local. Only explicit support evidence enters persisted inventory.
 export type AzureResource = Record<string, any>;
@@ -137,6 +138,20 @@ export class AzureCloudAdapter implements CloudAdapter {
         }
     }
     async inspect(ref: CloudRef): Promise<CloudInventory> { return (await this.read(ref)).inventory; }
+    async monthlyTraffic(ref: CloudRef, now = new Date()) {
+        if (ref.accountId !== this.accountId || ref.service !== 'azure_vm') throw new CloudError('resource_ownership_ambiguous', false);
+        const vmId = this.http.resourceId(ref.instanceId, 'Microsoft.Compute', 'virtualMachines');
+        const period = monthPeriod(now);
+        const query = new URLSearchParams({ 'api-version': '2023-10-01', timespan: `${period.start.toISOString()}/${period.end.toISOString()}`, interval: 'PT1H', metricnames: 'Network In Total,Network Out Total', aggregation: 'Total' });
+        const { body } = await this.http.request(`${vmId}/providers/Microsoft.Insights/metrics?${query}`);
+        if (!Array.isArray(body.value)) throw new CloudError('temporary_cloud_error', true);
+        const read = (name: string) => {
+            const metric = body.value.find((item: { name?: { value?: string } }) => item.name?.value === name);
+            if (metric?.errorCode && metric.errorCode !== 'Success') throw new CloudError('temporary_cloud_error', true);
+            return sumTraffic((metric?.timeseries ?? []).flatMap((series: { data?: Array<{ total?: number }> }) => (series.data ?? []).map(point => point.total)));
+        };
+        return monthlyTrafficResult('azure_monitor', now, read('Network In Total'), read('Network Out Total'));
+    }
     async read(ref: CloudRef, allowNicUpdating = false): Promise<AzureRead> {
         if (ref.accountId !== this.accountId || ref.service !== 'azure_vm')
             throw new CloudError('resource_ownership_ambiguous', false);

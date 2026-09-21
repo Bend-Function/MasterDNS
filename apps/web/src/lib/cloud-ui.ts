@@ -103,6 +103,8 @@ export function capabilityReason(reason?: string) {
     public_ip_topology_unsupported: "Azure 公网 IP 的 SKU、分配方式或关联拓扑不支持",
     unsupported_topology: "当前云网络拓扑不支持轮换，已发现的主机地址仍可绑定与监控",
     quota_exceeded: "云端地址配额不足；Linode 额外 IPv4 需要支持团队批准配额并产生费用",
+    rotation_rate_limited: "等待换址额度",
+    rotation_limit_too_low: "换址额度不足以完成一次换址；请提高云账号使用比例后恢复任务",
     cleanup_health_failed: "清理重启后探测未恢复", probe_insufficient: "外部探测证据不足，等待达到健康判定阈值",
     permission_denied: "云端拒绝访问，请检查凭证的有效权限", stop_start_not_authorized: "尚未授权停止、启动或重启实例",
   } as Record<string, string>)[reason ?? ""] ?? reason ?? "未返回技术能力";

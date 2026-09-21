@@ -19,6 +19,7 @@
     "test:aws-e2e": "tsx scripts/aws-e2e.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-cloudwatch": "^3.1136.0",
     "@aws-sdk/client-ec2": "^3.1131.0",
     "@aws-sdk/client-lightsail": "^3.1131.0",
     "@aws-sdk/client-sts": "^3.1131.0",

@@ -7,6 +7,7 @@ import { cloudRequestKey } from "./cloud-idempotency.js";
 import { CloudService } from "./cloud.service.js";
 import { cloudAuthorizationSchema, cloudBindingSchema, cloudCredentialsUpdateSchema, cloudEnabledSchema, cloudRegionsUpdateSchema, createCloudAccountSchema } from "./cloud.schemas.js";
 import type { CloudAuthorizationInput, CloudBindingInput, CloudCredentialsUpdateInput, CreateCloudAccountInput } from "./cloud.schemas.js";
+import { cloudRotationLimitPolicySchema } from "@masterdns/contracts";
 
 @Controller("v1")
 export class CloudController {
@@ -19,7 +20,10 @@ export class CloudController {
   @Post("cloud-accounts/:id/sync") sync(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.sync(actor, id); }
   @Get("cloud-accounts/:id/scopes") scopes(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.scopes(actor, id); }
   @Get("cloud-accounts/:id/instances") instances(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.instances(actor, id); }
+  @Get("cloud-accounts/:id/rotation-limits/:service") rotationLimits(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Param("service") service: string) { return this.cloud.rotationLimits(actor, id, service); }
+  @Patch("cloud-accounts/:id/rotation-limits/:service") setRotationLimits(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Param("service") service: string, @ZodBody(cloudRotationLimitPolicySchema) input: { utilizationPercent: number }) { return this.cloud.setRotationLimits(actor, id, service, input); }
   @Get("cloud-instances/:id") instance(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.instance(actor, id); }
+  @Get("cloud-instances/:id/traffic") traffic(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.monthlyTraffic(actor, id); }
   @Get("address-slots") slots(@CurrentUser() actor: AuthUser, @Query("instanceId", ParseUUIDPipe) id: string) { return this.cloud.slots(actor, id); }
   @Patch("cloud-instances/:id/authorization") authorize(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @ZodBody(cloudAuthorizationSchema) input: CloudAuthorizationInput) { return this.cloud.authorize(actor, id, input); }
   @Post("address-slots/:id/bindings") bind(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @ZodBody(cloudBindingSchema.omit({ slotId: true })) input: Omit<CloudBindingInput, "slotId">, @Headers("idempotency-key") key: string | undefined) { return this.bindings.bind(actor, { ...input, slotId: id }, cloudRequestKey(key)); }

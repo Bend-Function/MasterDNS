@@ -7,6 +7,7 @@ import { nextRotationAction, type RotationSnapshot, type RotationStepSnapshot, t
 import { planCloudRotation, type CloudInventory, type CloudObservation, type CloudStepResult } from "@masterdns/cloud-providers";
 import { cloudAddresses, databaseNow, healthRevisionMatches, lockRotationContext, lockRotationHealth, resetHealthEvidence, addressHealthStates, managedAddressSlots, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, rotationAuthorizationError, type RotationContext, type RotationTransaction } from "@masterdns/db";
 import { DatabaseService } from "../database.service.js";
+import { reserveCloudRotationWrite, recordCloudRotationThrottle } from "@masterdns/db";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease, type RotationLease } from "./rotation-lock.js";
 
 type Incident = typeof rotationIncidents.$inferSelect;
@@ -73,6 +74,9 @@ export class RotationStore {
     if (incident.trigger !== "manual" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
       action = c.slot.candidateAddressId ? { kind: "publish", mode: "dispatch", addressVersion: c.slot.candidateVersion } : { kind: "complete" };
     }
+    if (action.kind === "execute" && incident.errorCode === "rotation_rate_limited" && incident.nextRunAt > h.now) {
+      action = { kind: "wait", reason: "rate_limited", until: incident.nextRunAt.getTime() };
+    }
     return { c, incident, h, physical, budget, attempt, steps, snapshot, action, publication };
   }
   async prepare(id: string, lease: RotationLease, inventory: CloudInventory, identity: AdapterIdentity) {
@@ -107,12 +111,22 @@ export class RotationStore {
       const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
       const allocation = prior.filter(s => s.plan.action.endsWith(".allocate")).at(-1);
       const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
+      const admission = await reserveCloudRotationWrite(tx, {
+        accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: plan.action,
+        remainingSteps: run.steps.filter(s => s.sequence >= step.sequence && s.plan.arguments.phase === "rotation" && ["prepared", "not_applied", "rejected_no_effect"].includes(s.status)).map(s => ({ id: s.id, action: s.plan.action })),
+      });
+      if (!admission.allowed) {
+        await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: admission.retryAt, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
+        if (incident.errorCode !== "rotation_rate_limited") await rotationAudit(tx, incident, "rotation.rate_limit_wait", undefined, { stepId, ruleId: admission.ruleId, retryAt: admission.retryAt.toISOString() });
+        return;
+      }
       if (!run.attempt.charged) {
         await tx.update(rotationAttempts).set({ charged: true, chargedAt: run.h.now, status: "cloud" }).where(eq(rotationAttempts.id, run.attempt.id));
         await tx.update(rotationBudgetSegments).set({ attemptsUsed: run.budget.attemptsUsed + 1 }).where(eq(rotationBudgetSegments.id, run.budget.id));
         await tx.update(rotationIncidents).set({ nextAttemptAt: new Date(run.h.now.getTime() + c.policy!.minIntervalSeconds * 1000) }).where(eq(rotationIncidents.id, id));
       }
       await tx.update(rotationSteps).set({ plan, status: "in_flight", fence: lease.revision, dispatchedAt: run.h.now, observeDeadline: new Date(run.h.now.getTime() + c.policy!.cloudWaitSeconds * 1000), receipt: null, errorCode: null, retryAt: null, updatedAt: run.h.now }).where(eq(rotationSteps.id, stepId));
+      await tx.update(rotationIncidents).set({ errorCode: null, nextRunAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
       await tx.update(rotationLeases).set({ unresolvedStepId: stepId }).where(eq(rotationLeases.physicalKey, lease.physicalKey));
       await rotationAudit(tx, incident, "rotation.dispatched", undefined, { attemptId: run.attempt.id, stepId, fence: lease.revision });
       return plan;
@@ -150,8 +164,8 @@ export class RotationStore {
       await tx.update(rotationIncidents).set({ nextRunAt: new Date(now.getTime() + (status === "pending" ? 5000 : 0)) }).where(eq(rotationIncidents.id, id));
     });
   }
-  async reject(id: string, stepId: string, code: string, noEffect: boolean) {
-    await this.transaction(id, async (tx, _c, incident) => {
+  async reject(id: string, stepId: string, code: string, noEffect: boolean, retryAfterMs?: number) {
+    await this.transaction(id, async (tx, c, incident) => {
       const now = await databaseNow(tx);
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.attemptId !== incident.currentAttemptId || step.status === "applied") return;
@@ -159,7 +173,8 @@ export class RotationStore {
         await tx.update(rotationSteps).set({ errorCode: code, updatedAt: now }).where(eq(rotationSteps.id, stepId));
         await tx.update(rotationIncidents).set({ errorCode: code, nextRunAt: new Date(now.getTime() + 5000) }).where(eq(rotationIncidents.id, id)); return;
       }
-      await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code, retryAt: code === "rate_limited" ? new Date(now.getTime() + 60000) : null, updatedAt: now }).where(eq(rotationSteps.id, stepId));
+      const retryAt = code === "rate_limited" ? await recordCloudRotationThrottle(tx, { accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: step.plan.action, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) }) : null;
+      await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code, retryAt, updatedAt: now }).where(eq(rotationSteps.id, stepId));
       await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.unresolvedStepId, stepId)));
       const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, step.attemptId)).for("update");
       if (step.sequence === 0 && attempt?.charged) {
@@ -168,6 +183,7 @@ export class RotationStore {
         await tx.update(rotationIncidents).set({ nextAttemptAt: now }).where(eq(rotationIncidents.id, id));
       }
       if (code !== "rate_limited") await this.pauseIn(tx, incident, code, now);
+      else await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: retryAt!, updatedAt: now }).where(eq(rotationIncidents.id, id));
       await rotationAudit(tx, incident, "rotation.rejected_no_effect", undefined, { stepId, code });
     });
   }
@@ -192,7 +208,7 @@ export class RotationStore {
       else await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode, nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
     });
   }
-  async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`clock_timestamp() + interval '30 seconds'` }).where(eq(rotationIncidents.id, id)); }
+  async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '30 seconds')` }).where(eq(rotationIncidents.id, id)); }
   async pause(id: string, code: string) { await this.transaction(id, async (tx, _c, incident) => this.pauseIn(tx, incident, code, await databaseNow(tx))); }
   private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));

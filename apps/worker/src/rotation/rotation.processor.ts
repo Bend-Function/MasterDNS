@@ -62,7 +62,7 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
         const plan = await this.store.dispatch(incidentId, lease, action.stepId, identity); if (!plan) return;
         let receipt;
         try { receipt = await adapter.execute(plan); }
-        catch (error) { await this.store.reject(incidentId, action.stepId, safeError(error), error instanceof CloudError && noEffectErrors.has(error.code)); return; }
+        catch (error) { await this.store.reject(incidentId, action.stepId, safeError(error), error instanceof CloudError && noEffectErrors.has(error.code), error instanceof CloudError ? error.retryAfterMs : undefined); return; }
         // A failure here leaves the original in_flight intent. Recovery observes;
         // it cannot infer no-effect from a lost database write or SDK response.
         await this.store.saveReceipt(incidentId, action.stepId, receipt);
@@ -74,6 +74,6 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
 }
 function safeError(error: unknown) {
   if (error instanceof CloudError) return error.code;
-  if (error instanceof Error && ["authorization_changed", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager"].includes(error.message)) return error.message;
+  if (error instanceof Error && ["authorization_changed", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "rotation_limit_too_low"].includes(error.message)) return error.message;
   return "rotation_runtime_failed";
 }
