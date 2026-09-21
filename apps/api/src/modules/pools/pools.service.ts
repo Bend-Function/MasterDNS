@@ -36,7 +36,7 @@ import {
   reconcileIntents,
   zones,
 } from "@masterdns/db";
-import { and, asc, desc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
@@ -444,10 +444,19 @@ export class PoolsService {
   }
 
   async remove(actor: AuthUser, poolId: string) {
-    const pool = await this.findOwnedPool(actor, poolId);
-    const bindings = await this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId)).limit(1);
-    if (bindings.length > 0) throw new ConflictException("请先删除 Pool 中的域名绑定，系统不会直接遗留云端记录");
     await this.database.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.select().from(endpointPools).where(and(eq(endpointPools.id, poolId), actor.role === "admin" ? undefined : eq(endpointPools.ownerUserId, actor.id))).for("update");
+      if (!pool) throw new NotFoundException("IP Pool 不存在");
+      const bindings = await tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.poolId, poolId)).limit(1);
+      if (bindings.length > 0) throw new ConflictException("请先删除 Pool 中的域名绑定，系统不会直接遗留云端记录");
+      // Lock historical records too: sync may revive one while deletion is checked.
+      const records = await tx.select().from(dnsRecords).where(eq(dnsRecords.managedByPoolId, poolId)).for("update");
+      if (records.some(record => !record.deletedAt)) throw new ConflictException("Pool 仍关联未删除的 DNS 记录，请先核对并清理云端记录后再删除");
+      // Sync tombstones retain management metadata. Release it before the Pool FK
+      // sets its target to null, which otherwise violates dns_records_managed_pool.
+      await tx.update(dnsRecords).set({ management: "unmanaged", managedByPoolId: null, updatedAt: new Date() })
+        .where(and(eq(dnsRecords.managedByPoolId, poolId), isNotNull(dnsRecords.deletedAt)));
       await tx.insert(auditLogs).values({ ownerUserId: pool.ownerUserId, actorUserId: actor.id, source: "user", action: "pool.delete", resourceType: "endpoint_pool", resourceId: pool.id, beforeSnapshot: pool });
       await tx.delete(endpointPools).where(eq(endpointPools.id, poolId));
     });
@@ -585,21 +594,24 @@ export class PoolsService {
   }
 
   async deleteEndpoint(actor: AuthUser, poolId: string, endpointId: string) {
-    const pool = await this.findOwnedPool(actor, poolId);
-    const endpoint = await this.findEndpoint(poolId, endpointId);
-    const [assignment, binding] = await Promise.all([
-      this.database.db.select({ id: bindingAssignments.endpointId }).from(bindingAssignments).where(and(
-        eq(bindingAssignments.endpointId, endpointId),
-        or(eq(bindingAssignments.desired, true), eq(bindingAssignments.applied, true)),
-      )).limit(1),
-      this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.originalEndpointId, endpointId)).limit(1),
-    ]);
-    if (assignment.length > 0 || binding.length > 0) throw new ConflictException("节点仍被域名绑定引用，请先调整绑定或重新平衡");
     await this.database.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.select().from(endpointPools).where(and(eq(endpointPools.id, poolId), actor.role === "admin" ? undefined : eq(endpointPools.ownerUserId, actor.id))).for("update");
+      if (!pool) throw new NotFoundException("IP Pool 不存在");
+      const [endpoint] = await tx.select().from(endpoints).where(and(eq(endpoints.id, endpointId), eq(endpoints.poolId, poolId))).for("update");
+      if (!endpoint) throw new NotFoundException("节点不存在");
+      const [assignment, binding] = await Promise.all([
+        tx.select({ id: bindingAssignments.endpointId }).from(bindingAssignments).where(and(
+          eq(bindingAssignments.endpointId, endpointId),
+          or(eq(bindingAssignments.desired, true), eq(bindingAssignments.applied, true)),
+        )).limit(1),
+        tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.originalEndpointId, endpointId)).limit(1),
+      ]);
+      if (assignment.length > 0 || binding.length > 0) throw new ConflictException("节点仍被域名绑定引用，请先调整绑定或重新平衡");
       await tx.delete(bindingAssignments).where(eq(bindingAssignments.endpointId, endpointId));
       await tx.delete(endpoints).where(eq(endpoints.id, endpointId));
+      await this.recordPolicyChange(actor, poolId, "endpoint.delete", endpoint, undefined, pool.ownerUserId, tx);
     });
-    await this.recordPolicyChange(actor, poolId, "endpoint.delete", endpoint, undefined, pool.ownerUserId);
     return { deleted: true };
   }
 
@@ -796,11 +808,15 @@ export class PoolsService {
   }
 
   async deleteHealthCheck(actor: AuthUser, poolId: string, checkId: string) {
-    await this.findOwnedPool(actor, poolId);
-    const [check] = await this.database.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, checkId)).limit(1);
-    if (!check || !await this.checkBelongsToPool(check, poolId)) throw new NotFoundException("健康检查不存在");
-    await this.database.db.delete(healthCheckConfigs).where(eq(healthCheckConfigs.id, checkId));
-    await this.recordPolicyChange(actor, poolId, "health_check.delete", check, undefined);
+    await this.database.db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
+      const [pool] = await tx.select().from(endpointPools).where(and(eq(endpointPools.id, poolId), actor.role === "admin" ? undefined : eq(endpointPools.ownerUserId, actor.id))).for("update");
+      if (!pool) throw new NotFoundException("IP Pool 不存在");
+      const [check] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, checkId)).for("update");
+      if (!check || !await this.checkBelongsToPool(check, poolId, tx)) throw new NotFoundException("健康检查不存在");
+      await tx.delete(healthCheckConfigs).where(eq(healthCheckConfigs.id, checkId));
+      await this.recordPolicyChange(actor, poolId, "health_check.delete", check, undefined, pool.ownerUserId, tx);
+    });
     return { deleted: true };
   }
 
@@ -891,10 +907,10 @@ export class PoolsService {
     return transaction ? apply(transaction) : this.database.db.transaction(apply);
   }
 
-  private async checkBelongsToPool(check: typeof healthCheckConfigs.$inferSelect, poolId: string) {
+  private async checkBelongsToPool(check: typeof healthCheckConfigs.$inferSelect, poolId: string, reader: Pick<DatabaseTransaction, "select"> = this.database.db) {
     if (check.poolId) return check.poolId === poolId;
-    if (check.endpointId) return Boolean((await this.database.db.select({ id: endpoints.id }).from(endpoints).where(and(eq(endpoints.id, check.endpointId), eq(endpoints.poolId, poolId))).limit(1))[0]);
-    if (check.domainBindingId) return Boolean((await this.database.db.select({ id: domainBindings.id }).from(domainBindings).where(and(eq(domainBindings.id, check.domainBindingId), eq(domainBindings.poolId, poolId))).limit(1))[0]);
+    if (check.endpointId) return Boolean((await reader.select({ id: endpoints.id }).from(endpoints).where(and(eq(endpoints.id, check.endpointId), eq(endpoints.poolId, poolId))).limit(1))[0]);
+    if (check.domainBindingId) return Boolean((await reader.select({ id: domainBindings.id }).from(domainBindings).where(and(eq(domainBindings.id, check.domainBindingId), eq(domainBindings.poolId, poolId))).limit(1))[0]);
     return false;
   }
 }
