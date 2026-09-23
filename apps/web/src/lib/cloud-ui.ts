@@ -10,12 +10,34 @@ export function cloudTargetLabel(target: CloudTargetSummary) {
 }
 
 export function cloudTargetAddresses(target: CloudTargetSummary) {
+  if (target.currentAddressObserved && target.candidateAddress && target.candidateAddressObserved === false && !target.activeCandidate) return `IPv${target.slot.family} · 当前云地址 ${target.currentAddress!.address} · 历史候选 ${target.candidateAddress.address}`;
   if (target.inventoryCurrent === false && !target.activeCandidate) return `IPv${target.slot.family} · 历史地址 ${target.candidateAddress?.address ?? target.currentAddress?.address ?? "未知"} · 当前清单中不存在`;
   if (target.candidateAddress && target.candidateAddress.id === target.currentAddress?.id) return `IPv${target.slot.family} · 待验证 ${target.candidateAddress.address}`;
-  const current = target.currentAddress ? `${target.slot.currentVersion > 0 ? "当前" : "当前待验证"} ${target.currentAddress.address}` : "暂无当前地址";
+  const current = target.currentAddress ? `${target.currentAddressObserved === false ? "原地址（历史）" : target.slot.currentVersion > 0 ? "当前" : "当前待验证"} ${target.currentAddress.address}` : "暂无当前地址";
   const candidate = target.candidateAddress && target.candidateAddress.id !== target.currentAddress?.id
     ? ` · 候选待验证 ${target.candidateAddress.address}` : "";
   return `IPv${target.slot.family} · ${current}${candidate}`;
+}
+
+export function cloudAddressView(addresses: CloudAddress[], showHistory = false) {
+  const hosts = addresses.filter(address => address.kind === undefined || address.kind === "host");
+  const current = hosts.filter(address => address.isCurrent !== false);
+  const latestGeneration = Math.max(0, ...hosts.map(address => address.scanGeneration ?? 0));
+  const mode = current.length ? "current" as const : hosts.length ? "last_known" as const : "empty" as const;
+  return { addresses: showHistory ? hosts : current.length ? current : hosts.filter(address => (address.scanGeneration ?? 0) === latestGeneration), mode };
+}
+
+export function cloudInstanceMatches(row: CloudInstanceRow, query: string, addresses = row.addresses?.length ? row.addresses : row.lastKnownAddresses ?? row.addresses ?? []) {
+  const { instance, account } = row;
+  const text = `${instance.name ?? ""} ${instance.externalId} ${instance.service} ${instance.region} ${account?.name ?? ""} ${cloudAddressView(addresses).addresses.map(address => address.address).join(" ")}`;
+  return text.toLowerCase().includes(query.toLowerCase());
+}
+
+export function cloudInventoryNotice(inventory: CloudInstanceRow["inventory"], mode: "current" | "last_known" | "empty") {
+  const failure = inventory?.lastError ? "最近同步失败，显示最近一次已保存的清单。" : "";
+  if (mode === "last_known") return `${failure}${inventory?.status === "absent" ? "最近完整清单未发现此实例。" : "当前清单没有确认的地址。"}以下为最近已知地址，仅供查看，不表示仍在使用。`;
+  if (mode === "empty") return `${failure}尚未发现主机地址，请同步云账号后重试。`;
+  return failure;
 }
 
 export function selectableCloudSlots(recordType: "A" | "AAAA", slots: AddressSlot[], context: SlotContext = { accountEnabled: true, instancePresent: true, managed: true }) {

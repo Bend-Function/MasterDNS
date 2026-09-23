@@ -53,6 +53,8 @@ export type CloudAuthorization = {
 };
 
 export type CloudInstanceRow = {
+  lastKnownAddresses?: CloudAddress[];
+  inventory?: { status: "current" | "absent" | "unconfirmed"; lastError: string | null; lastCompletedAt?: string | null };
   instance: CloudInstance;
   authorization: CloudAuthorization | null;
   inScope: boolean;
@@ -118,6 +120,8 @@ export type AddressSlot = {
 export type AuthorizationPayload = Omit<CloudAuthorization, "instanceId" | "updatedAt">;
 
 export type CloudTargetSummary = {
+  currentAddressObserved?: boolean;
+  candidateAddressObserved?: boolean;
   inventoryCurrent?: boolean;
   activeCandidate?: boolean;
   available?: boolean;

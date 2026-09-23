@@ -51,6 +51,7 @@ it("creates slot config without any linked endpoint and enforces family and owne
    slot: { id: slot!.id, name: "primary", family: "4", currentVersion: 0, candidateVersion: 0 },
    currentAddress: { id: address!.id, address: "192.0.2.20" }, candidateAddress: null,
    inventoryCurrent: true, activeCandidate: false, available: true,
+   currentAddressObserved: true, candidateAddressObserved: false,
  });
  expect(await service.list(stranger.actor as never)).toEqual([]);
  await expect(service.save(actor, { ...input, family: "6" })).rejects.toMatchObject({ status: 400 });

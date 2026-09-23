@@ -87,7 +87,7 @@ export default function HealthPage() {
     finally { if (evidenceGeneration.current.isCurrent(generation)) setEvidenceLoading(false); }
   };
 
-  const visiblePolicies = policies?.filter(policy => showHistory || policy.cloudTarget?.inventoryCurrent !== false || policy.cloudTarget.activeCandidate);
+  const visiblePolicies = policies?.filter(policy => showHistory || policy.cloudTarget?.inventoryCurrent !== false || policy.cloudTarget.currentAddressObserved || policy.cloudTarget.candidateAddressObserved || policy.cloudTarget.activeCandidate);
   const configured = visiblePolicies?.length ?? 0;
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);

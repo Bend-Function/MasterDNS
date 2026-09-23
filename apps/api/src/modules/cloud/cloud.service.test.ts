@@ -74,8 +74,41 @@ describe("cloud account and authorization API", () => {
     const f = await fixture();
     await connection.db.update(cloudScanScopes).set({ generation: 2, lastCompletedAt: new Date() }).where(eq(cloudScanScopes.id, f.scope.id));
     expect((await service.instances(f.actor, f.account.id))[0]!.addresses).toEqual([]);
+    expect((await service.instances(f.actor, f.account.id))[0]).toMatchObject({ lastKnownAddresses: [{ id: f.address.id, isCurrent: false }], inventory: { status: "absent" } });
     expect((await service.instance(f.actor, f.instance.id)).addresses[0]).toMatchObject({ id: f.address.id, isCurrent: false });
     expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: false, ref: null, cloudTarget: { inventoryCurrent: false, available: false } });
+  });
+  it("keeps an observed current IP visible when the selected candidate is historical without enabling that candidate", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudScanScopes).set({ generation: 2 }).where(eq(cloudScanScopes.id, f.scope.id));
+    await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, f.instance.id));
+    await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, f.iface.id));
+    await connection.db.update(cloudAddresses).set({ scanGeneration: 2 }).where(eq(cloudAddresses.id, f.address.id));
+    const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "192.0.2.99", origin: "system", scanGeneration: 1 }).returning();
+    await connection.db.update(managedAddressSlots).set({ currentVersion: 1, candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
+    expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: true, ref: null, cloudTarget: { currentAddressObserved: true, candidateAddressObserved: false, inventoryCurrent: false, available: false } });
+    expect((await service.instances(f.actor, f.account.id))[0]!.addresses.map(address => address.address)).toEqual(["192.0.2.10"]);
+    const { lockHealthTargets } = await import("@masterdns/db");
+    expect(await connection.db.transaction(tx => lockHealthTargets(tx, { slotId: f.slot.id, family: "4" }))).toEqual([]);
+  });
+  it("shows observed nonrotatable private IPv4 and scan errors independently of rotation capability", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudAddresses).set({ address: "10.0.0.4", metadata: { providerMetadata: { awsAddressScope: "private" } } }).where(eq(cloudAddresses.id, f.address.id));
+    await connection.db.update(cloudInterfaces).set({ metadata: { deviceIndex: 0, primaryAddresses: ["10.0.0.4"] } }).where(eq(cloudInterfaces.id, f.iface.id));
+    await connection.db.update(cloudScanScopes).set({ lastError: "permission_denied" }).where(eq(cloudScanScopes.id, f.scope.id));
+    expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: true, capability: { available: false, reason: "private_ipv4_unsupported" } });
+    expect((await service.instance(f.actor, f.instance.id))).toMatchObject({ addresses: [{ address: "10.0.0.4", isCurrent: true }], inventory: { status: "current", lastError: "permission_denied" } });
+    expect((await service.instances(f.actor, f.account.id))[0]).toMatchObject({ addresses: [{ address: "10.0.0.4" }], inventory: { lastError: "permission_denied" } });
+  });
+  it("shows the latest actual IP even when an unfinished rotation has kept the slot on the old address", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudScanScopes).set({ generation: 2 }).where(eq(cloudScanScopes.id, f.scope.id));
+    await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, f.instance.id));
+    await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, f.iface.id));
+    await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "192.0.2.77", origin: "user", scanGeneration: 2 });
+    expect((await service.instance(f.actor, f.instance.id)).addresses.filter(address => address.isCurrent).map(address => address.address)).toEqual(["192.0.2.77"]);
+    expect((await service.instances(f.actor, f.account.id))[0]!.addresses.map(address => address.address)).toEqual(["192.0.2.77"]);
+    expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: false, ref: null, cloudTarget: { currentAddressObserved: false, candidateAddressObserved: false, available: false } });
   });
   it("lists only latest inventory IPs and labels current and candidate slots without credentials", async () => {
     const f = await fixture();
@@ -94,6 +127,7 @@ describe("cloud account and authorization API", () => {
       currentAddress: { id: f.address.id, address: "192.0.2.10" },
       candidateAddress: { id: candidate!.id, address: "192.0.2.20" },
       inventoryCurrent: true, activeCandidate: false, available: true,
+      currentAddressObserved: false, candidateAddressObserved: true,
     });
     const detail = await service.instance(f.actor, f.instance.id);
     expect(detail.addresses.find(address => address.id === f.address.id)).toMatchObject({ isCurrent: false });

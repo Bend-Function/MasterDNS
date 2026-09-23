@@ -96,6 +96,35 @@ it("retains original user addresses without independent release authorization", 
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(0);
 });
+it("new rotations release replaced user IPs after takeover without a separate legacy grant", async () => {
+  const f = await cleanupFixture("user");
+  await f.d.update(db.rotationIncidents).set({ releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  expect(await f.d.transaction(tx => db.idleIpAddressReleasing(tx, f.resource.address))).toBe(true);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released" });
+  expect(await f.d.transaction(tx => db.idleIpAddressReleasing(tx, f.resource.address))).toBe(false);
+});
+it.each(["history", "observed", "linked", "active"] as const)("old IP cleanup distinguishes %s slot references", async kind => {
+  const oldAddressValue = { history: "198.51.100.201", observed: "198.51.100.202", linked: "198.51.100.203", active: "198.51.100.204" }[kind];
+  const f = await cleanupFixture("user", "4", oldAddressValue);
+  await f.d.update(db.rotationIncidents).set({ releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+  const [oldAddress] = await f.d.insert(db.cloudAddresses).values({ interfaceId: f.slot.interfaceId, kind: "host", family: "4", address: f.resource.address, origin: "user", scanGeneration: 1 }).returning();
+  const [duplicate] = await f.d.insert(db.managedAddressSlots).values({ interfaceId: f.slot.interfaceId, family: "4", name: "historical-copy", currentAddressId: oldAddress!.id, currentVersion: 1 }).returning();
+  if (kind !== "observed") {
+    await f.d.update(db.cloudInstances).set({ scanGeneration: 2 }).where(eq(db.cloudInstances.id, f.instance.id));
+    await f.d.update(db.cloudInterfaces).set({ scanGeneration: 2 }).where(eq(db.cloudInterfaces.id, f.slot.interfaceId));
+    await f.d.update(db.cloudAddresses).set({ scanGeneration: 2 }).where(eq(db.cloudAddresses.id, f.address.id));
+    await f.d.update(db.cloudScanScopes).set({ generation: 2 }).where(eq(db.cloudScanScopes.accountId, f.account.id));
+  }
+  if (kind === "linked") {
+    await f.d.update(db.cloudEndpointLinks).set({ slotId: duplicate!.id }).where(eq(db.cloudEndpointLinks.endpointId, f.endpoints[0]!.id));
+  }
+  if (kind === "active") await f.d.insert(db.rotationIncidents).values({ ...f.incident, id: randomUUID(), slotId: duplicate!.id, sourceEventId: randomUUID(), currentAttemptId: null });
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(kind === "history" ? 1 : 0);
+});
 it("terminates stuck cleanup permanently, including stale jobs and late failure handlers", async () => {
   const f = await cleanupFixture();
   await f.cleanup.run(f.resource.id, new Date());

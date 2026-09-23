@@ -62,6 +62,7 @@ it("requires Idempotency-Key at the controller and derives the failure source on
   await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
   const key = randomUUID(); const first = await service.start(f.actor, f.slot.id, key); const retry = await service.start(f.actor, f.slot.id, key);
   expect(first.id).toBe(retry.id); expect(first.sourceEventId).toBe(`health-${f.health.lastRoundId}-1`);
+  expect(first.releaseOldAddress).toBe(true);
   expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id))).toHaveLength(1);
 });
 it("admits a manual AWS IPv4 rotation without probes and creates disabled timing defaults", async () => {
@@ -74,6 +75,7 @@ it("admits a manual AWS IPv4 rotation without probes and creates disabled timing
   const first = await service.startManual(f.actor, f.slot.id, key);
   const replay = await service.startManual(f.actor, f.slot.id, key);
   expect(replay).toEqual(first);
+  expect(first.releaseOldAddress).toBe(true);
   expect(first).toMatchObject({ trigger: "manual", healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null });
   expect(first.sourceEventId).toMatch(/^manual-/);
   expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]).toMatchObject({ enabled: false, revision: 1, maxAttempts: 3 });

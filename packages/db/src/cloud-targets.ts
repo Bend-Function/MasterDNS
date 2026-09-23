@@ -4,6 +4,8 @@ import type { MasterDnsDatabase } from "./index.js";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, managedAddressSlots, rotationAttempts, rotationIncidents } from "./schema/index.js";
 
 export type CloudTargetSummary = {
+  currentAddressObserved: boolean;
+  candidateAddressObserved: boolean;
   inventoryCurrent: boolean;
   activeCandidate: boolean;
   available: boolean;
@@ -47,9 +49,13 @@ export async function getCloudTargetsForSlots(db: Pick<MasterDnsDatabase, "selec
     const instanceCurrent = freshness.metadata.present !== false
       && (freshness.scopeGeneration === null || freshness.scopeGeneration === freshness.instanceGeneration)
       && freshness.interfaceGeneration === freshness.instanceGeneration;
-    const inventoryCurrent = instanceCurrent && (row.candidateAddress ? freshness.candidateGeneration : freshness.currentGeneration) === freshness.instanceGeneration;
+    const currentAddressObserved = instanceCurrent && !!row.currentAddress && freshness.currentGeneration === freshness.instanceGeneration;
+    const candidateAddressObserved = instanceCurrent && !!row.candidateAddress && freshness.candidateGeneration === freshness.instanceGeneration;
+    // Probe/publication authority stays on the selected candidate. Visibility may
+    // also show a separately observed current address, without authorizing it.
+    const inventoryCurrent = row.candidateAddress ? candidateAddressObserved : currentAddressObserved;
     const available = freshness.enabled && (freshness.regions === null || freshness.regions.includes(row.instance.region))
       && instanceCurrent && (inventoryCurrent || row.activeCandidate);
-    return [row.slot.id, { ...row, inventoryCurrent, available }];
+    return [row.slot.id, { ...row, currentAddressObserved, candidateAddressObserved, inventoryCurrent, available }];
   }));
 }

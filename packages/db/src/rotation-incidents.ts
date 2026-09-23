@@ -42,6 +42,7 @@ export async function createRotationIncident(tx: RotationTransaction, c: Rotatio
   if (!h.failure) throw new Error("confirmed_failure_required");
   const currentSegmentId = randomUUID();
   const [incident] = await tx.insert(rotationIncidents).values({ ownerUserId: c.account.ownerUserId, slotId: c.slot.id, family: c.slot.family, physicalKey: c.physicalKey, sourceEventId, currentSegmentId,
+    releaseOldAddress: true,
     authorizationRevision: c.authorization!.revision, policyRevision: c.policy!.revision, addressVersion: c.addressVersion, ...healthRevisions(h), nextRunAt: h.now, nextAttemptAt: h.now }).returning();
   await tx.insert(rotationBudgetSegments).values({ id: currentSegmentId, incidentId: incident!.id, maxAttempts: c.policy!.maxAttempts, actorUserId });
   await rotationAudit(tx, incident!, "rotation.start", actorUserId, { sourceEventId });
@@ -66,6 +67,7 @@ export async function createManualRotationIncident(tx: RotationTransaction, c: R
   const now = await databaseNow(tx);
   const currentSegmentId = randomUUID();
   const [incident] = await tx.insert(rotationIncidents).values({ ownerUserId: c.account.ownerUserId, slotId: c.slot.id, family: c.slot.family, physicalKey: c.physicalKey, sourceEventId, trigger: "manual", currentSegmentId,
+    releaseOldAddress: true,
     authorizationRevision: c.authorization!.revision, policyRevision: policy.revision, addressVersion: c.addressVersion, nextRunAt: now, nextAttemptAt: now }).returning();
   await tx.insert(rotationBudgetSegments).values({ id: currentSegmentId, incidentId: incident!.id, maxAttempts: 1, actorUserId });
   await rotationAudit(tx, incident!, "rotation.manual", actorUserId, { sourceEventId });

@@ -15,6 +15,7 @@ export function reconcileEndpointFamily(current: AddressFamily, endpoint: Endpoi
 export function healthPolicyDisplay(policy: AddressHealthPolicy, group: ProbeGroup | undefined, now: number) {
   const pending = (reason: string) => ({ status: "unknown", decision: "unknown", reason });
   const state = policy.state;
+  if (policy.slotId && policy.cloudTarget?.currentAddressObserved && policy.cloudTarget.candidateAddress && policy.cloudTarget.candidateAddressObserved === false && !policy.cloudTarget.activeCandidate) return pending("当前云地址仍存在；候选地址已不在当前清单中，候选探测已停止");
   if (policy.slotId && policy.cloudTarget?.inventoryCurrent === false && !policy.cloudTarget.activeCandidate) return pending("历史地址已不在当前清单中，已停止探测");
   if (policy.slotId && policy.cloudTarget?.available === false) return pending("云地址当前不可用，已停止探测");
   if (policy.slotId && policy.mode === "local") return pending("云地址需要外部 Agent 验证，本地结果不能用于发布");

@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy, wakeCloudRotationLimitWaits } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
 import { CloudError, createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
 import { cloudProviderServices, cloudRotationLimitPolicySchema, validCloudRegion, type CloudProvider, type CloudService as CloudServiceName, type SlotRef, type MonthlyTrafficResponse } from "@masterdns/contracts";
@@ -128,19 +128,24 @@ export class CloudService {
 
   async instances(actor: AuthUser, accountId: string) {
     const account = await this.findAccount(actor, accountId);
-    const rows = await this.database.db.select({ instance: cloudInstances, authorization: instanceAuthorizations }).from(cloudInstances)
+    const rows = await this.database.db.select({ instance: cloudInstances, authorization: instanceAuthorizations, scope: cloudScanScopes }).from(cloudInstances)
+      .leftJoin(cloudScanScopes, and(eq(cloudScanScopes.accountId, cloudInstances.accountId), eq(cloudScanScopes.service, cloudInstances.service), eq(cloudScanScopes.region, cloudInstances.region)))
       .leftJoin(instanceAuthorizations, eq(instanceAuthorizations.instanceId, cloudInstances.id)).where(eq(cloudInstances.accountId, accountId)).orderBy(asc(cloudInstances.region), asc(cloudInstances.name));
-    const addresses = await this.database.db.select({ instanceId: cloudInstances.id, address: cloudAddresses }).from(cloudAddresses)
+    const addresses = await this.database.db.select({ instanceId: cloudInstances.id, address: cloudAddresses, interfaceGeneration: cloudInterfaces.scanGeneration }).from(cloudAddresses)
       .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, cloudAddresses.interfaceId))
       .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
-      .leftJoin(cloudScanScopes, and(eq(cloudScanScopes.accountId, cloudInstances.accountId), eq(cloudScanScopes.service, cloudInstances.service), eq(cloudScanScopes.region, cloudInstances.region)))
-      .where(and(eq(cloudInstances.accountId, accountId), sql`(${cloudScanScopes.id} is null or ${cloudScanScopes.generation} = ${cloudInstances.scanGeneration})`, eq(cloudInterfaces.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.kind, "host")));
-    const byInstance = new Map<string, typeof cloudAddresses.$inferSelect[]>();
+      .where(and(eq(cloudInstances.accountId, accountId), eq(cloudAddresses.kind, "host")));
+    const byInstance = new Map<string, typeof addresses>();
     for (const row of addresses) {
       const values = byInstance.get(row.instanceId) ?? [];
-      values.push(row.address); byInstance.set(row.instanceId, values);
+      values.push(row); byInstance.set(row.instanceId, values);
     }
-    return rows.map((row) => ({ ...row, addresses: row.instance.metadata.present === false ? [] : byInstance.get(row.instance.id) ?? [], inScope: account.regions === null || account.regions.includes(row.instance.region) }));
+    return rows.map(({ scope, ...row }) => {
+      const inventory = inventorySummary(row.instance, scope);
+      const known = (byInstance.get(row.instance.id) ?? []).map(({ address, interfaceGeneration }) => ({ ...address, isCurrent: inventory.status === "current" && interfaceGeneration === row.instance.scanGeneration && address.scanGeneration === row.instance.scanGeneration }));
+      const latestGeneration = Math.max(0, ...known.map(address => address.scanGeneration));
+      return { ...row, addresses: known.filter(address => address.isCurrent), lastKnownAddresses: known.filter(address => address.scanGeneration === latestGeneration), inventory, inScope: account.regions === null || account.regions.includes(row.instance.region) };
+    });
   }
 
   async instance(actor: AuthUser, instanceId: string) {
@@ -155,7 +160,7 @@ export class CloudService {
     const [scope] = await this.database.db.select().from(cloudScanScopes).where(and(eq(cloudScanScopes.accountId, account.id), eq(cloudScanScopes.service, row.instance.service), eq(cloudScanScopes.region, row.instance.region)));
     const instanceCurrent = row.instance.metadata.present !== false && (!scope || scope.generation === row.instance.scanGeneration);
     const currentInterfaces = new Set(interfaces.filter(iface => instanceCurrent && iface.scanGeneration === row.instance.scanGeneration).map(iface => iface.id));
-    return { ...row, inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces: interfaces.map(iface => ({ ...iface, isCurrent: currentInterfaces.has(iface.id) })), addresses: addresses.map(({ address }) => ({ ...address, isCurrent: currentInterfaces.has(address.interfaceId) && address.scanGeneration === row.instance.scanGeneration })) };
+    return { ...row, inventory: inventorySummary(row.instance, scope), inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces: interfaces.map(iface => ({ ...iface, isCurrent: currentInterfaces.has(iface.id) })), addresses: addresses.map(({ address }) => ({ ...address, isCurrent: currentInterfaces.has(address.interfaceId) && address.scanGeneration === row.instance.scanGeneration })) };
   }
 
   async slots(actor: AuthUser, instanceId: string) {
@@ -187,9 +192,9 @@ export class CloudService {
     const targets = await getCloudTargetsForSlots(this.database.db, rows.map(row => row.slot.id));
     return rows.map(({ slot, currentAddress, interfaceExternalId }) => {
       const cloudTarget = targets.get(slot.id) ?? null;
-      const isCurrent = !!cloudTarget && (cloudTarget.inventoryCurrent || cloudTarget.activeCandidate);
+      const isCurrent = !!cloudTarget && (cloudTarget.currentAddressObserved || cloudTarget.candidateAddressObserved || cloudTarget.activeCandidate);
       const selected = cloudTarget?.candidateAddress ?? cloudTarget?.currentAddress;
-      const ref: SlotRef | null = selected && isCurrent ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: selected.address, family: slot.family === "4" ? 4 : 6 } : null;
+      const ref: SlotRef | null = selected && cloudTarget?.available ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: selected.address, family: slot.family === "4" ? 4 : 6 } : null;
       return { slot, currentAddress, cloudTarget, isCurrent, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
     });
   }
@@ -304,4 +309,10 @@ function rotationLimitAuditSnapshot(status: { enabled?: boolean; service: CloudS
 function providerMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
   const value = metadata.providerMetadata;
   return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function inventorySummary(instance: typeof cloudInstances.$inferSelect, scope: typeof cloudScanScopes.$inferSelect | null | undefined) {
+  const status = instance.metadata.present === false || (scope && scope.generation > instance.scanGeneration) ? "absent" as const
+    : !scope || scope.generation === instance.scanGeneration ? "current" as const : "unconfirmed" as const;
+  return { status, lastError: scope?.lastError ?? null, lastCompletedAt: scope?.lastCompletedAt ?? null };
 }

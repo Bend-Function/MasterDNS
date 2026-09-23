@@ -1,0 +1,1 @@
+ALTER TABLE "rotation_incidents" ADD COLUMN "release_old_address" boolean DEFAULT false NOT NULL;

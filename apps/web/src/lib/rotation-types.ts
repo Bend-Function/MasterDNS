@@ -19,6 +19,7 @@ export type RotationIncident = {
   family: "4" | "6";
   sourceEventId: string;
   trigger?: "health" | "manual";
+  releaseOldAddress?: boolean;
   status: "active" | "paused" | "exhausted" | "complete";
   phase: "cloud" | "candidate" | "publish" | "cleanup" | "complete";
   currentSegmentId: string;

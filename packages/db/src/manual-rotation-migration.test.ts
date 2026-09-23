@@ -39,7 +39,7 @@ it("upgrades existing health incidents and enforces trigger-specific epochs", as
     await sql`insert into rotation_incidents (id, owner_user_id, slot_id, family, physical_key, source_event_id, current_segment_id, authorization_revision, policy_revision, address_version, health_policy_id, health_policy_revision, config_id, config_revision, group_id, group_revision) values (${incidentId}, ${owner!.id}, ${slot!.id}, '4', 'physical', 'health-event', ${segmentId}, 1, 1, 1, ${healthPolicyId}, 1, ${configId}, 1, ${groupId}, 1)`;
 
     await migrate(connection.db, { migrationsFolder: migrations });
-    expect((await sql`select trigger, health_policy_id from rotation_incidents where id=${incidentId}`)[0]).toMatchObject({ trigger: "health", health_policy_id: healthPolicyId });
+    expect((await sql`select trigger, health_policy_id, release_old_address from rotation_incidents where id=${incidentId}`)[0]).toMatchObject({ trigger: "health", health_policy_id: healthPolicyId, release_old_address: false });
     await sql`update rotation_incidents set status='complete' where id=${incidentId}`;
     const [manual] = await sql`insert into rotation_incidents (owner_user_id, slot_id, family, physical_key, source_event_id, trigger, current_segment_id, authorization_revision, policy_revision, address_version) values (${owner!.id}, ${slot!.id}, '4', 'physical', 'manual-event', 'manual', ${randomUUID()}, 1, 1, 1) returning id`;
     await sql`update rotation_incidents set status='complete' where id=${manual!.id}`;

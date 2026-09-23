@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { AddressSlot, CloudAuthorization, CloudTargetSummary } from "./cloud-types";
-import { authorizationPayload, cloudTargetLabel, cloudTargetAddresses, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
+import { authorizationPayload, cloudAddressView, cloudInstanceMatches, cloudInventoryNotice, cloudTargetLabel, cloudTargetAddresses, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
+import { demoCloudInstances } from "./cloud-demo";
 import { createIntentKey } from "./intent-key";
 
 it("identifies cloud targets and distinguishes candidate IPv6 from the current address", () => {
@@ -16,6 +17,26 @@ it("identifies cloud targets and distinguishes candidate IPv6 from the current a
   expect(cloudTargetAddresses({ ...target, candidateAddress: target.currentAddress })).toBe("IPv6 · 待验证 2001:db8::1");
   expect(cloudTargetAddresses({ ...target, slot: { ...target.slot, currentVersion: 0 }, candidateAddress: null })).toBe("IPv6 · 当前待验证 2001:db8::1");
   expect(cloudTargetAddresses({ ...target, currentAddress: null, candidateAddress: null })).toBe("IPv6 · 暂无当前地址");
+  expect(cloudTargetAddresses({ ...target, inventoryCurrent: false, currentAddressObserved: true, candidateAddressObserved: false, available: false })).toBe("IPv6 · 当前云地址 2001:db8::1 · 历史候选 2001:db8::2");
+  expect(cloudTargetAddresses({ ...target, inventoryCurrent: true, currentAddressObserved: false, candidateAddressObserved: true })).toBe("IPv6 · 原地址（历史） 2001:db8::1 · 候选待验证 2001:db8::2");
+});
+
+it("shows the latest known address with an explicit history label when current inventory is empty", () => {
+  const addresses = [
+    { id: "old", address: "192.0.2.1", family: "4" as const, scanGeneration: 1, isCurrent: false },
+    { id: "latest", address: "192.0.2.2", family: "4" as const, scanGeneration: 2, isCurrent: false },
+  ];
+  expect(cloudAddressView(addresses)).toEqual({ addresses: [addresses[1]], mode: "last_known" });
+  expect(cloudAddressView(addresses, true)).toEqual({ addresses, mode: "last_known" });
+  expect(cloudInventoryNotice({ status: "absent", lastError: null }, "last_known")).toContain("最近已知");
+  expect(cloudInventoryNotice({ status: "current", lastError: "permission_denied" }, "current")).toContain("同步失败");
+  expect(cloudAddressView([...addresses, { id: "current", address: "192.0.2.3", family: "4", scanGeneration: 3, isCurrent: true }])).toMatchObject({ addresses: [{ address: "192.0.2.3" }], mode: "current" });
+});
+it("finds an instance by the last-known IP shown in its inventory row", () => {
+  const row = { ...demoCloudInstances[0]!, addresses: [], lastKnownAddresses: [{ id: "last", address: "192.0.2.25", family: "4" as const, isCurrent: false }] };
+  expect(cloudInstanceMatches(row, "192.0.2.25")).toBe(true);
+  expect(cloudInstanceMatches(row, "192.0.2.26")).toBe(false);
+  expect(cloudInstanceMatches({ ...row, addresses: [{ id: "current", address: "192.0.2.26", family: "4", isCurrent: true }] }, "192.0.2.26")).toBe(true);
 });
 
 const slot = (overrides: Partial<AddressSlot> = {}): AddressSlot => ({

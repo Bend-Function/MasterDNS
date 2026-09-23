@@ -413,9 +413,11 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
       const c = await lockRotationContext(tx, identity.slotId);
       const [p] = await tx.select().from(rotationPublications).where(eq(rotationPublications.id, id)).for("update");
       if (!p?.promotedAt) return;
+      let releaseOldAddress = false;
       if (p.incidentId) {
         const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId)).for("update");
         if (incident?.terminatedAt) return;
+        releaseOldAddress = incident?.releaseOldAddress ?? false;
       }
       if (c.addressVersion !== p.addressVersion || c.address?.id !== p.addressId) throw new Error("publication_version_changed");
       let done = true,
@@ -501,7 +503,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           for (const resource of resources) {
             const releasable =
               resource.address !== c.address!.address &&
-              (resource.origin === "system" || c.authorization?.allowReleaseAddress) &&
+              (resource.origin === "system" || releaseOldAddress || c.authorization?.allowReleaseAddress) &&
               (resource.allocationId || (c.instance.service === "ec2" && c.slot.family === "6"));
             if (releasable && resource.cleanupStatus !== "released")
               await tx

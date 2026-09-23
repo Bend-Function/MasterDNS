@@ -31,6 +31,9 @@ describe("effective cloud health", () => {
   it("invalidates healthy evidence for a target missing from the current inventory", () => {
     expect(healthPolicyDisplay({ ...policy, cloudTarget: { ...policy.cloudTarget!, inventoryCurrent: false, activeCandidate: false, available: false } }, group, now)).toMatchObject({ status: "unknown" });
   });
+  it("keeps stale candidate evidence unknown even while its current address is observed", () => {
+    expect(healthPolicyDisplay({ ...policy, cloudTarget: { ...policy.cloudTarget!, inventoryCurrent: false, currentAddressObserved: true, candidateAddressObserved: false, activeCandidate: false, available: false } }, group, now)).toMatchObject({ status: "unknown", reason: expect.stringContaining("当前云地址仍存在") });
+  });
 });
 
 describe("ordinary endpoint address families", () => {

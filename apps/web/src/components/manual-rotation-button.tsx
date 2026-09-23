@@ -101,6 +101,7 @@ export function ManualRotationButton({ account, instance, slot, savedAuthorizati
           <dt>换址次数</dt><dd>1 次</dd>
           <dt>绑定 DNS</dt><dd>更新到换址后的 IPv4</dd>
           <dt>外部验证</dt><dd>不执行</dd>
+          <dt>旧公网 IP</dt><dd>接管完成且旧 DNS 缓存期限结束后自动释放，不保留备用</dd>
         </dl>
       </div>}
     </Dialog>

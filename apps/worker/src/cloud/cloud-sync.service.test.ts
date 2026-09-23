@@ -85,6 +85,10 @@ describe("complete cloud scope sync", () => {
     f.item.interfaces[0]!.addresses[0]!.address = "192.0.2.40";
     await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
     expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot.id)))[0]).toMatchObject({ currentAddressId: slot.currentAddressId, candidateAddressId: null, candidateVersion: 0 });
+    const observed = await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.interfaceId, slot.interfaceId));
+    expect(observed.filter(address => address.scanGeneration === 2).map(address => address.address)).toEqual(["192.0.2.40"]);
+    const { getCloudTargetsForSlots } = await import("@masterdns/db");
+    expect((await getCloudTargetsForSlots(connection.db, [slot.id])).get(slot.id)).toMatchObject({ currentAddressObserved: false, candidateAddressObserved: false, available: false });
   });
 
   it("invalidates historical secondary-slot health in the successful scan transaction", async () => {

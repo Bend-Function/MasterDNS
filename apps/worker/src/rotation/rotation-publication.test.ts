@@ -459,7 +459,7 @@ it("cloud policy restore preserves stable links, discards old evidence and requi
 import { RotationStore } from "./rotation-store.js";
 import { RotationProcessor } from "./rotation.processor.js";
 import { RotationCleanupService } from "./rotation-cleanup.service.js";
-it("runs one allocation through partial DNS publication and schedules cleanup only after all providers plus old automatic TTL grace", async () => {
+it.each(["system", "user"] as const)("runs one allocation and cleans the old %s IP only after all providers plus TTL grace", async (origin) => {
   const f = await dnsFixture();
   f.state.failSecond = false;
   await f.service.publishSlot(f.slot.id);
@@ -471,7 +471,7 @@ it("runs one allocation through partial DNS publication and schedules cleanup on
   await f.d.update(db.dnsRecords).set({ ttl: 1 }).where(eq(db.dnsRecords.zoneId, f.bindings[0]!.zoneId));
   await f.d
     .update(db.cloudAddresses)
-    .set({ remoteAllocationId: "eipalloc-old", origin: "system", attemptId: randomUUID() })
+    .set({ remoteAllocationId: "eipalloc-old", origin, attemptId: origin === "system" ? randomUUID() : null })
     .where(eq(db.cloudAddresses.id, f.address.id));
   Object.assign(f.live.interfaces[0]!.addresses[0]!, { allocationId: "eipalloc-old", privateAddress: "10.0.0.1" });
   await f.d

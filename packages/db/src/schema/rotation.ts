@@ -24,6 +24,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     physicalKey: text("physical_key").notNull(),
     sourceEventId: varchar("source_event_id", { length: 255 }).notNull(),
     trigger: varchar("trigger", { length: 16 }).$type<"health" | "manual">().notNull().default("health"),
+    releaseOldAddress: boolean("release_old_address").notNull().default(false),
     status: varchar("status", { length: 16 }).$type<"active" | "paused" | "exhausted" | "complete">().notNull().default("active"),
     phase: varchar("phase", { length: 16 }).$type<"cloud" | "candidate" | "publish" | "cleanup" | "complete">().notNull().default("cloud"),
     currentSegmentId: uuid("current_segment_id").notNull(),
