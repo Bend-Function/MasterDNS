@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
+import { terminateRotationIncident } from "@masterdns/db";
 import * as db from "@masterdns/db";
 import { fixture } from "./rotation-test-utils.js";
 import { RotationCleanupService } from "./rotation-cleanup.service.js";
@@ -94,6 +95,29 @@ it("retains original user addresses without independent release authorization", 
   const f = await cleanupFixture("user");
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(0);
+});
+it("terminates stuck cleanup permanently, including stale jobs and late failure handlers", async () => {
+  const f = await cleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  await f.d.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.account.ownerUserId));
+  await (f.cleanup as any).receipt(f.resource, `cleanup:${f.resource.id}`, { status: "applied", allocationId: "eipalloc-old" }, true);
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.complete(f.incident.id);
+  expect(f.state.writes).toBe(1);
+  expect(f.state.observations).toBe(0);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "retained", cleanupDueAt: null });
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+});
+it("does not resurrect cleanup when termination happens during cloud inspection", async () => {
+  const f = await cleanupFixture();
+  f.state.beforeInspect = async () => {
+    await f.d.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.account.ownerUserId));
+    throw new Error("late_network_failure");
+  };
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(0);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "retained", cleanupDueAt: null, cleanupError: "manual_terminated" });
 });
 it("defers cleanup without dispatch or unresolved effects when the shared budget is cooling down", async () => {
   const f = await cleanupFixture();

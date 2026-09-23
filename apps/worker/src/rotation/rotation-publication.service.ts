@@ -81,6 +81,7 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
   const [incident] = publication?.incidentId
     ? await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, publication.incidentId)).for("update") : [];
   const manual = incident?.trigger === "manual";
+  if (incident?.terminatedAt) throw new Error("manual_terminated");
   if (!manual && !h.success) throw new Error("fresh_external_success_required");
   if (publication && (publication.addressId !== c.address?.id || publication.addressVersion !== c.addressVersion))
     throw new Error("publication_version_changed");
@@ -169,6 +170,8 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
     for (const slotId of new Set(missing.map((row) => row.slotId)))
       await this.database.db.transaction(async (tx) => {
         const c = await lockRotationContext(tx, slotId);
+        const [terminated] = await tx.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(eq(rotationIncidents.slotId, slotId), sql`${rotationIncidents.terminatedAt} is not null`, eq(rotationIncidents.addressVersion, c.addressVersion)));
+        if (terminated) return;
         if (c.slot.candidateAddressId || !c.slot.currentAddressId) return;
         const [active] = await tx
           .select({ id: rotationIncidents.id })
@@ -206,7 +209,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
     const pending = await this.database.db
       .select()
       .from(rotationPublications)
-      .where(and(ne(rotationPublications.status, "applied"), sql`${rotationPublications.promotedAt} is not null`))
+      .where(and(ne(rotationPublications.status, "applied"), sql`${rotationPublications.promotedAt} is not null`, sql`${rotationPublications.errorCode} is distinct from 'manual_terminated'`))
       .orderBy(asc(rotationPublications.updatedAt), asc(rotationPublications.id))
       .limit(200);
     for (const p of pending) {
@@ -231,6 +234,8 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
   async publishSlot(slotId: string, incidentId?: string) {
     const admission = await this.database.db.transaction(async (tx) => {
       const c = await lockRotationContext(tx, slotId);
+      const [terminated] = await tx.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(eq(rotationIncidents.slotId, slotId), sql`${rotationIncidents.terminatedAt} is not null`, eq(rotationIncidents.addressVersion, c.addressVersion)));
+      if (terminated) return {};
       const [existing] = await tx
         .select()
         .from(rotationPublications)
@@ -399,6 +404,10 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
       const c = await lockRotationContext(tx, identity.slotId);
       const [p] = await tx.select().from(rotationPublications).where(eq(rotationPublications.id, id)).for("update");
       if (!p?.promotedAt) return;
+      if (p.incidentId) {
+        const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId)).for("update");
+        if (incident?.terminatedAt) return;
+      }
       if (c.addressVersion !== p.addressVersion || c.address?.id !== p.addressId) throw new Error("publication_version_changed");
       let done = true,
         failed = p.errorCode === "dns_partial",

@@ -169,6 +169,13 @@
       "when": 1789948924527,
       "tag": "0023_cloud_rotation_limits",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1790152248181,
+      "tag": "0024_rotation_termination",
+      "breakpoints": true
     }
   ]
 }

@@ -273,6 +273,13 @@ describe("durable notification state scanning", () => {
 
     expect(queues.events.find((event) => event.payload.incidentId === fixture.incidentId)?.eventType).toBe("rotation.cleanup_completed");
   });
+  it("reports user termination separately from successful completion", async () => {
+    const fixture = await rotationFixture({ status: "complete", phase: "cleanup" });
+    await connection.db.update(rotationIncidents).set({ terminatedAt: new Date(), errorCode: "manual_terminated" }).where(eq(rotationIncidents.id, fixture.incidentId));
+    const queues = fakeQueues();
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+    expect(queues.events.find(event => event.payload.incidentId === fixture.incidentId)?.eventType).toBe("rotation.terminated");
+  });
 });
 
 async function healthFixture(input: {

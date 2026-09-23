@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy } from "@masterdns/db";
+import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy, wakeCloudRotationLimitWaits } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, eq } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
@@ -40,15 +40,15 @@ export class CloudService {
     });
   }
 
-  async setRotationLimits(actor: AuthUser, id: string, serviceName: string, input: { utilizationPercent: number }) {
-    const { utilizationPercent } = cloudRotationLimitPolicySchema.parse(input);
-    return this.database.db.transaction(async (tx) => {
+  async setRotationLimits(actor: AuthUser, id: string, serviceName: string, input: { utilizationPercent: number; enabled?: boolean }) {
+    const { utilizationPercent, enabled } = cloudRotationLimitPolicySchema.parse(input);
+    const result = await this.database.db.transaction(async (tx) => {
       const [account] = await tx.select().from(cloudAccounts).where(and(eq(cloudAccounts.id, id), actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id))).for("update");
       if (!account) throw new NotFoundException("Cloud account not found");
       const service = this.rotationLimitService(account.provider, serviceName);
       if (!account.externalAccountId) throw new ConflictException("Cloud account identity must be verified before configuring rotation limits");
       const before = await getCloudRotationLimitStatus(tx, account.id, service);
-      const after = await setCloudRotationLimitPolicy(tx, account.id, service, utilizationPercent);
+      const after = await setCloudRotationLimitPolicy(tx, account.id, service, utilizationPercent, enabled);
       await tx.insert(auditLogs).values({
         ownerUserId: account.ownerUserId,
         actorUserId: actor.id,
@@ -61,6 +61,8 @@ export class CloudService {
       });
       return after;
     });
+    if (enabled === false) await this.database.db.transaction(tx => wakeCloudRotationLimitWaits(tx, id, result.service));
+    return result;
   }
 
   async create(actor: AuthUser, input: CreateCloudAccountInput, idempotencyKey: string) {
@@ -288,8 +290,8 @@ export class CloudService {
   }
 }
 
-function rotationLimitAuditSnapshot(status: { service: CloudServiceName; utilizationPercent: number; effectivePercent: number }) {
-  return { service: status.service, utilizationPercent: status.utilizationPercent, effectivePercent: status.effectivePercent };
+function rotationLimitAuditSnapshot(status: { enabled?: boolean; service: CloudServiceName; utilizationPercent: number; effectivePercent: number }) {
+  return { enabled: status.enabled ?? true, service: status.service, utilizationPercent: status.utilizationPercent, effectivePercent: status.effectivePercent };
 }
 
 function providerMetadata(metadata: Record<string, unknown>): Record<string, unknown> {

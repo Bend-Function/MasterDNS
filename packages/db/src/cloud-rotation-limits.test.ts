@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { createDatabase } from "./index.js";
+import { terminateRotationIncident } from "./rotation-termination.js";
 import { getCloudRotationLimitStatus, recordCloudRotationThrottle, reserveCloudRotationWrite, setCloudRotationLimitPolicy } from "./cloud-rotation-limits.js";
 
 let admin: ReturnType<typeof createDatabase>;
@@ -25,6 +26,28 @@ async function account(provider = "aws", externalId = randomUUID()) {
   return row!.id as string;
 }
 const reserve = (accountId: string, action = "ec2.eip.allocate", service: "ec2" | "lightsail" | "linode" | "azure_vm" = "ec2", region = "us-east-1", stepId: string = randomUUID(), remainingSteps?: Array<{ id: string; action: string }>) => connection.db.transaction(tx => reserveCloudRotationWrite(tx, { accountId, action, service, region, stepId, ...(remainingSteps ? { remainingSteps } : {}) }));
+it("disables local limits across account aliases without resetting usage or bypassing vendor cooldown", async () => {
+  const external = randomUUID();
+  const a = await account("linode", external), b = await account("linode", external);
+  await connection.db.transaction(tx => setCloudRotationLimitPolicy(tx, a, "linode", 1, false));
+  for (let index = 0; index < 20; index++) expect(await reserve(b, "linode.ipv4.allocate", "linode")).toEqual({ allowed: true });
+  expect(await connection.db.transaction(tx => getCloudRotationLimitStatus(tx, b, "linode"))).toMatchObject({ enabled: false, usage: [expect.objectContaining({ used: 20, retryAt: null })] });
+  await connection.db.transaction(tx => setCloudRotationLimitPolicy(tx, a, "linode", 1, true));
+  expect(await reserve(b, "linode.ipv4.allocate", "linode")).toMatchObject({ allowed: false });
+  await connection.db.transaction(tx => setCloudRotationLimitPolicy(tx, a, "linode", 1, false));
+  await connection.db.transaction(tx => recordCloudRotationThrottle(tx, { accountId: a, service: "linode", region: "us-east", action: "linode.ipv4.allocate", stepId: randomUUID() }));
+  expect(await reserve(b, "linode.ipv4.allocate", "linode")).toMatchObject({ allowed: false, ruleId: "cooldown" });
+});
+it("allows Lightsail chains with limits off and termination releases only unused reservations", async () => {
+  const id = await account();
+  await connection.db.transaction(tx => setCloudRotationLimitPolicy(tx, id, "lightsail", 1, false));
+  const plan = await lightsailPlan(id);
+  expect(await plan.dispatch()).toEqual({ allowed: true });
+  expect((await connection.db.transaction(tx => getCloudRotationLimitStatus(tx, id, "lightsail"))).usage.find(row => row.ruleId === "lightsail.static-ip.hour")).toMatchObject({ used: 3 });
+  await connection.db.transaction(tx => terminateRotationIncident(tx, plan.incidentId, ownerId));
+  expect((await connection.db.transaction(tx => getCloudRotationLimitStatus(tx, id, "lightsail"))).usage.find(row => row.ruleId === "lightsail.static-ip.hour")).toMatchObject({ used: 1 });
+  expect(await connection.client`select step_id from cloud_rotation_reservations where step_id in (${plan.steps[1]!.id},${plan.steps[2]!.id})`).toHaveLength(0);
+});
 it("serializes concurrent requests and shares real account budgets across local copies and regions for global windows", async () => {
   const external = randomUUID(); const a = await account("linode", external); const b = await account("linode", external);
   await connection.db.transaction(tx => setCloudRotationLimitPolicy(tx, a, "linode", 1));

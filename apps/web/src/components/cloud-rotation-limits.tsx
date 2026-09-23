@@ -1,5 +1,6 @@
 import type { CloudService } from "@masterdns/contracts/cloud";
 import type { CloudRotationLimitRule, CloudRotationLimitStatus } from "@masterdns/contracts/cloud-rotation-limits";
+import { Switch } from "./ui";
 import { formatDate } from "../lib/api";
 import { cloudServiceLabel } from "../lib/cloud-ui";
 
@@ -9,24 +10,28 @@ export function parseRotationLimitPercent(value: string): number | null {
   return Number.isInteger(parsed) && parsed >= 1 && parsed <= 100 ? parsed : null;
 }
 
-export function CloudRotationLimits({ services, service, status, utilizationPercent, disabled, onServiceChange, onUtilizationPercentChange }: {
+export function CloudRotationLimits({ services, service, status, utilizationPercent, enabled = true, onEnabledChange, disabled, onServiceChange, onUtilizationPercentChange }: {
   services: readonly CloudService[];
   service: CloudService;
   status: CloudRotationLimitStatus | null;
   utilizationPercent: string;
+  enabled?: boolean;
+  onEnabledChange?: (enabled: boolean) => void;
   disabled: boolean;
   onServiceChange: (service: CloudService) => void;
   onUtilizationPercentChange: (value: string) => void;
 }) {
   return <div className="rotation-limit-settings">
+    <div className="switch-row"><span>启用换址限额</span><Switch checked={enabled} disabled={disabled} label="启用换址限额" onCheckedChange={value => onEnabledChange?.(value)} /></div>
+    {!enabled && <p className="inline-warning">本地限额已关闭；仍记录用量并遵守云厂商限流。此开关适用于同一远端账号和云服务的所有凭证入口。</p>}
     {services.length > 1 && <div className="segmented" aria-label="云服务">{services.map((option) => <button key={option} type="button" className={option === service ? "active" : ""} aria-pressed={option === service} disabled={disabled} onClick={() => onServiceChange(option)}>{cloudServiceLabel(option)}</button>)}</div>}
-    <label className="field"><span>使用官方额度</span><div className="rotation-percent-input"><input type="number" min={1} max={100} step={1} required inputMode="numeric" value={utilizationPercent} disabled={disabled} onChange={(event) => onUtilizationPercentChange(event.target.value)} /><span>%</span></div><small>默认 80%，必须填写 1–100 的整数，不能关闭。</small></label>
+    <label className="field"><span>使用官方额度</span><div className="rotation-percent-input"><input type="number" min={1} max={100} step={1} required inputMode="numeric" value={utilizationPercent} disabled={disabled} onChange={(event) => onUtilizationPercentChange(event.target.value)} /><span>%</span></div><small>默认 80%，填写 1–100 的整数；关闭开关后本地比例和窗口不拦截请求。</small></label>
     {status && <>
       <div className="rotation-limit-summary"><span>当前设置 <strong>{status.utilizationPercent}%</strong></span><span>共享生效 <strong>{status.effectivePercent}%</strong></span></div>
       {status.effectivePercent < status.utilizationPercent && <p className="inline-warning">同一远端账号还有更低的设置，当前按 {status.effectivePercent}% 生效。</p>}
       <div className="table-wrap rotation-limit-table"><table><thead><tr><th>规则</th><th>范围</th><th>官方基准</th><th>本地生效</th><th>最近用量 / 可重试</th></tr></thead><tbody>{status.rules.map((rule) => {
         const usage = status.usage.filter((entry) => entry.ruleId === rule.id);
-        return <tr key={rule.id}><td><div className="table-primary"><strong>{ruleLabel(rule)}</strong><small>{rule.operations.join(" / ")}</small></div></td><td>{rule.scope === "global" ? "远端账号全局" : "按区域"}</td><td>{ruleValue(rule, true)}</td><td>{ruleValue(rule, false)}</td><td>{usage.length ? <div className="table-primary">{usage.map((entry) => <span key={`${entry.ruleId}:${entry.region ?? "global"}`}><strong>{entry.region ?? "全局"} · 已用 {formatCount(entry.used)}，剩余 {formatCount(entry.remaining)}</strong>{entry.retryAt && <small>可重试 {formatDate(entry.retryAt)}</small>}</span>)}</div> : <span className="muted">尚无消耗</span>}</td></tr>;
+        return <tr key={rule.id}><td><div className="table-primary"><strong>{ruleLabel(rule)}</strong><small>{rule.operations.join(" / ")}</small></div></td><td>{rule.scope === "global" ? "远端账号全局" : "按区域"}</td><td>{ruleValue(rule, true)}</td><td>{status.enabled === false ? "已关闭" : ruleValue(rule, false)}</td><td>{usage.length ? <div className="table-primary">{usage.map((entry) => <span key={`${entry.ruleId}:${entry.region ?? "global"}`}><strong>{entry.region ?? "全局"} · 已用 {formatCount(entry.used)}，剩余 {formatCount(entry.remaining)}</strong>{entry.retryAt && <small>可重试 {formatDate(entry.retryAt)}</small>}</span>)}</div> : <span className="muted">尚无消耗</span>}</td></tr>;
       })}</tbody></table></div>
     </>}
     <div className="rotation-limit-notes">

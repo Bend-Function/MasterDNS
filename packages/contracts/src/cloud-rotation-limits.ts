@@ -1,14 +1,14 @@
 import { z } from "zod";
 import type { CloudService } from "./cloud.js";
 
-export const cloudRotationLimitPolicySchema = z.object({ utilizationPercent: z.number().int().min(1).max(100) }).strict();
+export const cloudRotationLimitPolicySchema = z.object({ utilizationPercent: z.number().int().min(1).max(100), enabled: z.boolean().optional() }).strict();
 export type CloudRotationLimitRule = {
   id: string; name: string; scope: "region" | "global"; operations: string[];
   kind: "token_bucket" | "sliding_window"; officialCapacity: number; capacity: number;
   officialRefillPerSecond: number | null; refillPerSecond: number | null; windowSeconds: number | null;
 };
 export type CloudRotationLimitUsage = { ruleId: string; region: string | null; used: number; remaining: number; retryAt: string | null };
-export type CloudRotationLimitStatus = { service: CloudService; utilizationPercent: number; effectivePercent: number; rules: CloudRotationLimitRule[]; usage: CloudRotationLimitUsage[] };
+export type CloudRotationLimitStatus = { enabled?: boolean; service: CloudService; utilizationPercent: number; effectivePercent: number; rules: CloudRotationLimitRule[]; usage: CloudRotationLimitUsage[] };
 
 const actions: Record<CloudService, Record<string, string>> = {
   ec2: {

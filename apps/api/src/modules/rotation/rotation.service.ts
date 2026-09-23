@@ -2,6 +2,7 @@ import { rotationDisplay } from "./rotation-display.js";
 import { getCloudTargetsForSlots } from "@masterdns/db";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq } from "drizzle-orm";
+import { terminateRotationIncident } from "@masterdns/db";
 import { auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, createManualRotationIncident, createRotationIncident, databaseNow, lockRotationContext, lockRotationHealth, managedAddressSlots, resumeRotationIncident, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, type RotationTransaction } from "@masterdns/db";
 import { randomUUID } from "node:crypto";
 import { DatabaseService } from "../../infrastructure/database.module.js";
@@ -71,6 +72,10 @@ export class RotationService {
     const display = await this.database.db.transaction(tx => rotationDisplay(tx, incident.slotId));
     const targets = await getCloudTargetsForSlots(this.database.db, [incident.slotId]);
     return { incident: { ...incident, cloudTarget: targets.get(incident.slotId) ?? null }, segments, attempts, steps, resources, publications, ...display };
+  }
+  async terminate(actor: AuthUser, id: string) {
+    await this.ownedIncident(actor, id);
+    return this.transaction(tx => terminateRotationIncident(tx, id, actor.id));
   }
   async pause(actor: AuthUser, id: string) {
     const owned = await this.ownedIncident(actor, id);

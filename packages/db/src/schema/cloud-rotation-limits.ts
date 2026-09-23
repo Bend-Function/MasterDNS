@@ -1,7 +1,12 @@
 import { sql } from "drizzle-orm";
-import { check, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uuid, varchar, type AnyPgColumn } from "drizzle-orm/pg-core";
+import { boolean, check, doublePrecision, index, integer, jsonb, pgTable, primaryKey, text, timestamp, uuid, varchar, type AnyPgColumn } from "drizzle-orm/pg-core";
 import { cloudServiceEnum } from "./cloud.js";
 export function defineCloudRotationLimitSchema(deps: { accountId: () => AnyPgColumn; stepId: () => AnyPgColumn }) {
+  const cloudRotationLimitSwitches = pgTable("cloud_rotation_limit_switches", {
+    identityKey: text("identity_key").primaryKey(),
+    enabled: boolean("enabled").notNull().default(true),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  });
   const cloudRotationLimitPolicies = pgTable("cloud_rotation_limit_policies", {
     accountId: uuid("account_id").notNull().references(deps.accountId, { onDelete: "cascade" }),
     service: cloudServiceEnum("service").notNull(),
@@ -23,5 +28,5 @@ export function defineCloudRotationLimitSchema(deps: { accountId: () => AnyPgCol
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     consumedAt: timestamp("consumed_at", { withTimezone: true }),
   }, t => [index("cloud_rotation_reservations_identity_idx").on(t.identityKey)]);
-  return { cloudRotationLimitPolicies, cloudRotationBuckets, cloudRotationReservations };
+  return { cloudRotationLimitPolicies, cloudRotationBuckets, cloudRotationReservations, cloudRotationLimitSwitches };
 }

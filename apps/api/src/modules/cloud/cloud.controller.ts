@@ -21,7 +21,7 @@ export class CloudController {
   @Get("cloud-accounts/:id/scopes") scopes(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.scopes(actor, id); }
   @Get("cloud-accounts/:id/instances") instances(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.instances(actor, id); }
   @Get("cloud-accounts/:id/rotation-limits/:service") rotationLimits(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Param("service") service: string) { return this.cloud.rotationLimits(actor, id, service); }
-  @Patch("cloud-accounts/:id/rotation-limits/:service") setRotationLimits(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Param("service") service: string, @ZodBody(cloudRotationLimitPolicySchema) input: { utilizationPercent: number }) { return this.cloud.setRotationLimits(actor, id, service, input); }
+  @Patch("cloud-accounts/:id/rotation-limits/:service") setRotationLimits(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Param("service") service: string, @ZodBody(cloudRotationLimitPolicySchema) input: { utilizationPercent: number; enabled?: boolean }) { return this.cloud.setRotationLimits(actor, id, service, input); }
   @Get("cloud-instances/:id") instance(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.instance(actor, id); }
   @Get("cloud-instances/:id/traffic") traffic(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.monthlyTraffic(actor, id); }
   @Get("address-slots") slots(@CurrentUser() actor: AuthUser, @Query("instanceId", ParseUUIDPipe) id: string) { return this.cloud.slots(actor, id); }

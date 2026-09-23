@@ -242,7 +242,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, input.endpointId!), eq(cloudEndpointLinks.family, c.slot.family)));
         const [owner] = await tx.select().from(endpointPools).where(eq(endpointPools.id, input.poolId!));
         const [publication] = typeof input.cloud?.publicationId === "string" ? await tx.select().from(rotationPublications).where(eq(rotationPublications.id, input.cloud.publicationId)) : [];
-        if (!publication || publication.slotId !== c.slot.id || publication.addressVersion !== c.addressVersion) throw new ProviderError("Cloud publication is missing or superseded", "validation_failed", adapter.provider);
+        if (!publication || publication.errorCode === "manual_terminated" || publication.slotId !== c.slot.id || publication.addressVersion !== c.addressVersion) throw new ProviderError("Cloud publication is missing or superseded", "validation_failed", adapter.provider);
         const h = await assertPublicationContext(tx, c, publication.context?.manualIncidentId || publication.status !== "applied" ? publication : undefined);
         const current = live && livePublicationMatches(c, live)
           && c.account.credentialCiphertext === cloud.account.credentialCiphertext

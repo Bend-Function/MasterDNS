@@ -61,3 +61,4 @@ export * from "./pool-health.js";
 export * from "./cloud-targets.js";
 
 export * from "./cloud-rotation-limits.js";
+export * from "./rotation-termination.js";

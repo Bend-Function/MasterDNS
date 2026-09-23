@@ -102,6 +102,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!incident) return;
       const c = await lockRotationContext(tx, incident.slotId);
+      const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id)).for("update");
+      if (lockedIncident?.terminatedAt) return;
       const identity = cleanupIdentity(r);
       if (identity && !r.cleanupStepId) {
         const aliases = (await tx.select().from(rotationResources).where(eq(rotationResources.incidentId, incident.id)).orderBy(asc(rotationResources.createdAt), asc(rotationResources.id)))
@@ -240,6 +242,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       // P11c's durable scanner is the only notification/routing authority.
       await this.database.db.transaction(async (tx) => {
         await lockRotationContext(tx, c.slot.id);
+        const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId)).for("update");
+        if (incident?.terminatedAt) return;
         const failed = await tx
           .update(rotationResources)
           .set({
@@ -392,6 +396,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!incident) return;
       const context = await lockRotationContext(tx, incident.slotId);
+      const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id)).for("update");
+      if (lockedIncident?.terminatedAt) {
+        await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result } });
+        return;
+      }
       const [resource] = await tx.select().from(rotationResources).where(eq(rotationResources.id, r.id)).for("update");
       if (!resource) return;
       const chain = await this.chain(tx, resource, true);
@@ -479,6 +488,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       const [i] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!i) return;
       const c = await lockRotationContext(tx, i.slotId);
+      const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, i.id)).for("update");
+      if (lockedIncident?.terminatedAt) return;
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.status !== "in_flight") return;
       if (code === "rate_limited") {
@@ -498,6 +509,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       const [i] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incidentId));
       if (!i || i.phase !== "cleanup" || i.status === "complete") return;
       const c = await lockRotationContext(tx, i.slotId);
+      const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, i.id)).for("update");
+      if (lockedIncident?.terminatedAt) return;
       const [physical] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey)).for("update");
       if (physical?.unresolvedStepId) return;
       const remaining = await tx

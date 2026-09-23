@@ -31,6 +31,7 @@ export type RotationIncident = {
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;
+  terminatedAt?: string | null;
 };
 
 export type RotationDetail = {

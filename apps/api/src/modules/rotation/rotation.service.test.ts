@@ -42,6 +42,20 @@ it("returns opt-in policy defaults and enforces revision and external threshold 
   expect(await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }))).toMatchObject({ enabled: true, revision: 1 });
   await expect(service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0 }))).rejects.toMatchObject({ status: 409 });
 });
+it("permanently terminates a rotation and disables retriggering without deleting history", async () => {
+  const f = await fixture();
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, enabled: true }));
+  const incident = await service.start(f.actor, f.slot.id, randomUUID());
+  const foreign = await fixture();
+  await expect(service.terminate(foreign.actor, incident.id)).rejects.toMatchObject({ status: 404 });
+  const terminated = await service.terminate(f.actor, incident.id);
+  expect(terminated).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+  expect(terminated.terminatedAt).toBeInstanceOf(Date);
+  expect(await service.terminate(f.actor, incident.id)).toMatchObject({ terminatedAt: terminated.terminatedAt });
+  expect(await service.policy(f.actor, f.slot.id)).toMatchObject({ enabled: false });
+  await expect(service.resume(f.actor, incident.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  expect((await service.list(f.actor)).map(row => row.id)).toContain(incident.id);
+});
 it("requires Idempotency-Key at the controller and derives the failure source on the server", async () => {
   const f = await fixture(); const controller = new RotationController(service);
   expect(() => controller.start(f.actor, { slotId: f.slot.id })).toThrow("Idempotency-Key is required");

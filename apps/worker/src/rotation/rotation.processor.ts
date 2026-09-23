@@ -25,6 +25,7 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
     const lease = await this.store.claim(incidentId); if (!lease) return;
     try {
       const run = await this.store.read(incidentId, lease);
+      if (run.incident.terminatedAt) return;
       const action = run.action;
       if (run.incident.phase === "publish" || run.incident.phase === "cleanup") {
         if (run.incident.phase === "publish" && !run.publication?.promotedAt) {

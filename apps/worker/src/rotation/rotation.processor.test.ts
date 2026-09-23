@@ -38,6 +38,7 @@ import { RotationStore } from "./rotation-store.js";
 import { RotationProcessor } from "./rotation.processor.js";
 import { RotationRecoveryService } from "./rotation-recovery.service.js";
 import { RotationPublicationService } from "./rotation-publication.service.js";
+import { terminateRotationIncident } from "@masterdns/db";
 
 async function fixture(family: "4" | "6" = "4") {
   const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
@@ -78,6 +79,22 @@ async function fixture(family: "4" | "6" = "4") {
   return { owner: owner!, account: account!, instance: instance!, iface: iface!, address: address!, slot: slot!, config: config!, group: group!, healthPolicy: healthPolicy!, health: health!, incident, state, inventory, adapter, store, runtime, processor };
 }
 async function drive(f: Awaited<ReturnType<typeof fixture>>, turns = 5) { for (let n = 0; n < turns; n++) await f.processor.run(f.incident.id); }
+it("keeps terminated rotations terminal after late receipts, queue replay and recovery", async () => {
+  const f = await fixture();
+  await drive(f, 2);
+  const [step] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, f.state.writes[0]!));
+  await connection.db.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.owner.id));
+  await f.store.saveReceipt(f.incident.id, step!.id, { ...f.state.effect!, status: "applied" } as never, true);
+  await f.store.pause(f.incident.id, "late_error");
+  await drive(f, 3);
+  const jobs: string[] = [];
+  const recovery = new RotationRecoveryService({ db: connection.db } as never, { rotation: { add: async (_name: string, data: { incidentId: string }) => jobs.push(data.incidentId) } } as never);
+  await recovery.recover();
+  expect(jobs).not.toContain(f.incident.id);
+  expect(f.state.writes).toHaveLength(1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+});
 async function evidence(f: Awaited<ReturnType<typeof fixture>>, decision: "success" | "failure" | "unknown", version?: number) {
   const [slot] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id));
   await connection.db.update(addressHealthStates).set({ addressId: slot!.candidateAddressId ?? slot!.currentAddressId, addressVersion: version ?? (slot!.candidateAddressId ? slot!.candidateVersion : slot!.currentVersion), healthState: decision === "success" ? "healthy" : decision === "failure" ? "unhealthy" : "unknown", latestDecision: decision, consecutiveFailures: decision === "failure" ? 3 : 0, consecutiveSuccesses: decision === "success" ? 3 : 0, lastAppliedSequence: 10, lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000), lastRoundId: randomUUID() }).where(eq(addressHealthStates.id, f.health.id));

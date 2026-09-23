@@ -95,4 +95,12 @@ describe("cloud account rotation-limit API service", () => {
     await expect(service.setRotationLimits(f.owner, f.account.id, "ec2", { utilizationPercent: 0 })).rejects.toThrow();
     await expect(service.rotationLimits(f.owner, f.account.id, "ec2")).resolves.toMatchObject({ utilizationPercent: 80 });
   });
+  it("persists the shared off switch through the API and audits the change", async () => {
+    const f = await fixture();
+    expect(await service.setRotationLimits(f.owner, f.account.id, "lightsail", { utilizationPercent: 80, enabled: false })).toMatchObject({ enabled: false });
+    expect(await service.rotationLimits(f.owner, f.account.id, "lightsail")).toMatchObject({ enabled: false });
+    expect(await service.rotationLimits(f.owner, f.account.id, "ec2")).toMatchObject({ enabled: true });
+    const rows = await connection.db.select().from(auditLogs).where(eq(auditLogs.resourceId, f.account.id));
+    expect(rows[0]!.afterSnapshot).toMatchObject({ enabled: false });
+  });
 });

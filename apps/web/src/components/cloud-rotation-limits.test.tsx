@@ -18,6 +18,15 @@ const status: CloudRotationLimitStatus = {
 };
 
 describe("cloud rotation limit settings", () => {
+  it("shows disabled enforcement while keeping recorded usage visible", () => {
+    const html = renderToStaticMarkup(createElement(CloudRotationLimits, {
+      services: ["lightsail"], service: "lightsail", status: { ...status, enabled: false }, enabled: false,
+      utilizationPercent: "80", disabled: false, onServiceChange: () => undefined, onUtilizationPercentChange: () => undefined,
+    }));
+    expect(html).toContain('aria-checked="false"');
+    expect(html).toContain("已关闭");
+    expect(html).toContain("已用 1");
+  });
   it("renders service choice, policy boundaries, official/effective rules, usage and retry time", () => {
     const html = renderToStaticMarkup(createElement(CloudRotationLimits, {
       services: ["ec2", "lightsail"],

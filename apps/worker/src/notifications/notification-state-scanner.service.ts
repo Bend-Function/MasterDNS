@@ -254,6 +254,7 @@ function classifyRotation(
   resources: Array<Pick<typeof rotationResources.$inferSelect, "cleanupStatus">>,
   errorCodes: string[],
 ) {
+  if (incident.terminatedAt) return { eventType: "rotation.terminated", summary: `Rotation ${incident.id} was terminated by the user; remaining resources require manual review.` };
   if (resources.some((item) => item.cleanupStatus === "failed") || errorCodes.some((code) => /cleanup/.test(code))) {
     return { eventType: "rotation.cleanup_failed", summary: `Rotation ${incident.id} could not finish address cleanup.` };
   }

@@ -46,6 +46,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     createdAt: time("created_at").notNull().defaultNow(),
     updatedAt: time("updated_at").notNull().defaultNow(),
     completedAt: time("completed_at"),
+    terminatedAt: time("terminated_at"),
   }, t => [
     uniqueIndex("rotation_incidents_active_unique").on(t.slotId, t.family).where(sql`${t.status} <> 'complete'`),
     uniqueIndex("rotation_incidents_source_unique").on(t.slotId, t.sourceEventId),

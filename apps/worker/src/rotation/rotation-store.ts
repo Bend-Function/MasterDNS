@@ -65,6 +65,7 @@ export class RotationStore {
       cleanup: { status: "failed" }, // Completion remains with P10 after all required cleanup settles.
     };
     let action = nextRotationAction(snapshot, h.now.getTime());
+    if (incident.terminatedAt) return { c, incident, h, physical, budget, attempt, steps, snapshot, action: { kind: "wait" as const, reason: "instance_busy" as const }, publication };
     if (action.kind !== "observe") {
       if (incident.pausedByUserId) action = { kind: "wait", reason: "instance_busy" };
       else if (incident.status === "paused" && incident.phase === "cloud") action = { kind: "wait", reason: "instance_busy" };
@@ -144,6 +145,7 @@ export class RotationStore {
       const status = conflict ? "ambiguous" : step.status === "ambiguous" ? "ambiguous" : step.status === "applied" ? "applied" : observation ? (result as CloudObservation).status : "pending";
       await tx.update(rotationSteps).set({ receipt, status, updatedAt: now }).where(eq(rotationSteps.id, stepId));
       await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result }, createdAt: now });
+      if (incident.terminatedAt) return;
       if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.unresolvedStepId, stepId)));
       if (status === "applied" && !incident.pausedByUserId && ["rotation_runtime_failed", "cloud_convergence_timeout", "temporary_cloud_error"].includes(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null }).where(eq(rotationIncidents.id, id));
       if (status === "ambiguous") await this.pauseIn(tx, incident, "resource_ownership_ambiguous", now);
@@ -166,6 +168,7 @@ export class RotationStore {
   }
   async reject(id: string, stepId: string, code: string, noEffect: boolean, retryAfterMs?: number) {
     await this.transaction(id, async (tx, c, incident) => {
+      if (incident.terminatedAt) return;
       const now = await databaseNow(tx);
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.attemptId !== incident.currentAttemptId || step.status === "applied") return;
@@ -189,6 +192,7 @@ export class RotationStore {
   }
   async settle(id: string, lease: RotationLease) {
     await this.transaction(id, async (tx, c, incident) => {
+      if (incident.terminatedAt) return;
       const run = await this.snapshot(tx, c, incident, lease); const action = run.action;
       if (action.kind === "publish" && action.mode === "dispatch" && run.h.success && c.slot.candidateAddressId) {
         await tx.insert(rotationPublications).values({ slotId: c.slot.id, addressVersion: c.slot.candidateVersion, addressId: c.slot.candidateAddressId, incidentId: id }).onConflictDoNothing();
@@ -211,6 +215,7 @@ export class RotationStore {
   async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '30 seconds')` }).where(eq(rotationIncidents.id, id)); }
   async pause(id: string, code: string) { await this.transaction(id, async (tx, _c, incident) => this.pauseIn(tx, incident, code, await databaseNow(tx))); }
   private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
+    if (incident.terminatedAt) return;
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
     await tx.update(rotationIncidents).set({ status: code === "attempts_exhausted" ? "exhausted" : "paused", errorCode: code, nextRunAt: new Date(now.getTime() + 15000), updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
     if (incident.errorCode !== code) await rotationAudit(tx, incident, "rotation.paused", undefined, { code });

@@ -5,6 +5,7 @@ import * as db from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { effectiveOldTtl } from "./rotation-publication.service.js";
 import { fixture } from "./rotation-test-utils.js";
+import { terminateRotationIncident } from "@masterdns/db";
 it("publishes initial verified candidates to all linked Pools with both auto switches off and no incident or rotation policy", async () => {
   const f = await fixture();
   for (const pool of f.pools) await f.d.update(db.endpointPools).set({ state: "unhealthy" }).where(eq(db.endpointPools.id, pool.id));
@@ -240,6 +241,24 @@ it("manual publication updates linked DNS without health evidence and retries on
   expect(f.remote.get("zone-1")?.content).toBe(f.address.address);
   expect(f.state.cloudCalls).toBe(0);
   expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ phase: "cleanup" });
+});
+it("termination cancels queued DNS publication and recovery cannot revive it", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.service.publish(incident.id);
+  await f.plan();
+  await f.d.transaction(tx => terminateRotationIncident(tx, incident.id, f.account.ownerUserId));
+  await f.execute();
+  await f.service.recover();
+  expect(f.writes).toHaveLength(0);
+  for (const pool of f.pools) expect((await f.d.select().from(db.operations).where(eq(db.operations.resourceId, pool.id)))[0]).toMatchObject({ status: "superseded" });
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+});
+it("termination prevents an unpromoted candidate becoming an initial publication", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.d.transaction(tx => terminateRotationIncident(tx, incident.id, f.account.ownerUserId));
+  await f.service.publishSlot(f.slot.id);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.currentVersion).toBe(0);
+  expect(await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, f.pools[0]!.id))).toHaveLength(0);
 });
 
 it("manual publication succeeds with no DNS bindings", async () => {

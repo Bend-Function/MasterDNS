@@ -1,6 +1,6 @@
 import { cloudRotationLimitPolicySchema, cloudRotationLimitRules, cloudRotationRulesForAction, cloudServiceProvider, type CloudRotationLimitRule, type CloudRotationLimitStatus, type CloudService } from "@masterdns/contracts";
 import { eq, sql } from "drizzle-orm";
-import { cloudAccounts, cloudRotationBuckets, cloudRotationLimitPolicies, cloudRotationReservations } from "./schema/index.js";
+import { cloudAccounts, cloudRotationBuckets, cloudRotationLimitPolicies, cloudRotationReservations, cloudRotationLimitSwitches } from "./schema/index.js";
 import { databaseNow, type RotationTransaction } from "./rotation-context.js";
 
 export type CloudRotationWriteInput = { accountId: string; service: CloudService; region: string; stepId: string; action: string; remainingSteps?: Array<{ id: string; action: string }> };
@@ -22,7 +22,8 @@ async function context(tx: RotationTransaction, accountId: string, service: Clou
     select a.id, coalesce(p.utilization_percent, 80) as percent from cloud_accounts a
     left join cloud_rotation_limit_policies p on p.account_id=a.id and p.service=${service}
     where a.provider=${account.provider} and a.external_account_id=${account.externalAccountId}`);
-  return { identityKey, utilizationPercent: policies.find(p => p.id === accountId)!.percent, effectivePercent: Math.min(...policies.map(p => p.percent)) };
+  const [setting] = await tx.select().from(cloudRotationLimitSwitches).where(eq(cloudRotationLimitSwitches.identityKey, identityKey));
+  return { identityKey, enabled: setting?.enabled ?? true, utilizationPercent: policies.find(p => p.id === accountId)!.percent, effectivePercent: Math.min(...policies.map(p => p.percent)) };
 }
 async function buckets(tx: RotationTransaction, identityKey: string) {
   return tx.select().from(cloudRotationBuckets).where(eq(cloudRotationBuckets.identityKey, identityKey)).orderBy(cloudRotationBuckets.key).for("update");
@@ -90,10 +91,10 @@ export async function reserveCloudRotationWrite(tx: RotationTransaction, input: 
     const key = bucketKey(c.identityKey, rule.id, region);
     const state = liveState(rule, rows.find(row => row.key === key), now);
     const required = rule.kind === "sliding_window" && dynamic ? (ownsReservation ? 0 : 1) + newReservations.length : 1;
-    if (dynamic && !release && rule.kind === "sliding_window" && required > rule.capacity) throw new Error("rotation_limit_too_low");
+    if (c.enabled && dynamic && !release && rule.kind === "sliding_window" && required > rule.capacity) throw new Error("rotation_limit_too_low");
     const used = rule.kind === "token_bucket" ? state.debt : state.events.length + (dynamic ? pending.length : 0);
     const protectedReservation = dynamic && ownsReservation && required === 0;
-    if (!(dynamic && rule.kind === "sliding_window" && (release || protectedReservation)) && used + required > rule.capacity + 1e-9) {
+    if (c.enabled && !(dynamic && rule.kind === "sliding_window" && (release || protectedReservation)) && used + required > rule.capacity + 1e-9) {
       const retryAt = retryTime(rule, state, dynamic ? pending.length : 0, required, now);
       if (!refusal || retryAt > refusal.retryAt) refusal = { ruleId: rule.id, retryAt };
     }
@@ -139,14 +140,14 @@ export async function getCloudRotationLimitStatus(tx: RotationTransaction, accou
       const state = liveState(rule, row, now);
       const outstanding = rule.id.startsWith("lightsail.static-ip.") ? pending : 0;
       const used = rule.kind === "token_bucket" ? state.debt : state.events.length + outstanding;
-      let retryAt = used + 1 > rule.capacity ? retryTime(rule, state, outstanding, 1, now) : null;
+      let retryAt = c.enabled && used + 1 > rule.capacity ? retryTime(rule, state, outstanding, 1, now) : null;
       if (cooldown && cooldown > now && (!retryAt || cooldown > retryAt)) retryAt = cooldown;
       usage.push({ ruleId: rule.id, region: row?.region ?? null, used, remaining: Math.max(0, rule.capacity - used), retryAt: retryAt?.toISOString() ?? null });
     }
   }
-  return { service, utilizationPercent: c.utilizationPercent, effectivePercent: c.effectivePercent, rules, usage };
+  return { enabled: c.enabled, service, utilizationPercent: c.utilizationPercent, effectivePercent: c.effectivePercent, rules, usage };
 }
-export async function setCloudRotationLimitPolicy(tx: RotationTransaction, accountId: string, service: CloudService, utilizationPercent: number): Promise<CloudRotationLimitStatus> {
+export async function setCloudRotationLimitPolicy(tx: RotationTransaction, accountId: string, service: CloudService, utilizationPercent: number, enabled?: boolean): Promise<CloudRotationLimitStatus> {
   cloudRotationLimitPolicySchema.parse({ utilizationPercent });
   // Match the existing account-before-budget lock order used by rotation dispatch.
   await tx.select({ id: cloudAccounts.id }).from(cloudAccounts).where(eq(cloudAccounts.id, accountId)).for("update");
@@ -160,5 +161,27 @@ export async function setCloudRotationLimitPolicy(tx: RotationTransaction, accou
     if (rule) await tx.update(cloudRotationBuckets).set({ debt: liveState(rule, row, now).debt, updatedAt: now }).where(eq(cloudRotationBuckets.key, row.key));
   }
   await tx.insert(cloudRotationLimitPolicies).values({ accountId, service, utilizationPercent }).onConflictDoUpdate({ target: [cloudRotationLimitPolicies.accountId, cloudRotationLimitPolicies.service], set: { utilizationPercent, updatedAt: sql`clock_timestamp()` } });
+  if (enabled !== undefined) await tx.insert(cloudRotationLimitSwitches).values({ identityKey: previous.identityKey, enabled }).onConflictDoUpdate({ target: cloudRotationLimitSwitches.identityKey, set: { enabled, updatedAt: now } });
   return getCloudRotationLimitStatus(tx, accountId, service);
+}
+
+// Run after the policy transaction commits: never acquire incident locks while
+// holding the shared budget lock (dispatch takes those locks in the other order).
+export async function wakeCloudRotationLimitWaits(tx: RotationTransaction, accountId: string, service: CloudService) {
+  const [account] = await tx.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId));
+  if (!account) return;
+  const identityKey = JSON.stringify([account.provider, account.externalAccountId, service]);
+  {
+    // Wake local-budget waits only. The admission path still enforces vendor cooldowns.
+    await tx.execute(sql`update rotation_incidents i set next_run_at=clock_timestamp()
+      from managed_address_slots s, cloud_interfaces f, cloud_instances v, cloud_accounts a
+      where i.slot_id=s.id and s.interface_id=f.id and f.instance_id=v.id and v.account_id=a.id
+      and jsonb_build_array(a.provider, a.external_account_id, v.service) = ${identityKey}::jsonb
+      and i.status='active' and i.error_code='rotation_rate_limited'`);
+    await tx.execute(sql`update rotation_resources r set cleanup_due_at=clock_timestamp()
+      from rotation_incidents i, managed_address_slots s, cloud_interfaces f, cloud_instances v, cloud_accounts a
+      where r.incident_id=i.id and i.slot_id=s.id and s.interface_id=f.id and f.instance_id=v.id and v.account_id=a.id
+      and jsonb_build_array(a.provider, a.external_account_id, v.service) = ${identityKey}::jsonb
+      and i.status='active' and r.cleanup_error='rotation_rate_limited'`);
+  }
 }

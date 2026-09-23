@@ -40,6 +40,7 @@ function CloudAccountsConsole() {
   const [limitService, setLimitService] = useState<CloudService>("ec2");
   const [limitStatus, setLimitStatus] = useState<CloudRotationLimitStatus | null>(null);
   const [limitPercent, setLimitPercent] = useState("80");
+  const [limitEnabled, setLimitEnabled] = useState(true);
   const [limitLoading, setLimitLoading] = useState(false);
   const [name, setName] = useState("");
   const [ownerUserId, setOwnerUserId] = useState("");
@@ -140,7 +141,7 @@ function CloudAccountsConsole() {
         ? { service, utilizationPercent: 80, effectivePercent: 80, rules: cloudRotationLimitRules(service), usage: [] }
         : await api<CloudRotationLimitStatus>(`/v1/cloud-accounts/${account.id}/rotation-limits/${service}`);
       if (!limitRequests.current.isCurrent(request)) return;
-      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent));
+      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent)); setLimitEnabled(value.enabled ?? true);
     } catch (value) { if (limitRequests.current.isCurrent(request)) setFormError(message(value, "换址限制加载失败")); }
     finally { if (limitRequests.current.isCurrent(request)) setLimitLoading(false); }
   };
@@ -165,10 +166,10 @@ function CloudAccountsConsole() {
     const request = limitRequests.current.current(); setSaving(true); setFormError(null);
     try {
       const value: CloudRotationLimitStatus = UI_PREVIEW
-        ? { service: limitService, utilizationPercent, effectivePercent: utilizationPercent, rules: cloudRotationLimitRules(limitService, utilizationPercent), usage: limitStatus?.usage ?? [] }
-        : await api<CloudRotationLimitStatus>(`/v1/cloud-accounts/${limitTarget.id}/rotation-limits/${limitService}`, { method: "PATCH", ...jsonBody({ utilizationPercent }) });
+        ? { enabled: limitEnabled, service: limitService, utilizationPercent, effectivePercent: utilizationPercent, rules: cloudRotationLimitRules(limitService, utilizationPercent), usage: limitStatus?.usage ?? [] }
+        : await api<CloudRotationLimitStatus>(`/v1/cloud-accounts/${limitTarget.id}/rotation-limits/${limitService}`, { method: "PATCH", ...jsonBody({ utilizationPercent, enabled: limitEnabled }) });
       if (!limitRequests.current.isCurrent(request)) return;
-      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent));
+      setLimitStatus(value); setLimitPercent(String(value.utilizationPercent)); setLimitEnabled(value.enabled ?? true);
     } catch (value) { if (limitRequests.current.isCurrent(request)) setFormError(message(value, "换址限制保存失败")); }
     finally { if (limitRequests.current.isCurrent(request)) setSaving(false); }
   };
@@ -199,7 +200,7 @@ function CloudAccountsConsole() {
     <Dialog open={regionsTarget !== null} title="限制扫描区域" onClose={() => setRegionsTarget(null)} footer={<><Button variant="secondary" onClick={() => setRegionsTarget(null)}>取消</Button><Button type="submit" form="cloud-regions-form" disabled={saving}>保存范围</Button></>}><form id="cloud-regions-form" onSubmit={updateRegions}><Field label="区域范围" hint="留空恢复 Provider 可见区域"><textarea value={regions} onChange={(event) => setRegions(event.target.value)} placeholder={cloudScopeExamples[regionsTarget?.provider ?? draft.provider]} /></Field>{formError && <div className="login-error" role="alert">{formError}</div>}</form></Dialog>
     <Dialog open={limitTarget !== null} title={`换址限制 · ${limitTarget?.name ?? "云账号"}`} size="large" onClose={closeRotationLimits} footer={<><Button variant="secondary" disabled={saving} onClick={closeRotationLimits}>关闭</Button><Button type="submit" form="cloud-rotation-limits-form" disabled={saving || limitLoading || parseRotationLimitPercent(limitPercent) === null}>{saving ? "保存中" : "保存限制"}</Button></>}>
       <form id="cloud-rotation-limits-form" onSubmit={updateRotationLimits}>
-        <CloudRotationLimits services={limitTarget ? cloudProviderServices[limitTarget.provider] : [limitService]} service={limitService} status={limitStatus} utilizationPercent={limitPercent} disabled={saving || limitLoading} onServiceChange={changeRotationLimitService} onUtilizationPercentChange={(value) => { setLimitPercent(value); setFormError(null); }} />
+        <CloudRotationLimits services={limitTarget ? cloudProviderServices[limitTarget.provider] : [limitService]} service={limitService} status={limitStatus} enabled={limitEnabled} onEnabledChange={setLimitEnabled} utilizationPercent={limitPercent} disabled={saving || limitLoading} onServiceChange={changeRotationLimitService} onUtilizationPercentChange={(value) => { setLimitPercent(value); setFormError(null); }} />
         {limitLoading && <LoadingState />}
         {formError && <div className="login-error" role="alert">{formError}</div>}
       </form>

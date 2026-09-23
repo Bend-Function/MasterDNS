@@ -15,5 +15,6 @@ export class RotationController {
   @Post("rotations/manual") startManual(@CurrentUser() actor: AuthUser, @ZodBody(rotationStartSchema) input: { slotId: string }, @Headers("idempotency-key") key?: string) { return this.rotations.startManual(actor, input.slotId, cloudRequestKey(key)); }
   @Get("rotations/:id") detail(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.rotations.detail(actor, id); }
   @Post("rotations/:id/pause") pause(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.rotations.pause(actor, id); }
+  @Post("rotations/:id/terminate") terminate(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.rotations.terminate(actor, id); }
   @Post("rotations/:id/resume") resume(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @Headers("idempotency-key") key?: string, @ZodBody(rotationResumeSchema) input: RotationResumeInput = {}) { return this.rotations.resume(actor, id, cloudRequestKey(key), input); }
 }
