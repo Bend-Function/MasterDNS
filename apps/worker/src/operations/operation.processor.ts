@@ -22,6 +22,7 @@ import {
   policyVersions,
   providerAccounts,
   zones,
+  type RotationTransaction,
 } from "@masterdns/db";
 import { dnsRecordMatches, providerRecordHash } from "@masterdns/providers";
 import { Job, Worker } from "bullmq";
@@ -113,7 +114,9 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         return;
       }
     }
-    await this.database.db.update(operations).set({ status: "running", startedAt: operation.startedAt ?? new Date(), updatedAt: new Date() }).where(eq(operations.id, operationId));
+    const claimed = await this.database.db.update(operations).set({ status: "running", startedAt: operation.startedAt ?? new Date(), updatedAt: new Date() })
+      .where(and(eq(operations.id, operationId), inArray(operations.status, ["pending", "running"]))).returning({ id: operations.id });
+    if (!claimed.length) return;
     const steps = await this.database.db.select().from(operationSteps).where(eq(operationSteps.operationId, operationId)).orderBy(operationSteps.sequence);
     operationLease.assertOwned();
 
@@ -146,19 +149,25 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
           providerStatus: currentAccount?.status,
           lockFailure: isDnsZoneLockError(error),
         });
-        await this.database.db.update(operationSteps).set({
-          status: finalAttempt ? "failed" : "pending",
-          attempts: step.attempts + 1,
-          errorCode: providerError.code,
-          errorDetail: providerError.message.slice(0, 512),
-          nextRetryAt: finalAttempt ? null : new Date(Date.now() + (providerError.retryAfterMs ?? 1000 * 2 ** job.attemptsMade)),
-          finishedAt: finalAttempt ? new Date() : null,
-          updatedAt: new Date(),
-        }).where(eq(operationSteps.id, step.id));
-        if (currentAccount?.status !== "disabled" && ["authentication_failed", "permission_denied"].includes(providerError.code)) {
-          await this.database.db.update(providerAccounts).set({ status: "error", errorCode: providerError.code, updatedAt: new Date() })
-            .where(and(eq(providerAccounts.id, step.providerAccountId), ne(providerAccounts.status, "disabled")));
-        }
+        const recorded = await this.database.db.transaction(async tx => {
+          if (!await this.lockActiveOperation(tx, operationId)) return false;
+          const changed = await tx.update(operationSteps).set({
+            status: finalAttempt ? "failed" : "pending",
+            attempts: step.attempts + 1,
+            errorCode: providerError.code,
+            errorDetail: providerError.message.slice(0, 512),
+            nextRetryAt: finalAttempt ? null : new Date(Date.now() + (providerError.retryAfterMs ?? 1000 * 2 ** job.attemptsMade)),
+            finishedAt: finalAttempt ? new Date() : null,
+            updatedAt: new Date(),
+          }).where(and(eq(operationSteps.id, step.id), inArray(operationSteps.status, ["pending", "running"]))).returning({ id: operationSteps.id });
+          if (!changed.length) return false;
+          if (currentAccount?.status !== "disabled" && ["authentication_failed", "permission_denied"].includes(providerError.code)) {
+            await tx.update(providerAccounts).set({ status: "error", errorCode: providerError.code, updatedAt: new Date() })
+              .where(and(eq(providerAccounts.id, step.providerAccountId), ne(providerAccounts.status, "disabled")));
+          }
+          return true;
+        });
+        if (!recorded) return;
         if (!finalAttempt) throw providerError;
       }
       operationLease.assertOwned();
@@ -237,6 +246,11 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
           return false;
         }
       }
+      // Cancellation and provider dispatch share this row lock. A pre-change
+      // read may have outlived the operation that originally authorized it.
+      if (!await this.lockActiveOperation(tx, operation.id)) return false;
+      const [currentStep] = await tx.select({ status: operationSteps.status }).from(operationSteps).where(eq(operationSteps.id, step.id)).for("update");
+      if (currentStep?.status !== "running") return false;
       if (cloud) {
         const c = await lockRotationContext(tx, cloud.slot.id);
         const [physical] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey)).for("share");
@@ -373,13 +387,14 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         }).from(endpointPools).where(eq(endpointPools.id, operation.resourceId)).limit(1);
         if (!isOperationDecisionCurrent(operation, pool)) return false;
       }
-      await tx.update(operationSteps).set({
+      if (!await this.lockActiveOperation(tx, operation.id)) return false;
+      const prepared = await tx.update(operationSteps).set({
         status: "running",
         attempts: step.attempts + 1,
         startedAt: step.startedAt ?? new Date(),
         updatedAt: new Date(),
-      }).where(eq(operationSteps.id, step.id));
-      return true;
+      }).where(and(eq(operationSteps.id, step.id), inArray(operationSteps.status, ["pending", "running"]))).returning({ id: operationSteps.id });
+      return prepared.length > 0;
     });
   }
 
@@ -392,6 +407,9 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     return this.database.db.transaction(async (tx) => {
       if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
+      }
+      if (!await this.lockActiveOperation(tx, operation.id)) return { superseded: true, status: "failed", succeeded: 0, failed: 0 };
+      if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
         const [pool] = await tx.select({
           policyRevision: endpointPools.policyRevision,
           decisionRevision: endpointPools.decisionRevision,
@@ -486,11 +504,18 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
 
   private async supersedeOperation(operationId: string) {
     await this.database.db.transaction(async (tx) => {
+      const [operation] = await tx.select({ status: operations.status }).from(operations).where(eq(operations.id, operationId)).for("update");
+      if (!operation || (isTerminalOperationStatus(operation.status) && operation.status !== "superseded")) return;
       await tx.update(operationSteps).set({ status: "skipped", finishedAt: new Date(), updatedAt: new Date() })
         .where(and(eq(operationSteps.operationId, operationId), inArray(operationSteps.status, ["pending", "running"])));
       await tx.update(operations).set({ status: "superseded", finishedAt: new Date(), updatedAt: new Date() })
         .where(eq(operations.id, operationId));
     });
+  }
+
+  private async lockActiveOperation(tx: RotationTransaction, operationId: string) {
+    const [operation] = await tx.select({ status: operations.status }).from(operations).where(eq(operations.id, operationId)).for("update");
+    return !!operation && !isTerminalOperationStatus(operation.status);
   }
 }
 

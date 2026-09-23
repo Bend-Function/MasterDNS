@@ -19,6 +19,7 @@ it("identifies cloud targets and distinguishes candidate IPv6 from the current a
   expect(cloudTargetAddresses({ ...target, currentAddress: null, candidateAddress: null })).toBe("IPv6 · 暂无当前地址");
   expect(cloudTargetAddresses({ ...target, inventoryCurrent: false, currentAddressObserved: true, candidateAddressObserved: false, available: false })).toBe("IPv6 · 当前云地址 2001:db8::1 · 历史候选 2001:db8::2");
   expect(cloudTargetAddresses({ ...target, inventoryCurrent: true, currentAddressObserved: false, candidateAddressObserved: true })).toBe("IPv6 · 原地址（历史） 2001:db8::1 · 候选待验证 2001:db8::2");
+  expect(cloudTargetAddresses({ ...target, inventoryCurrent: false, currentAddressObserved: false, candidateAddressObserved: false, observedAddress: { id: "observed", address: "2001:db8::3" } })).toBe("IPv6 · 当前云地址 2001:db8::3 · 槽位仍保留 2001:db8::1 · 等待核对");
 });
 
 it("shows the latest known address with an explicit history label when current inventory is empty", () => {
@@ -215,6 +216,11 @@ describe("manual AWS IPv4 eligibility", () => {
       savedAuthorization: authorization,
       draftAuthorization: authorization,
     })).toEqual({ visible: true, reason: null });
+  });
+  it("blocks an observed replacement while the stable slot has an unresolved cloud operation", () => {
+    expect(manualIpv4RotationEligibility(slot({ blockedRotation: { incidentId: "old-incident", reason: "rotation_uncertain" }, observedCapability: slot().capability }), {
+      accountEnabled: true, provider: "aws", service: "ec2", instancePresent: true, savedAuthorization: authorization, draftAuthorization: authorization,
+    })).toEqual({ visible: true, reason: "先前云操作的结果尚未确认，当前槽位暂不可再次换址" });
   });
 
   it("keeps the action visible with a saved-authorization explanation", () => {

@@ -84,7 +84,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     attemptId: uuid("attempt_id").notNull().references(() => rotationAttempts.id, { onDelete: "restrict" }),
     sequence: integer("sequence").notNull(),
     plan: jsonb("plan").$type<CloudStep>().notNull(),
-    status: varchar("status", { length: 24 }).$type<"prepared" | "in_flight" | "pending" | "applied" | "not_applied" | "ambiguous" | "rejected_no_effect">().notNull().default("prepared"),
+    status: varchar("status", { length: 24 }).$type<"prepared" | "in_flight" | "pending" | "applied" | "not_applied" | "ambiguous" | "rejected_no_effect" | "abandoned">().notNull().default("prepared"),
     receipt: jsonb("receipt").$type<Record<string, unknown>>(),
     fence: integer("fence"),
     dispatchedAt: time("dispatched_at"),
@@ -92,7 +92,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     retryAt: time("retry_at"),
     errorCode: varchar("error_code", { length: 80 }),
     updatedAt: time("updated_at").notNull().defaultNow(),
-  }, t => [uniqueIndex("rotation_step_sequence_unique").on(t.attemptId, t.sequence), check("rotation_step_state", sql`${t.status} in ('prepared','in_flight','pending','applied','not_applied','ambiguous','rejected_no_effect')`)]);
+  }, t => [uniqueIndex("rotation_step_sequence_unique").on(t.attemptId, t.sequence), check("rotation_step_state", sql`${t.status} in ('prepared','in_flight','pending','applied','not_applied','ambiguous','rejected_no_effect','abandoned')`)]);
   const rotationStepObservations = pgTable("rotation_step_observations", {
     id: uuid("id").primaryKey().defaultRandom(),
     stepId: varchar("step_id", { length: 180 }).notNull().references(() => rotationSteps.id, { onDelete: "restrict" }),

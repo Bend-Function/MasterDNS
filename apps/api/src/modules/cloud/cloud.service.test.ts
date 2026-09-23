@@ -4,7 +4,7 @@ import { Redis } from "ioredis";
 import { withDnsZoneLock } from "@masterdns/automation";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, users, zones } from "@masterdns/db";
+import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 
 const identityHook = vi.hoisted(() => ({ run: undefined as (() => Promise<void>) | undefined }));
@@ -70,6 +70,50 @@ async function fixture(managed = false) {
 }
 
 describe("cloud account and authorization API", () => {
+  it("rejects binding an explicitly absent address even at the current generation", async () => {
+    const f = await fixture(true);
+    await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, f.address.id));
+    await expect(bind(f.actor, { zoneId: f.zone.id, fqdn: "absent.example.com", recordType: "A", slotId: f.slot.id, takeoverExisting: false })).rejects.toThrow("Cloud slot address is no longer present in current inventory");
+    expect(await connection.db.select().from(domainBindings).where(eq(domainBindings.zoneId, f.zone.id))).toEqual([]);
+  });
+  it("honors a single-instance refresh that marks an address absent within the same scan generation", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, f.address.id));
+    expect((await service.instance(f.actor, f.instance.id)).addresses[0]).toMatchObject({ id: f.address.id, isCurrent: false });
+    expect((await service.instances(f.actor, f.account.id))[0]!.addresses).toEqual([]);
+    expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: false, ref: null, cloudTarget: { observedAddress: null, available: false, currentAddressObserved: false } });
+    const { lockHealthTargets } = await import("@masterdns/db");
+    expect(await connection.db.transaction(tx => lockHealthTargets(tx, { slotId: f.slot.id, family: "4" }))).toEqual([]);
+  });
+  it.each([false, true])("shows fresh public inventory on a pinned stable slot without authorizing rotation (terminated: %s)", async terminated => {
+    const f = await fixture();
+    await connection.db.update(cloudScanScopes).set({ generation: 2 }).where(eq(cloudScanScopes.id, f.scope.id));
+    await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, f.instance.id));
+    await connection.db.update(cloudInterfaces).set({ scanGeneration: 2, metadata: { deviceIndex: 0, primaryAddresses: ["10.0.0.4", "198.51.100.77"] } }).where(eq(cloudInterfaces.id, f.iface.id));
+    await connection.db.update(cloudAddresses).set({ metadata: { providerMetadata: { awsAddressScope: "public" } } }).where(eq(cloudAddresses.id, f.address.id));
+    const [observed, privateAddress] = await connection.db.insert(cloudAddresses).values([
+      { interfaceId: f.iface.id, kind: "host", family: "4", address: "198.51.100.77", origin: "user", scanGeneration: 2, metadata: { providerMetadata: { awsAddressScope: "public" } } },
+      { interfaceId: f.iface.id, kind: "host", family: "4", address: "10.0.0.4", origin: "user", scanGeneration: 2, metadata: { providerMetadata: { awsAddressScope: "private" } } },
+    ]).returning();
+    await connection.db.insert(managedAddressSlots).values({ interfaceId: f.iface.id, name: "primary-private", family: "4", currentAddressId: privateAddress!.id });
+    const segmentId = randomUUID(), attemptId = randomUUID();
+    const [incident] = await connection.db.insert(rotationIncidents).values({ ownerUserId: f.actor.id, slotId: f.slot.id, family: "4", physicalKey: randomUUID(), sourceEventId: randomUUID(), trigger: "manual", status: terminated ? "complete" : "paused", terminatedAt: terminated ? new Date() : null, currentSegmentId: segmentId, currentAttemptId: attemptId, authorizationRevision: 1, policyRevision: 1, addressVersion: 0 }).returning();
+    await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 1 });
+    await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: {} });
+    const stepId = randomUUID();
+    await connection.db.insert(rotationSteps).values({ id: stepId, attemptId, sequence: 1, status: terminated ? "ambiguous" : "pending", plan: { id: stepId, action: "ec2.eip.associate", resourceKey: f.instance.externalId, arguments: {}, destructive: true } });
+    const slots = await service.slots(f.actor, f.instance.id);
+    expect(slots).toHaveLength(2);
+    expect(slots.find(row => row.slot.id === f.slot.id)).toMatchObject({
+      slot: { id: f.slot.id, currentAddressId: f.address.id, candidateAddressId: null }, isCurrent: true, ref: null,
+      observedCapability: { available: true }, capability: { available: false, reason: "rotation_uncertain" },
+      blockedRotation: { incidentId: incident!.id, reason: "rotation_uncertain" },
+      cloudTarget: { observedAddress: { id: observed!.id, address: "198.51.100.77" }, available: false, inventoryCurrent: false },
+    });
+    expect(slots.find(row => row.slot.currentAddressId === privateAddress!.id)?.cloudTarget?.observedAddress).toMatchObject({ address: "10.0.0.4" });
+    const { lockHealthTargets } = await import("@masterdns/db");
+    expect(await connection.db.transaction(tx => lockHealthTargets(tx, { slotId: f.slot.id, family: "4" }))).toEqual([]);
+  });
   it("marks retained addresses and slots historical when a newer complete scope omits the instance", async () => {
     const f = await fixture();
     await connection.db.update(cloudScanScopes).set({ generation: 2, lastCompletedAt: new Date() }).where(eq(cloudScanScopes.id, f.scope.id));
@@ -128,6 +172,7 @@ describe("cloud account and authorization API", () => {
       candidateAddress: { id: candidate!.id, address: "192.0.2.20" },
       inventoryCurrent: true, activeCandidate: false, available: true,
       currentAddressObserved: false, candidateAddressObserved: true,
+      observedAddress: { id: candidate!.id, address: "192.0.2.20" },
     });
     const detail = await service.instance(f.actor, f.instance.id);
     expect(detail.addresses.find(address => address.id === f.address.id)).toMatchObject({ isCurrent: false });

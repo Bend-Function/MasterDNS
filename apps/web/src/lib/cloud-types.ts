@@ -101,6 +101,8 @@ export type CloudCapability = {
 };
 
 export type AddressSlot = {
+  observedCapability?: CloudCapability | null;
+  blockedRotation?: { incidentId: string; reason: "rotation_in_progress" | "rotation_uncertain" } | null;
   isCurrent?: boolean;
   cloudTarget?: CloudTargetSummary | null;
   slot: {
@@ -120,6 +122,7 @@ export type AddressSlot = {
 export type AuthorizationPayload = Omit<CloudAuthorization, "instanceId" | "updatedAt">;
 
 export type CloudTargetSummary = {
+  observedAddress?: { id: string; address: string } | null;
   currentAddressObserved?: boolean;
   candidateAddressObserved?: boolean;
   inventoryCurrent?: boolean;

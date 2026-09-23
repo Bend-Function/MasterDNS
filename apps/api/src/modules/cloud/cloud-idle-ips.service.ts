@@ -8,6 +8,7 @@ import type { IdleIpItem, IdleIpPreview } from "@masterdns/contracts";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { env } from "../../config/env.js";
+import { unresolvedRotationProtectsIdleIp, type IdleIpRotationEvidence } from "./idle-ip-rotation-protection.js";
 
 type Account = typeof cloudAccounts.$inferSelect;
 type Batch = typeof cloudIdleIpCleanups.$inferSelect;
@@ -169,13 +170,22 @@ export class CloudIdleIpsService {
     const rotation = await tx.execute(sql`select 1 from rotation_incidents i
       join managed_address_slots s on s.id=i.slot_id join cloud_interfaces f on f.id=s.interface_id
       join cloud_instances v on v.id=f.instance_id join cloud_accounts a on a.id=v.account_id
-      left join rotation_leases l on l.physical_key=i.physical_key
       where a.provider='aws' and a.external_account_id=${externalAccountId} and v.service='lightsail' and v.region=${item.region}
-      and (l.unresolved_step_id is not null or (i.status<>'complete' and (
+      and i.status<>'complete' and (
         exists(select 1 from rotation_resources r where r.incident_id=i.id and (r.address=${item.address} or r.allocation_id=${item.name} or r.resource_id=${item.arn}))
         or exists(select 1 from cloud_addresses ca where ca.id in (s.current_address_id,s.candidate_address_id) and ca.address=${item.address})
-      ))) limit 1`);
+      ) limit 1`);
     if (rotation.length) return "rotation_in_progress";
+    const unresolved = await tx.execute<IdleIpRotationEvidence>(sql`select st.id as "stepId", st.attempt_id as "attemptId", st.plan, st.receipt,
+      a.id as "accountId", a.external_account_id as "externalAccountId", v.region, v.external_id as "instanceId", f.external_id as "interfaceId", s.id as "slotId",
+      coalesce((select jsonb_agg(jsonb_build_object('allocationId',r.allocation_id,'resourceId',r.resource_id,'address',r.address,'role',r.role,'cleanupStepId',r.cleanup_step_id))
+        from rotation_resources r where r.attempt_id=st.attempt_id or r.cleanup_step_id=st.id), '[]'::jsonb) as resources
+      from rotation_leases l join rotation_steps st on st.id=l.unresolved_step_id
+      join rotation_attempts t on t.id=st.attempt_id join rotation_incidents i on i.id=t.incident_id
+      join managed_address_slots s on s.id=i.slot_id join cloud_interfaces f on f.id=s.interface_id
+      join cloud_instances v on v.id=f.instance_id join cloud_accounts a on a.id=v.account_id
+      where a.provider='aws' and a.external_account_id=${externalAccountId} and v.service='lightsail' and v.region=${item.region}`);
+    if (unresolved.some(step => unresolvedRotationProtectsIdleIp(item, step))) return "rotation_in_progress";
     if (await idleIpReleaseInProgress(tx, externalAccountId, item.region)) return "cleanup_in_progress";
     return undefined;
   }

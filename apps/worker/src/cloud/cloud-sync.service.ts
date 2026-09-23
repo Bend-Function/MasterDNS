@@ -104,7 +104,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
               const kind = observed.prefixLength === undefined ? "host" : "prefix";
               const family = observed.family === 4 ? "4" : "6";
               const addressMetadata = { providerMetadata: observed.metadata ?? {}, ...(observed.privateAddress === undefined ? {} : { privateAddress: observed.privateAddress }), ...(observed.resourceId === undefined ? {} : { resourceId: observed.resourceId }) };
-              const values = { metadata: addressMetadata, interfaceId: iface.id, kind, family, address: observed.address, prefixLength: observed.prefixLength ?? null, remoteAllocationId: observed.allocationId ?? null, origin: "user", scanGeneration: generation, lastSeenAt: now } as const;
+              const values = { metadata: addressMetadata, interfaceId: iface.id, kind, family, address: observed.address, prefixLength: observed.prefixLength ?? null, remoteAllocationId: observed.allocationId ?? null, origin: "user", inventoryPresent: true, scanGeneration: generation, lastSeenAt: now } as const;
               // Refresh observations, but preserve the existing allocation proof atomically.
               // Legacy GUIDs must be anchored BEFORE the first scan can overwrite them.
               // Receipt-backed UPSERT rows may still have origin=user, so origin alone
@@ -118,7 +118,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
               const [address] = await tx.insert(cloudAddresses).values(values).onConflictDoUpdate({
                 target: kind === "host" ? [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address] : [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address, cloudAddresses.prefixLength],
                 targetWhere: kind === "host" ? sql`${cloudAddresses.kind} = 'host'` : sql`${cloudAddresses.kind} = 'prefix'`,
-                set: { metadata: refreshedMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
+                set: { metadata: refreshedMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, inventoryPresent: true, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
               }).returning();
               if (kind === "host" && address) {
                 // Discovery can stage verification but never publishes an address.

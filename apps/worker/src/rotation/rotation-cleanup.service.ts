@@ -310,7 +310,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       join cloud_interfaces f on f.id=s.interface_id join cloud_instances v on v.id=f.instance_id
       left join cloud_scan_scopes scope on scope.account_id=v.account_id and scope.service=v.service and scope.region=v.region
       where a.address::inet=${r.address}::inet and (
-        (v.metadata->>'present' is distinct from 'false' and f.scan_generation=v.scan_generation and a.scan_generation=v.scan_generation
+        (v.metadata->>'present' is distinct from 'false' and a.inventory_present=true and f.scan_generation=v.scan_generation and a.scan_generation=v.scan_generation
           and (scope.id is null or scope.generation=v.scan_generation))
         or exists(select 1 from cloud_endpoint_links link where link.slot_id=s.id)
         or exists(select 1 from rotation_incidents i left join rotation_leases l on l.physical_key=i.physical_key

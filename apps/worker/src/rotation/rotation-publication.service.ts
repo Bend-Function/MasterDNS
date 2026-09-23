@@ -44,7 +44,7 @@ export function effectiveOldTtl(ttl: number, provider: string) {
 export function publicationAuthorizationError(c: RotationContext) {
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed) return "authorization_revoked";
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
-  if (!c.iface || !c.address || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration)
+  if (!c.iface || !c.address?.inventoryPresent || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration)
     return "resource_not_found";
   if (c.conflictingManager) return "conflicting_manager";
 }
@@ -220,7 +220,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         await this.database.db
           .update(rotationPublications)
           .set({ errorCode: e instanceof Error ? e.message.slice(0, 80) : "publication_failed", updatedAt: new Date() })
-          .where(eq(rotationPublications.id, p.id));
+          .where(and(eq(rotationPublications.id, p.id), sql`${rotationPublications.errorCode} is distinct from 'manual_terminated'`));
       }
     }
   }
@@ -355,7 +355,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         // The exact live inspection proves this address is present even when the
         // last full scan predates candidate attachment. Preserve allocation proof;
         // a later full inventory generation can still mark it historical.
-        await tx.update(cloudAddresses).set({ scanGeneration: current.instance.scanGeneration, lastSeenAt: h.now, updatedAt: h.now })
+        await tx.update(cloudAddresses).set({ inventoryPresent: true, scanGeneration: current.instance.scanGeneration, lastSeenAt: h.now, updatedAt: h.now })
           .where(eq(cloudAddresses.id, current.address!.id));
         await tx
           .update(managedAddressSlots)

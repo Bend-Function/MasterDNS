@@ -32,6 +32,12 @@ it("does not publish stale evidence or a cloud address absent from fresh provide
   await f.service.recover();
   expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toHaveLength(0);
 });
+it("does not publish an explicitly absent address using retained healthy evidence", async () => {
+  const f = await fixture();
+  await f.d.update(db.cloudAddresses).set({ inventoryPresent: false }).where(eq(db.cloudAddresses.id, f.address.id));
+  await expect(f.service.publishSlot(f.slot.id)).rejects.toThrow("resource_not_found");
+  expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toHaveLength(0);
+});
 async function advanceInventory(f: Awaited<ReturnType<typeof fixture>>, generation: number) {
   await f.d.transaction(async tx => {
     await tx.update(db.cloudScanScopes).set({ generation, lastCompletedAt: new Date() }).where(eq(db.cloudScanScopes.accountId, f.account.id));

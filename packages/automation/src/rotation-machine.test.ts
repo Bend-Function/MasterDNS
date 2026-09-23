@@ -66,7 +66,7 @@ describe("rotation preparation and cloud steps", () => {
   });
 
   it.each([
-    ["ambiguous", "resource_ownership_ambiguous"], ["not_applied", "cloud_not_applied"],
+    ["ambiguous", "resource_ownership_ambiguous"], ["not_applied", "cloud_not_applied"], ["abandoned", "cloud_not_applied"],
   ] as const)("does not redispatch an observed %s write", (status, reason) => {
     const state = snapshot();
     state.attempt!.steps = [{ ...prepared, status }];

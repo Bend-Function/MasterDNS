@@ -10,6 +10,7 @@ export function cloudTargetLabel(target: CloudTargetSummary) {
 }
 
 export function cloudTargetAddresses(target: CloudTargetSummary) {
+  if (target.observedAddress && target.observedAddress.id !== target.currentAddress?.id && target.observedAddress.id !== target.candidateAddress?.id) return `IPv${target.slot.family} · 当前云地址 ${target.observedAddress.address} · 槽位仍保留 ${target.currentAddress?.address ?? target.candidateAddress?.address ?? "未知"} · 等待核对`;
   if (target.currentAddressObserved && target.candidateAddress && target.candidateAddressObserved === false && !target.activeCandidate) return `IPv${target.slot.family} · 当前云地址 ${target.currentAddress!.address} · 历史候选 ${target.candidateAddress.address}`;
   if (target.inventoryCurrent === false && !target.activeCandidate) return `IPv${target.slot.family} · 历史地址 ${target.candidateAddress?.address ?? target.currentAddress?.address ?? "未知"} · 当前清单中不存在`;
   if (target.candidateAddress && target.candidateAddress.id === target.currentAddress?.id) return `IPv${target.slot.family} · 待验证 ${target.candidateAddress.address}`;
@@ -109,6 +110,9 @@ export function cloudServiceLabel(service: import("@masterdns/contracts/cloud").
 }
 export function capabilityReason(reason?: string) {
   return ({
+    rotation_in_progress: "此实例还有未完成的轮换，当前槽位暂不可再次换址",
+    rotation_uncertain: "先前云操作的结果尚未确认，当前槽位暂不可再次换址",
+    cloud_state_reset: "已同步云端并清除旧流程的本地阻塞",
     private_ipv4_unsupported: "私网或保留 IPv4 地址不支持自动轮换，请使用公网 IPv4 槽位",
     inventory_mismatch: "清单身份不匹配", interface_not_found: "网卡已不存在", address_not_found: "地址已不存在", lightsail_ipv6_only: "IPv6-only 套餐不支持", secondary_interface_unsupported: "不支持次要网卡", primary_ipv6_immutable: "Primary IPv6 不可轮换，可绑定与监控",
     linode_slaac_ipv6_immutable: "Linode SLAAC IPv6 为硬件派生地址，不可轮换；可绑定与监控",
@@ -154,8 +158,9 @@ export function manualIpv4RotationEligibility(slot: AddressSlot, context: Manual
   const visible = context.provider === "aws"
     && ["ec2", "lightsail"].includes(context.service)
     && slot.slot.family === "4"
-    && slot.capability?.reason !== "private_ipv4_unsupported";
+    && (slot.observedCapability ?? slot.capability)?.reason !== "private_ipv4_unsupported";
   if (!visible) return { visible: false, reason: null };
+  if (slot.blockedRotation) return { visible: true, reason: capabilityReason(slot.blockedRotation.reason) };
   if (authorizationChanged(context.savedAuthorization, context.draftAuthorization)) return { visible: true, reason: "请先保存当前授权更改" };
   if (!context.accountEnabled) return { visible: true, reason: "云账号已停用" };
   if (!context.instancePresent) return { visible: true, reason: "云端实例已不存在" };

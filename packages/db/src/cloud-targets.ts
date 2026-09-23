@@ -4,6 +4,8 @@ import type { MasterDnsDatabase } from "./index.js";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, managedAddressSlots, rotationAttempts, rotationIncidents } from "./schema/index.js";
 
 export type CloudTargetSummary = {
+  /** Display-only correspondence attached by inventory views; never a probe target. */
+  observedAddress?: { id: string; address: string } | null;
   currentAddressObserved: boolean;
   candidateAddressObserved: boolean;
   inventoryCurrent: boolean;
@@ -25,6 +27,7 @@ export async function getCloudTargetsForSlots(db: Pick<MasterDnsDatabase, "selec
       enabled: cloudAccounts.enabled, regions: cloudAccounts.regions, metadata: cloudInstances.metadata,
       instanceGeneration: cloudInstances.scanGeneration, interfaceGeneration: cloudInterfaces.scanGeneration,
       scopeGeneration: cloudScanScopes.generation, currentGeneration: cloudAddresses.scanGeneration, candidateGeneration: candidate.scanGeneration,
+      currentPresent: cloudAddresses.inventoryPresent, candidatePresent: candidate.inventoryPresent,
     },
     activeCandidate: sql<boolean>`exists (select 1 from ${rotationIncidents}
       inner join ${rotationAttempts} on ${rotationAttempts.id} = ${rotationIncidents.currentAttemptId}
@@ -49,13 +52,13 @@ export async function getCloudTargetsForSlots(db: Pick<MasterDnsDatabase, "selec
     const instanceCurrent = freshness.metadata.present !== false
       && (freshness.scopeGeneration === null || freshness.scopeGeneration === freshness.instanceGeneration)
       && freshness.interfaceGeneration === freshness.instanceGeneration;
-    const currentAddressObserved = instanceCurrent && !!row.currentAddress && freshness.currentGeneration === freshness.instanceGeneration;
-    const candidateAddressObserved = instanceCurrent && !!row.candidateAddress && freshness.candidateGeneration === freshness.instanceGeneration;
+    const currentAddressObserved = instanceCurrent && !!row.currentAddress && freshness.currentPresent === true && freshness.currentGeneration === freshness.instanceGeneration;
+    const candidateAddressObserved = instanceCurrent && !!row.candidateAddress && freshness.candidatePresent === true && freshness.candidateGeneration === freshness.instanceGeneration;
     // Probe/publication authority stays on the selected candidate. Visibility may
     // also show a separately observed current address, without authorizing it.
     const inventoryCurrent = row.candidateAddress ? candidateAddressObserved : currentAddressObserved;
     const available = freshness.enabled && (freshness.regions === null || freshness.regions.includes(row.instance.region))
-      && instanceCurrent && (inventoryCurrent || row.activeCandidate);
+      && instanceCurrent && (row.candidateAddress ? freshness.candidatePresent : freshness.currentPresent) === true && (inventoryCurrent || row.activeCandidate);
     return [row.slot.id, { ...row, currentAddressObserved, candidateAddressObserved, inventoryCurrent, available }];
   }));
 }

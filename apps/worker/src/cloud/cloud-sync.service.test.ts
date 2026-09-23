@@ -53,6 +53,14 @@ async function awsInventory(accountId: string, service: "ec2" | "lightsail", pri
 }
 
 describe("complete cloud scope sync", () => {
+  it("restores explicitly absent address presence when a complete scan observes the same IP", async () => {
+    const f = await fixture();
+    await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [row] = await connection.db.select({ address: cloudAddresses }).from(cloudAddresses).innerJoin(cloudInterfaces, eq(cloudInterfaces.id, cloudAddresses.interfaceId)).innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId)).where(eq(cloudInstances.accountId, f.account.id));
+    await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, row!.address.id));
+    expect(await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+    expect((await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.id, row!.address.id)))[0]).toMatchObject({ inventoryPresent: true, scanGeneration: 2 });
+  });
   it.each(["ec2", "lightsail"] as const)("stages manual %s public IP drift on the same slot and invalidates old evidence", async service => {
     const f = await fixture();
     const item = await awsInventory(f.account.id, service);

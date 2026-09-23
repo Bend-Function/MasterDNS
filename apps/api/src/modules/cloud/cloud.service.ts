@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy, wakeCloudRotationLimitWaits } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
-import { and, asc, eq } from "drizzle-orm";
-import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
+import { and, asc, desc, eq, ne, or, sql } from "drizzle-orm";
+import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationAttempts, rotationIncidents, rotationSteps, users } from "@masterdns/db";
 import { CloudError, createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
 import { cloudProviderServices, cloudRotationLimitPolicySchema, validCloudRegion, type CloudProvider, type CloudService as CloudServiceName, type SlotRef, type MonthlyTrafficResponse } from "@masterdns/contracts";
 import { decryptJson, encryptJson, parseEncryptionKey } from "@masterdns/crypto";
@@ -142,7 +142,7 @@ export class CloudService {
     }
     return rows.map(({ scope, ...row }) => {
       const inventory = inventorySummary(row.instance, scope);
-      const known = (byInstance.get(row.instance.id) ?? []).map(({ address, interfaceGeneration }) => ({ ...address, isCurrent: inventory.status === "current" && interfaceGeneration === row.instance.scanGeneration && address.scanGeneration === row.instance.scanGeneration }));
+      const known = (byInstance.get(row.instance.id) ?? []).map(({ address, interfaceGeneration }) => ({ ...address, isCurrent: address.inventoryPresent && inventory.status === "current" && interfaceGeneration === row.instance.scanGeneration && address.scanGeneration === row.instance.scanGeneration }));
       const latestGeneration = Math.max(0, ...known.map(address => address.scanGeneration));
       return { ...row, addresses: known.filter(address => address.isCurrent), lastKnownAddresses: known.filter(address => address.scanGeneration === latestGeneration), inventory, inScope: account.regions === null || account.regions.includes(row.instance.region) };
     });
@@ -160,7 +160,7 @@ export class CloudService {
     const [scope] = await this.database.db.select().from(cloudScanScopes).where(and(eq(cloudScanScopes.accountId, account.id), eq(cloudScanScopes.service, row.instance.service), eq(cloudScanScopes.region, row.instance.region)));
     const instanceCurrent = row.instance.metadata.present !== false && (!scope || scope.generation === row.instance.scanGeneration);
     const currentInterfaces = new Set(interfaces.filter(iface => instanceCurrent && iface.scanGeneration === row.instance.scanGeneration).map(iface => iface.id));
-    return { ...row, inventory: inventorySummary(row.instance, scope), inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces: interfaces.map(iface => ({ ...iface, isCurrent: currentInterfaces.has(iface.id) })), addresses: addresses.map(({ address }) => ({ ...address, isCurrent: currentInterfaces.has(address.interfaceId) && address.scanGeneration === row.instance.scanGeneration })) };
+    return { ...row, inventory: inventorySummary(row.instance, scope), inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces: interfaces.map(iface => ({ ...iface, isCurrent: currentInterfaces.has(iface.id) })), addresses: addresses.map(({ address }) => ({ ...address, isCurrent: address.inventoryPresent && currentInterfaces.has(address.interfaceId) && address.scanGeneration === row.instance.scanGeneration })) };
   }
 
   async slots(actor: AuthUser, instanceId: string) {
@@ -190,12 +190,27 @@ export class CloudService {
       .leftJoin(cloudAddresses, eq(cloudAddresses.id, managedAddressSlots.currentAddressId))
       .where(eq(cloudInterfaces.instanceId, instanceId));
     const targets = await getCloudTargetsForSlots(this.database.db, rows.map(row => row.slot.id));
+    const uncertain = sql<boolean>`exists (select 1 from ${rotationAttempts} inner join ${rotationSteps} on ${rotationSteps.attemptId} = ${rotationAttempts.id}
+      where ${rotationAttempts.incidentId} = ${rotationIncidents.id} and ${rotationSteps.status} in ('in_flight', 'pending', 'ambiguous'))`;
+    const blocked = await this.database.db.select({ incident: rotationIncidents, uncertain }).from(rotationIncidents)
+      .innerJoin(managedAddressSlots, eq(managedAddressSlots.id, rotationIncidents.slotId))
+      .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+      .where(and(eq(cloudInterfaces.instanceId, instanceId), or(ne(rotationIncidents.status, "complete"), uncertain)))
+      .orderBy(desc(rotationIncidents.createdAt));
+    const blocking = blocked.find(row => row.uncertain) ?? blocked[0];
+    const blockedRotation = blocking ? { incidentId: blocking.incident.id, reason: blocking.uncertain ? "rotation_uncertain" as const : "rotation_in_progress" as const } : null;
     return rows.map(({ slot, currentAddress, interfaceExternalId }) => {
-      const cloudTarget = targets.get(slot.id) ?? null;
-      const isCurrent = !!cloudTarget && (cloudTarget.currentAddressObserved || cloudTarget.candidateAddressObserved || cloudTarget.activeCandidate);
+      const target = targets.get(slot.id) ?? null;
+      const observed = observedSlotAddress(slot, currentAddress, detail.interfaces, detail.addresses, rows.map(row => row.slot), instance.service);
+      const cloudTarget = target ? { ...target, observedAddress: observed ? { id: observed.id, address: observed.address } : null } : null;
+      const isCurrent = !!cloudTarget && (!!observed || cloudTarget.currentAddressObserved || cloudTarget.candidateAddressObserved || cloudTarget.activeCandidate);
       const selected = cloudTarget?.candidateAddress ?? cloudTarget?.currentAddress;
       const ref: SlotRef | null = selected && cloudTarget?.available ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: selected.address, family: slot.family === "4" ? 4 : 6 } : null;
-      return { slot, currentAddress, cloudTarget, isCurrent, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
+      const observedCapability = observed ? evaluateCapabilities({ ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: observed.address, family: slot.family === "4" ? 4 : 6 }, inventory) : null;
+      const capability = ref ? evaluateCapabilities(ref, inventory) : null;
+      const blockedCapability = blockedRotation && (capability ?? observedCapability);
+      return { slot, currentAddress, cloudTarget, isCurrent, ref, observedCapability, blockedRotation,
+        capability: blockedCapability && blockedRotation ? { ...blockedCapability, available: false, reason: blockedRotation.reason } : capability, inScope: detail.inScope };
     });
   }
 
@@ -315,4 +330,22 @@ function inventorySummary(instance: typeof cloudInstances.$inferSelect, scope: t
   const status = instance.metadata.present === false || (scope && scope.generation > instance.scanGeneration) ? "absent" as const
     : !scope || scope.generation === instance.scanGeneration ? "current" as const : "unconfirmed" as const;
   return { status, lastError: scope?.lastError ?? null, lastCompletedAt: scope?.lastCompletedAt ?? null };
+}
+
+function observedSlotAddress(slot: typeof managedAddressSlots.$inferSelect, current: typeof cloudAddresses.$inferSelect | null,
+  interfaces: Array<typeof cloudInterfaces.$inferSelect & { isCurrent: boolean }>, addresses: Array<typeof cloudAddresses.$inferSelect & { isCurrent: boolean }>,
+  slots: Array<typeof managedAddressSlots.$inferSelect>, service: CloudServiceName) {
+  const fresh = addresses.filter(address => address.isCurrent && address.interfaceId === slot.interfaceId && address.family === slot.family && address.kind === "host");
+  const pointed = fresh.find(address => address.id === slot.candidateAddressId) ?? fresh.find(address => address.id === slot.currentAddressId);
+  if (pointed) return pointed;
+  // Read-only correspondence for a primary AWS role. Never create/repoint a
+  // manager, guess from IP ranges, or lend this observation probe authority.
+  if (slot.family !== "4" || !["ec2", "lightsail"].includes(service) || !/^primary(?:-|$)/.test(slot.name)) return undefined;
+  const metadata = providerMetadata(current?.metadata ?? {});
+  const role = metadata.awsAddressScope ?? (slot.name.startsWith("primary-public") ? "public" : slot.name.startsWith("primary-private") ? "private" : undefined);
+  if (role !== "public" && role !== "private") return undefined;
+  const primary = interfaces.find(iface => iface.id === slot.interfaceId)?.metadata.primaryAddresses;
+  const matches = fresh.filter(address => providerMetadata(address.metadata).awsAddressScope === role && Array.isArray(primary) && primary.includes(address.address)
+    && !slots.some(other => other.id !== slot.id && (other.currentAddressId === address.id || other.candidateAddressId === address.id)));
+  return matches.length === 1 ? matches[0] : undefined;
 }

@@ -44,7 +44,7 @@ export class RotationStore {
     const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, incident.addressVersion)));
     const snapshot: RotationSnapshot = {
       phase: incident.phase,
-      authorization: { managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
+      authorization: { managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
         regionAllowed: !!c.scope && (c.account.regions === null || c.account.regions.includes(c.instance.region)), conflictingManager: c.conflictingManager },
       revisions: { authorization: c.authorization?.revision ?? 0, policy: c.policy?.revision ?? 0, address: c.addressVersion },
       expectedRevisions: { authorization: incident.authorizationRevision, policy: incident.policyRevision, address: incident.addressVersion },
@@ -139,6 +139,10 @@ export class RotationStore {
     await this.transaction(id, async (tx, c, incident) => {
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.attemptId !== incident.currentAttemptId) throw new Error("rotation_step_changed");
+      if (step.status === "abandoned" || incident.errorCode === "cloud_state_reset") {
+        await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result } });
+        return;
+      }
       const now = await databaseNow(tx); const old = step.receipt ?? {};
       const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]);
       const receipt = { ...old, ...(step.status === "applied" ? {} : result), ...(old.resourceId ? { resourceId: old.resourceId } : {}), ...(old.allocationId ? { allocationId: old.allocationId } : {}) };
@@ -231,7 +235,7 @@ export class RotationStore {
     const metadata = { ...(c.instance.service === "azure_vm" ? { allocationIdentity: allocationIdentity(result) } : {}), providerMetadata: providerMetadata && typeof providerMetadata === "object" && !Array.isArray(providerMetadata) ? providerMetadata : {},
       ...(typeof result.after?.privateAddress === "string" ? { privateAddress: result.after.privateAddress } : {}),
       ...(result.resourceId ? { resourceId: result.resourceId } : {}) };
-    const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, metadata, origin: "system", attemptId: attempt.id, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, scanGeneration: c.instance.scanGeneration, metadata } }).returning();
+    const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, metadata, origin: "system", attemptId: attempt.id, inventoryPresent: true, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, inventoryPresent: true, scanGeneration: c.instance.scanGeneration, metadata } }).returning();
     const version = Math.max(c.slot.currentVersion, c.slot.candidateVersion) + 1;
     await tx.update(managedAddressSlots).set({ candidateAddressId: address!.id, candidateVersion: version, updatedAt: now }).where(eq(managedAddressSlots.id, c.slot.id));
     await tx.update(addressHealthStates).set(resetHealthEvidence).where(eq(addressHealthStates.slotId, c.slot.id));

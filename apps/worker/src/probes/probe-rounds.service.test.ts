@@ -135,6 +135,9 @@ it("continues probing the active rotation candidate while inventory has not obse
   await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 3 });
   await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, status: "candidate", beforeInventory: {}, candidateAddressId: candidate!.id, candidateVersion: 2 });
   expect(await scheduler.schedulePolicy(f.policy.id, now)).toMatchObject({ address: "192.0.2.55", addressVersion: 2 });
+  await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, candidate!.id));
+  expect(await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 30000))).toBeUndefined();
+  await connection.db.update(cloudAddresses).set({ inventoryPresent: true }).where(eq(cloudAddresses.id, candidate!.id));
   await connection.db.update(rotationIncidents).set({ status: "complete" }).where(eq(rotationIncidents.id, incident!.id));
   expect(await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 30000))).toBeUndefined();
 });

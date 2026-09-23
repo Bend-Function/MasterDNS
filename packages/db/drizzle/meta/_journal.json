@@ -190,6 +190,13 @@
       "when": 1790165533503,
       "tag": "0026_release_replaced_addresses",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1790167857616,
+      "tag": "0027_cloud_state_reset",
+      "breakpoints": true
     }
   ]
 }

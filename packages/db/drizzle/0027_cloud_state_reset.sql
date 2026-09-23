@@ -1,0 +1,3 @@
+ALTER TABLE "rotation_steps" DROP CONSTRAINT "rotation_step_state";--> statement-breakpoint
+ALTER TABLE "cloud_addresses" ADD COLUMN "inventory_present" boolean DEFAULT true NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_steps" ADD CONSTRAINT "rotation_step_state" CHECK ("rotation_steps"."status" in ('prepared','in_flight','pending','applied','not_applied','ambiguous','rejected_no_effect','abandoned'));

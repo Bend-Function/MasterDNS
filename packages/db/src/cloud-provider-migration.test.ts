@@ -34,7 +34,7 @@ it("upgrades populated AWS schema without changing rows and stores complete Azur
     expect((await sql`select * from cloud_accounts where id=${account!.id}`)[0]).toEqual(account);
     expect((await sql`select * from cloud_instances where id=${instance!.id}`)[0]).toEqual(instance);
     expect((await sql`select * from cloud_interfaces where id=${iface!.id}`)[0]).toEqual(iface);
-    expect((await sql`select * from cloud_addresses where id=${address!.id}`)[0]).toEqual({ ...address, metadata: {} });
+    expect((await sql`select * from cloud_addresses where id=${address!.id}`)[0]).toEqual({ ...address, metadata: {}, inventory_present: true });
     const longId = "/subscriptions/22222222-2222-4222-8222-222222222222/resourceGroups/" + "r".repeat(90) + "/providers/Microsoft.Network/networkInterfaces/" + "n".repeat(90) + "/ipConfigurations/exact-config";
     for (const [provider, service, region] of [["azure", "azure_vm", "australiaeast"], ["linode", "linode", "ap-south"]]) {
       const [added] = await sql`insert into cloud_accounts (owner_user_id, provider, name, external_account_id, credential_ciphertext, credential_iv, credential_tag) values (${owner!.id}, ${provider!}, 'new', ${longId}, 'cipher', 'iv', 'tag') returning id`;

@@ -79,6 +79,24 @@ async function fixture(family: "4" | "6" = "4") {
   return { owner: owner!, account: account!, instance: instance!, iface: iface!, address: address!, slot: slot!, config: config!, group: group!, healthPolicy: healthPolicy!, health: health!, incident, state, inventory, adapter, store, runtime, processor };
 }
 async function drive(f: Awaited<ReturnType<typeof fixture>>, turns = 5) { for (let n = 0; n < turns; n++) await f.processor.run(f.incident.id); }
+it("makes a reused historical address probeable when a new cloud candidate is installed", async () => {
+  const f = await fixture();
+  const [historical] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "198.51.100.1", origin: "user", scanGeneration: 1, inventoryPresent: false }).returning();
+  await drive(f, 5);
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ candidateAddressId: historical!.id, candidateVersion: 2 });
+  expect((await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.id, historical!.id)))[0]).toMatchObject({ inventoryPresent: true, origin: "user" });
+  const { getCloudTargetsForSlots } = await import("@masterdns/db");
+  expect((await getCloudTargetsForSlots(connection.db, [f.slot.id])).get(f.slot.id)?.available).toBe(true);
+});
+it("rejects new rotation writes when the selected address is explicitly absent", async () => {
+  const f = await fixture();
+  await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, f.address.id));
+  const { rotationAuthorizationError } = await import("@masterdns/db");
+  expect(await connection.db.transaction(async tx => rotationAuthorizationError(await lockRotationContext(tx, f.slot.id)))).toBe("resource_not_found");
+  await drive(f, 3);
+  expect(f.state.writes).toEqual([]);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", errorCode: "resource_not_found" });
+});
 it("keeps terminated rotations terminal after late receipts, queue replay and recovery", async () => {
   const f = await fixture();
   await drive(f, 2);
@@ -93,6 +111,31 @@ it("keeps terminated rotations terminal after late receipts, queue replay and re
   expect(jobs).not.toContain(f.incident.id);
   expect(f.state.writes).toHaveLength(1);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+});
+it.each(["applied", "abandoned"] as const)("keeps reset %s steps terminal when conflicting receipts and stale jobs arrive", async status => {
+  const f = await fixture();
+  await drive(f, 2);
+  const [step] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, f.state.writes[0]!));
+  const receipt = { allocationId: "eipalloc-reset-original", resourceId: "resource-reset-original" };
+  await connection.db.update(rotationSteps).set({ status, receipt }).where(eq(rotationSteps.id, step!.id));
+  await connection.db.update(rotationIncidents).set({ status: "complete", phase: "complete", terminatedAt: new Date(), completedAt: new Date(), errorCode: "cloud_state_reset" }).where(eq(rotationIncidents.id, f.incident.id));
+  await connection.db.update(rotationLeases).set({ holder: null, expiresAt: new Date(0), incidentId: null, unresolvedStepId: null }).where(eq(rotationLeases.physicalKey, f.incident.physicalKey));
+  const observations = await connection.db.select().from(rotationStepObservations).where(eq(rotationStepObservations.stepId, step!.id));
+  const resources = await connection.db.select().from(rotationResources).where(eq(rotationResources.incidentId, f.incident.id));
+  const writes = [...f.state.writes];
+  await f.store.saveReceipt(f.incident.id, step!.id, { allocationId: "eipalloc-conflicting-late", resourceId: "resource-conflicting-late", candidateAddress: "203.0.113.90", status: "applied" } as never, true);
+  await f.store.pause(f.incident.id, "late_error");
+  await f.store.reject(f.incident.id, step!.id, "permission_denied", true);
+  await drive(f, 3);
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, step!.id)))[0]).toMatchObject({ status, receipt });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", phase: "complete", errorCode: "cloud_state_reset" });
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.incident.physicalKey)))[0]).toMatchObject({ holder: null, incidentId: null, unresolvedStepId: null });
+  const after = await connection.db.select().from(rotationStepObservations).where(eq(rotationStepObservations.stepId, step!.id));
+  expect(after).toHaveLength(observations.length + 1);
+  expect(after).toEqual(expect.arrayContaining([expect.objectContaining({ observation: true, result: expect.objectContaining({ allocationId: "eipalloc-conflicting-late" }) })]));
+  expect(await connection.db.select().from(rotationResources).where(eq(rotationResources.incidentId, f.incident.id))).toEqual(resources);
+  expect(f.state.writes).toEqual(writes);
   expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
 });
 async function evidence(f: Awaited<ReturnType<typeof fixture>>, decision: "success" | "failure" | "unknown", version?: number) {

@@ -7,7 +7,7 @@ export type RotationCloudRejection =
 
 /** IDs refer to persisted adapter-plan steps; receipts and arguments remain in the store. */
 export type RotationStepSnapshot = { stepId: string } & (
-  | { status: "prepared" | "applied" | "not_applied" | "ambiguous" }
+  | { status: "prepared" | "applied" | "not_applied" | "ambiguous" | "abandoned" }
   | { status: "in_flight" | "pending"; observeDeadline: number }
   // Only a positively confirmed rejection without effects is eligible for execution again.
   | { status: "rejected_no_effect"; reason: RotationCloudRejection; retryAt: number | null }
@@ -92,6 +92,7 @@ export function nextRotationAction(snapshot: RotationSnapshot, now: number): Rot
   const steps = inCleanup && snapshot.cleanup.status === "required"
     ? snapshot.cleanup.steps : snapshot.phase === "cloud" ? attempt?.steps : undefined;
   const step = steps?.find((item) => item.status !== "applied");
+  if (step?.status === "abandoned") return { kind: "pause", reason: "cloud_not_applied" };
 
   // Reads must still reconcile dispatched effects when authorization or fencing changes.
   if (attempt && step && (step.status === "in_flight" || step.status === "pending")) {

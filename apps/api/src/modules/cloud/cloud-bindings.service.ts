@@ -52,7 +52,7 @@ export class CloudBindingsService {
           if (await idleIpAddressReleasing(tx, source.address.address)) throw new ConflictException("Address cleanup is in progress");
           const [authorization] = await tx.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, source.instance.id)).for("share");
           if (!authorization?.managed) throw new ConflictException("Cloud instance is not managed");
-          if ((account.regions !== null && !account.regions.includes(source.instance.region)) || source.instance.metadata.present === false || source.iface.scanGeneration !== source.generation || source.address.scanGeneration !== source.generation) throw new ConflictException("Cloud slot address is no longer present in current inventory");
+          if ((account.regions !== null && !account.regions.includes(source.instance.region)) || source.instance.metadata.present === false || !source.address.inventoryPresent || source.iface.scanGeneration !== source.generation || source.address.scanGeneration !== source.generation) throw new ConflictException("Cloud slot address is no longer present in current inventory");
           if (source.slot.family !== (input.recordType === "A" ? "4" : "6")) throw new BadRequestException("Record type does not match slot family");
           const [existingBinding] = await tx.select({ id: domainBindings.id }).from(domainBindings).where(and(eq(domainBindings.zoneId, input.zoneId), eq(domainBindings.fqdn, fqdn), eq(domainBindings.recordType, input.recordType))).limit(1);
           if (existingBinding) throw new ConflictException("DNS record already has a manager");

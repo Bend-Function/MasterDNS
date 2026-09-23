@@ -119,6 +119,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     remoteAllocationId: text("remote_allocation_id"),
     metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
     origin: cloudAddressOriginEnum("origin").notNull(),
+    inventoryPresent: boolean("inventory_present").notNull().default(true),
     attemptId: uuid("attempt_id"),
     scanGeneration: integer("scan_generation").notNull(),
     lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
