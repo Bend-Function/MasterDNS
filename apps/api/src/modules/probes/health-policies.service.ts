@@ -89,7 +89,7 @@ export class HealthPoliciesService {
       const cloudTarget = policy.slotId ? targets.get(policy.slotId) ?? null : null;
       const address = cloudTarget?.candidateAddress ?? cloudTarget?.currentAddress;
       const version = cloudTarget?.candidateAddress ? cloudTarget.slot.candidateVersion : cloudTarget?.slot.currentVersion;
-      const state = policy.slotId && (policy.state?.addressId !== address?.id || policy.state?.addressVersion !== version) ? null : policy.state;
+      const state = policy.slotId && (!cloudTarget?.available || policy.state?.addressId !== address?.id || policy.state?.addressVersion !== version) ? null : policy.state;
       return { ...policy, state, cloudTarget };
     });
   }

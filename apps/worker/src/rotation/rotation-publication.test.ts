@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
 import * as db from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
-import { effectiveOldTtl } from "./rotation-publication.service.js";
+import { effectiveOldTtl, RotationPublicationService } from "./rotation-publication.service.js";
 import { fixture } from "./rotation-test-utils.js";
 import { terminateRotationIncident } from "@masterdns/db";
 it("publishes initial verified candidates to all linked Pools with both auto switches off and no incident or rotation policy", async () => {
@@ -31,6 +31,54 @@ it("does not publish stale evidence or a cloud address absent from fresh provide
   await f.d.update(db.addressHealthStates).set({ consecutiveSuccesses: 1 }).where(eq(db.addressHealthStates.slotId, f.slot.id));
   await f.service.recover();
   expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toHaveLength(0);
+});
+async function advanceInventory(f: Awaited<ReturnType<typeof fixture>>, generation: number) {
+  await f.d.transaction(async tx => {
+    await tx.update(db.cloudScanScopes).set({ generation, lastCompletedAt: new Date() }).where(eq(db.cloudScanScopes.accountId, f.account.id));
+    await tx.update(db.cloudInstances).set({ scanGeneration: generation }).where(eq(db.cloudInstances.id, f.instance.id));
+    await tx.update(db.cloudInterfaces).set({ scanGeneration: generation }).where(eq(db.cloudInterfaces.id, f.slot.interfaceId));
+  });
+}
+it("keeps a verified promoted candidate current until a later successful inventory omits it", async () => {
+  const f = await fixture();
+  await f.d.update(db.instanceAuthorizations).set({ allowIpv4Rotation: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: true });
+  const segmentId = randomUUID(), attemptId = randomUUID();
+  const [incident] = await f.d.insert(db.rotationIncidents).values({
+    ownerUserId: f.account.ownerUserId, slotId: f.slot.id, family: "4", phase: "publish", currentSegmentId: segmentId, currentAttemptId: attemptId,
+    physicalKey: JSON.stringify(["aws", f.account.externalAccountId, "ec2", "us-east-1", f.instance.externalId]), sourceEventId: randomUUID(),
+    authorizationRevision: 1, policyRevision: 1, addressVersion: 1, healthPolicyId: f.policy.id, healthPolicyRevision: 1,
+    configId: f.policy.configId, configRevision: 1, groupId: f.policy.groupId!, groupRevision: 1,
+  }).returning();
+  await f.d.insert(db.rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 3 });
+  await f.d.insert(db.rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: f.live, status: "verified", candidateAddressId: f.address.id, candidateVersion: 1 });
+  await f.d.insert(db.rotationPublications).values({ slotId: f.slot.id, incidentId: incident!.id, addressId: f.address.id, addressVersion: 1 });
+  const [agent] = await f.d.insert(db.probeAgents).values({ ownerUserId: f.account.ownerUserId, name: "external", capabilities: { ipv4: true, ipv6: true } }).returning();
+  await f.d.insert(db.probeGroupMembers).values({ groupId: f.policy.groupId!, probeId: agent!.id });
+  await advanceInventory(f, 2);
+  expect((await db.getCloudTargetsForSlots(f.d, [f.slot.id])).get(f.slot.id)).toMatchObject({ inventoryCurrent: false, activeCandidate: true, available: true });
+  await f.service.publishSlot(f.slot.id, incident!.id);
+  expect((await db.getCloudTargetsForSlots(f.d, [f.slot.id])).get(f.slot.id)).toMatchObject({ inventoryCurrent: true, activeCandidate: false, available: true, candidateAddress: null });
+  expect((await f.d.select().from(db.cloudAddresses).where(eq(db.cloudAddresses.id, f.address.id)))[0]).toMatchObject({ scanGeneration: 2, origin: f.address.origin, remoteAllocationId: f.address.remoteAllocationId, metadata: f.address.metadata });
+  const database = { db: f.d } as never;
+  const scheduler = new ProbeSchedulerService(database, new ProbeHealthService(database, new HealthResultService(database)));
+  expect(await scheduler.schedulePolicy(f.policy.id)).toMatchObject({ address: f.address.address, addressVersion: 1 });
+  expect((await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id)))[0]).toMatchObject({ latestDecision: "success", healthState: "healthy" });
+  await advanceInventory(f, 3);
+  expect((await db.getCloudTargetsForSlots(f.d, [f.slot.id])).get(f.slot.id)).toMatchObject({ inventoryCurrent: false, activeCandidate: false, available: false });
+  expect(await scheduler.schedulePolicy(f.policy.id)).toBeUndefined();
+  expect((await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id)))[0]).toMatchObject({ latestDecision: "unknown", healthState: "unknown" });
+});
+it("does not refresh address presence from an inspection preceding a newer inventory", async () => {
+  const f = await fixture();
+  const service = new RotationPublicationService({ db: f.d } as never, { adapter: async () => ({ inspect: async () => {
+    const live = structuredClone(f.live);
+    await advanceInventory(f, 2);
+    return live;
+  } }) } as never);
+  await expect(service.publishSlot(f.slot.id)).rejects.toThrow("live_cloud_address_changed");
+  expect((await f.d.select().from(db.cloudAddresses).where(eq(db.cloudAddresses.id, f.address.id)))[0]!.scanGeneration).toBe(1);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentVersion: 0, candidateAddressId: f.address.id });
 });
 it("requires a DNS link for initial verification without a rotation incident", async () => {
   const f = await fixture();

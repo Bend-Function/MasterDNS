@@ -67,6 +67,10 @@ describe("cloud source selection", () => {
     expect(selectableCloudSlots("A", [slot()], { accountEnabled: true, instancePresent: true, managed: false })).toEqual([]);
   });
 
+  it("excludes historical slots from new bindings even if their old address is retained", () => {
+    expect(selectableCloudSlots("A", [slot({ isCurrent: false })])).toEqual([]);
+  });
+
   it("allows an immutable primary IPv6 slot to be bound for monitoring without granting rotation", () => {
     const immutable = slot({
       slot: { id: "slot-v6", interfaceId: "interface-1", family: "6", name: "primary-v6", currentAddressId: "address-2", currentVersion: 1 },

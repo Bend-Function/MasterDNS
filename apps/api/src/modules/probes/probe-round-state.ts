@@ -1,4 +1,4 @@
-import { addressHealthPolicies, cloudAddresses, endpointAddresses, healthCheckConfigs, managedAddressSlots, probeGroups, probeRounds } from "@masterdns/db";
+import { addressHealthPolicies, cloudAddresses, endpointAddresses, getCloudTargetsForSlots, healthCheckConfigs, managedAddressSlots, probeGroups, probeRounds } from "@masterdns/db";
 import { eq } from "drizzle-orm";
 import type { ProbeTransaction } from "./probe-agent-auth.js";
 
@@ -11,7 +11,8 @@ export async function lockRoundState(tx: ProbeTransaction, snapshot: Round, now:
     const addressId = slot?.candidateAddressId ?? slot?.currentAddressId;
     const version = slot?.candidateAddressId ? slot.candidateVersion : slot?.currentVersion;
     const [address] = addressId ? await tx.select().from(cloudAddresses).where(eq(cloudAddresses.id, addressId)).for("share") : [];
-    targetMatches = !!address && version === snapshot.addressVersion && version > 0 && address.address === snapshot.address && address.family === snapshot.family;
+    const available = slot && (await getCloudTargetsForSlots(tx, [slot.id])).get(slot.id)?.available;
+    targetMatches = !!available && !!address && version === snapshot.addressVersion && version > 0 && address.address === snapshot.address && address.family === snapshot.family;
   } else if (snapshot.endpointAddressId) {
     const [address] = await tx.select().from(endpointAddresses).where(eq(endpointAddresses.id, snapshot.endpointAddressId)).for("share");
     targetMatches = !!address && address.endpointId === snapshot.endpointId && address.state !== "previous" && address.address === snapshot.address && address.family === snapshot.family;

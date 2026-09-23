@@ -237,7 +237,12 @@ it('probes shared slots without anchor endpoints and rejects version zero, wrong
   const third = await rounds.create(f.actor, { ...input, configId: newConfig!.id, addressVersion: 2 }, now);
   expect(third.sequence).toBe(3);
   await connection.db.delete(probeRounds).where(eq(probeRounds.id, third.id));
-  expect((await rounds.create(f.actor, { ...input, configId: newConfig!.id, addressVersion: 2 }, now)).sequence).toBe(4);
+  const fourth = await rounds.create(f.actor, { ...input, configId: newConfig!.id, addressVersion: 2 }, now);
+  expect(fourth.sequence).toBe(4);
+  await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, instance!.id));
+  await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, iface!.id));
+  expect(await leases.lease(f.probe.id, 1, now)).toEqual([]);
+  expect((await connection.db.select().from(probeTasks).where(eq(probeTasks.roundId, fourth.id)))[0]?.status).toBe('stale');
 });
 
 it('rolls back observation insertion when the terminal task write fails', async () => {

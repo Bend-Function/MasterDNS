@@ -165,6 +165,7 @@ export const {
   managedAddressSlots,
   instanceAuthorizations,
   cloudEndpointLinks,
+  cloudIdleIpCleanups,
 } = defineCloudSchema({
   userId: () => users.id,
   endpointId: () => endpoints.id,

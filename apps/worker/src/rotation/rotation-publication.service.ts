@@ -4,6 +4,7 @@ import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@ne
 import { and, asc, eq, inArray, isNull, ne, notExists, sql } from "drizzle-orm";
 import {
   addressHealthStates,
+  cloudAddresses,
   resetHealthEvidence,
   refreshPoolHealth,
   cloudEndpointLinks,
@@ -278,6 +279,9 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           current.physicalKey !== c.physicalKey ||
           current.addressVersion !== c.addressVersion ||
           current.address?.id !== c.address?.id ||
+          current.scope?.generation !== c.scope?.generation ||
+          current.instance.scanGeneration !== c.instance.scanGeneration ||
+          current.iface?.scanGeneration !== c.iface?.scanGeneration ||
           !livePublicationMatches(current, live)
         )
           throw new Error("live_cloud_address_changed");
@@ -348,6 +352,11 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
             })
             .where(eq(endpoints.id, endpoint.id));
         }
+        // The exact live inspection proves this address is present even when the
+        // last full scan predates candidate attachment. Preserve allocation proof;
+        // a later full inventory generation can still mark it historical.
+        await tx.update(cloudAddresses).set({ scanGeneration: current.instance.scanGeneration, lastSeenAt: h.now, updatedAt: h.now })
+          .where(eq(cloudAddresses.id, current.address!.id));
         await tx
           .update(managedAddressSlots)
           .set({ currentAddressId: current.address!.id, currentVersion: c.addressVersion, candidateAddressId: null, updatedAt: h.now })

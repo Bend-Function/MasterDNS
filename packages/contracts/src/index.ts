@@ -10,3 +10,4 @@ export * from "./rotation.js";
 export * from "./external-health.js";
 
 export * from "./cloud-rotation-limits.js";
+export * from "./idle-ips.js";

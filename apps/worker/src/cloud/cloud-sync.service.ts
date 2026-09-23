@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
-import { and, eq, ne, or, sql } from "drizzle-orm";
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, managedAddressSlots } from "@masterdns/db";
+import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
+import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, getCloudTargetsForSlots, managedAddressSlots, resetHealthEvidence, rotationAttempts, rotationIncidents, rotationSteps } from "@masterdns/db";
 import { CloudError, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 import { queueNames, cloudProviderServices, cloudServiceProvider, validCloudRegion, type CloudService, type CloudSyncJob } from "@masterdns/contracts";
 import { Worker } from "bullmq";
@@ -97,6 +97,9 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
             const [iface] = await tx.insert(cloudInterfaces).values({ instanceId: instance.id, externalId: remote.id, name: remote.deviceIndex === undefined ? null : `eth${remote.deviceIndex}`, metadata: interfaceMetadata, scanGeneration: generation, lastSeenAt: now })
               .onConflictDoUpdate({ target: [cloudInterfaces.instanceId, cloudInterfaces.externalId], set: { name: remote.deviceIndex === undefined ? null : `eth${remote.deviceIndex}`, metadata: interfaceMetadata, scanGeneration: generation, lastSeenAt: now, updatedAt: now } }).returning();
             if (!iface) throw new Error("Cloud interface insert returned no row");
+            // Health scheduling locks slot before address. Match that order before
+            // refreshing observations so a concurrent scheduler cannot deadlock.
+            await tx.select({ id: managedAddressSlots.id }).from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, iface.id)).orderBy(asc(managedAddressSlots.id)).for("update");
             for (const observed of remote.addresses) {
               const kind = observed.prefixLength === undefined ? "host" : "prefix";
               const family = observed.family === 4 ? "4" : "6";
@@ -118,29 +121,50 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
                 set: { metadata: refreshedMetadata, remoteAllocationId: sql`case when ${cloudAddresses.origin} = 'system' then ${cloudAddresses.remoteAllocationId} else ${observed.allocationId ?? null} end`, scanGeneration: generation, lastSeenAt: now, updatedAt: now },
               }).returning();
               if (kind === "host" && address) {
-                // Existing slot pointers and versions are exclusively managed by the verified
-                // rotation path. First discovery creates an observed, unverified version 0 slot.
-                const [existingSlot] = await tx.select({ id: managedAddressSlots.id }).from(managedAddressSlots).where(and(
+                // Discovery can stage verification but never publishes an address.
+                const [existingSlot] = await tx.select().from(managedAddressSlots).where(and(
                   eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family),
                   or(eq(managedAddressSlots.currentAddressId, address.id), eq(managedAddressSlots.candidateAddressId, address.id)),
                 )).limit(1);
-                if (existingSlot) continue;
-                let name = observed.primary ? "primary" : observed.address;
-                if (observed.primary && family === "4" && (service === "ec2" || service === "lightsail")) {
-                  const [primary] = await tx.select({ metadata: cloudAddresses.metadata }).from(managedAddressSlots)
+                if (existingSlot && (!observed.primary || (existingSlot.candidateAddressId ?? existingSlot.currentAddressId) === address.id)) continue;
+                let name = existingSlot?.name ?? (observed.primary ? "primary" : observed.address);
+                if (!existingSlot && observed.primary && family === "4" && (service === "ec2" || service === "lightsail")) {
+                  const roleSlots = await tx.select({ name: managedAddressSlots.name, metadata: cloudAddresses.metadata, address: cloudAddresses.address }).from(managedAddressSlots)
                     .leftJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
-                    .where(and(eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family), eq(managedAddressSlots.name, "primary"))).limit(1);
+                    .where(and(eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family)));
                   // AWS reports both private and public IPv4 as primary. Keep legacy
-                  // slots and their bindings intact, adding only the missing role.
-                  const metadata = primary?.metadata?.providerMetadata;
-                  const primaryScope = metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>).awsAddressScope : undefined;
+                  // bindings intact, including when public observations arrive first
+                  // and the previous scan did not persist role metadata.
+                  const role = (row: typeof roleSlots[number]) => {
+                    const currentObservation = remote.addresses.find(item => item.address === row.address);
+                    const metadata = row.metadata?.providerMetadata;
+                    return currentObservation?.metadata?.awsAddressScope ?? (metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>).awsAddressScope : undefined);
+                  };
                   const observedScope = observed.metadata?.awsAddressScope;
-                  if ((primaryScope === "private" || primaryScope === "public") && (observedScope === "private" || observedScope === "public") && primaryScope !== observedScope) {
-                    name = `primary-${observedScope}`;
+                  if (observedScope === "private" || observedScope === "public") {
+                    const matchingRole = roleSlots.find(row => (row.name === "primary" || row.name.startsWith(`primary-${observedScope}`)) && role(row) === observedScope);
+                    if (matchingRole) name = matchingRole.name;
+                    else if (roleSlots.some(row => row.name === "primary")) {
+                      name = `primary-${observedScope}`;
+                      if (roleSlots.some(row => row.name === name)) name = `${name}-${address.id.slice(0, 8)}`;
+                    }
                   }
                 }
                 await tx.insert(managedAddressSlots).values({ interfaceId: iface.id, family, name, currentAddressId: address.id })
                   .onConflictDoNothing({ target: [managedAddressSlots.interfaceId, managedAddressSlots.family, managedAddressSlots.name] });
+                if (observed.primary) {
+                  const [slot] = await tx.select().from(managedAddressSlots).where(and(eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family), eq(managedAddressSlots.name, name))).for("update");
+                  if (!slot || (slot.candidateAddressId ?? slot.currentAddressId) === address.id) continue;
+                  // A scan may discover an out-of-band change, but never takes over
+                  // from an unfinished or uncertain cloud operation.
+                  const [busy] = await tx.select({ id: rotationIncidents.id }).from(rotationIncidents)
+                    .innerJoin(managedAddressSlots, eq(managedAddressSlots.id, rotationIncidents.slotId))
+                    .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+                    .where(and(eq(cloudInterfaces.instanceId, instance.id), or(ne(rotationIncidents.status, "complete"), sql`exists (select 1 from ${rotationAttempts} inner join ${rotationSteps} on ${rotationSteps.attemptId} = ${rotationAttempts.id} where ${rotationAttempts.incidentId} = ${rotationIncidents.id} and ${rotationSteps.status} in ('in_flight', 'pending', 'ambiguous'))`))).limit(1);
+                  if (busy) continue;
+                  await tx.update(managedAddressSlots).set({ candidateAddressId: address.id, candidateVersion: Math.max(slot.currentVersion, slot.candidateVersion) + 1, updatedAt: now }).where(eq(managedAddressSlots.id, slot.id));
+                  await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(eq(addressHealthStates.slotId, slot.id));
+                }
               }
             }
           }
@@ -148,6 +172,16 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         const absent = await tx.update(cloudInstances).set({ metadata: sql`${cloudInstances.metadata} || '{"present":false}'::jsonb`, updatedAt: now })
           .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInstances.service, service), eq(cloudInstances.region, region), ne(cloudInstances.scanGeneration, generation), sql`${cloudInstances.metadata}->>'present' is distinct from 'false'`)).returning({ id: cloudInstances.id });
         await tx.update(cloudScanScopes).set({ generation, lastCompletedAt: now, lastError: null, updatedAt: now }).where(eq(cloudScanScopes.id, scope.id));
+        // Invalidate authority atomically with the new inventory, including slots
+        // on missing interfaces/instances. Keep every address and binding for history.
+        const scopeSlots = await tx.select({ id: managedAddressSlots.id }).from(managedAddressSlots)
+          .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+          .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
+          .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInstances.service, service), eq(cloudInstances.region, region)))
+          .orderBy(asc(managedAddressSlots.id)).for("update", { of: managedAddressSlots });
+        const targets = await getCloudTargetsForSlots(tx, scopeSlots.map(slot => slot.id));
+        const historical = [...targets.values()].filter(target => !target.available).map(target => target.slot.id);
+        if (historical.length) await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(inArray(addressHealthStates.slotId, historical));
         return { scopeStatus: "complete", removedInstances: absent.length };
       });
     } catch (error) {

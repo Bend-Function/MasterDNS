@@ -61,6 +61,7 @@ export type CloudInstanceRow = {
 };
 
 export type CloudInterface = {
+  isCurrent?: boolean;
   id: string;
   instanceId: string;
   externalId: string;
@@ -71,6 +72,7 @@ export type CloudInterface = {
 };
 
 export type CloudAddress = {
+  isCurrent?: boolean;
   id: string;
   interfaceId?: string;
   address: string;
@@ -97,6 +99,7 @@ export type CloudCapability = {
 };
 
 export type AddressSlot = {
+  isCurrent?: boolean;
   cloudTarget?: CloudTargetSummary | null;
   slot: {
     id: string;
@@ -115,6 +118,9 @@ export type AddressSlot = {
 export type AuthorizationPayload = Omit<CloudAuthorization, "instanceId" | "updatedAt">;
 
 export type CloudTargetSummary = {
+  inventoryCurrent?: boolean;
+  activeCandidate?: boolean;
+  available?: boolean;
   account: Pick<CloudAccount, "id" | "name" | "provider">;
   instance: Pick<CloudInstance, "id" | "name" | "externalId" | "service" | "region">;
   slot: { id: string; name: string; family: "4" | "6"; currentVersion: number; candidateVersion: number };

@@ -16,6 +16,7 @@ import {
   varchar,
 } from "drizzle-orm/pg-core";
 import type { AnyPgColumn } from "drizzle-orm/pg-core";
+import type { IdleIpItem } from "@masterdns/contracts";
 
 export const cloudProviderEnum = pgEnum("cloud_provider", ["aws", "azure", "linode"]);
 export const cloudServiceEnum = pgEnum("cloud_service", ["ec2", "lightsail", "azure_vm", "linode"]);
@@ -186,5 +187,19 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     check("cloud_endpoint_links_family_valid", sql`${table.family} in ('4', '6')`),
   ]);
 
-  return { cloudApiRequests, cloudAccounts, cloudScanScopes, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, instanceAuthorizations, cloudEndpointLinks };
+  const cloudIdleIpCleanups = pgTable("cloud_idle_ip_cleanups", {
+    id: uuid("id").primaryKey().defaultRandom(),
+    accountId: uuid("account_id").notNull().references(() => cloudAccounts.id, { onDelete: "restrict" }),
+    ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "restrict" }),
+    actorUserId: uuid("actor_user_id").notNull().references(dependencies.userId, { onDelete: "restrict" }),
+    externalAccountId: text("external_account_id").notNull(),
+    credentialFingerprint: text("credential_fingerprint").notNull(),
+    regions: jsonb("regions").$type<string[]>().notNull(),
+    items: jsonb("items").$type<IdleIpItem[]>().notNull(),
+    scanErrors: jsonb("scan_errors").$type<Array<{ region: string; reason: string }>>().notNull().default([]),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    ...timestamps,
+  }, table => [index("cloud_idle_ip_account_idx").on(table.accountId, table.createdAt), index("cloud_idle_ip_identity_idx").on(table.externalAccountId)]);
+  return { cloudApiRequests, cloudAccounts, cloudScanScopes, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, instanceAuthorizations, cloudEndpointLinks, cloudIdleIpCleanups };
 }

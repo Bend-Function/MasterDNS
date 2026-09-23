@@ -28,6 +28,9 @@ describe("effective cloud health", () => {
     expect(healthPolicyDisplay({ ...policy, mode: "local" }, group, now)).toMatchObject({ status: "unknown", reason: "云地址需要外部 Agent 验证，本地结果不能用于发布" });
     expect(healthPolicyDisplay(policy, undefined, now).status).toBe("unknown");
   });
+  it("invalidates healthy evidence for a target missing from the current inventory", () => {
+    expect(healthPolicyDisplay({ ...policy, cloudTarget: { ...policy.cloudTarget!, inventoryCurrent: false, activeCandidate: false, available: false } }, group, now)).toMatchObject({ status: "unknown" });
+  });
 });
 
 describe("ordinary endpoint address families", () => {

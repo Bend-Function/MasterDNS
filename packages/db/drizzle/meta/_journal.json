@@ -176,6 +176,13 @@
       "when": 1790152248181,
       "tag": "0024_rotation_termination",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1790158431926,
+      "tag": "0025_idle_ip_cleanup",
+      "breakpoints": true
     }
   ]
 }

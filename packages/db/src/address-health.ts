@@ -1,6 +1,7 @@
 import { and, eq, ne, sql } from "drizzle-orm";
 import { addressHealthStates, cloudAddresses, endpointAddresses, endpointPools, endpoints, managedAddressSlots } from "./schema/index.js";
 import type { ProbeTransaction } from "./probe-rounds.js";
+import { getCloudTargetsForSlots } from "./cloud-targets.js";
 export type HealthTargetIdentity = { slotId?: string | null | undefined; endpointId?: string | null | undefined; endpointAddressId?: string | null | undefined; family: "4" | "6" };
 export function healthTargetWhere(table: typeof addressHealthStates, target: HealthTargetIdentity) {
   return target.slotId ? eq(table.slotId, target.slotId) : and(eq(table.endpointId, target.endpointId!), eq(table.family, target.family), target.endpointAddressId ? eq(table.addressId, target.endpointAddressId) : undefined);
@@ -23,7 +24,9 @@ export async function lockHealthTarget(tx: ProbeTransaction, target: HealthTarge
 }
 export async function lockHealthTargets(tx: ProbeTransaction, target: HealthTargetIdentity, initialize = false, now = new Date()) {
   if (target.slotId) {
-    const slot = initialize ? await initializeSlotCandidate(tx, target.slotId, now) : (await tx.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, target.slotId)).for("update"))[0];
+    let slot = (await tx.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, target.slotId)).for("update"))[0];
+    if (!slot || !(await getCloudTargetsForSlots(tx, [slot.id])).get(slot.id)?.available) return [];
+    if (initialize) slot = await initializeSlotCandidate(tx, target.slotId, now);
     const addressId = slot?.candidateAddressId ?? slot?.currentAddressId;
     const [address] = addressId ? await tx.select().from(cloudAddresses).where(eq(cloudAddresses.id, addressId)).for("share") : [];
     if (!slot || !address || slot.family !== target.family) return [];

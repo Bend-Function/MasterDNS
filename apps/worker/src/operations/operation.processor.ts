@@ -4,6 +4,7 @@ import { ProviderError, queueNames } from "@masterdns/contracts";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
   rotationLeases,
+  idleIpAddressReleasing,
   rotationPublications,
   captureCloudPolicyLinks,
   cloudEndpointLinks,
@@ -223,6 +224,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     const live = cloud && this.cloudRuntime ? await (await this.cloudRuntime.adapter(cloud.account.id, cloud.instance.service, { observation: true })).inspect({ accountId: cloud.account.id, service: cloud.instance.service, region: cloud.instance.region, instanceId: cloud.instance.externalId }) : undefined;
     return this.database.db.transaction(async (tx) => {
       if (cloud) await lockRotationContext(tx, cloud.slot.id);
+      if (step.action !== "delete" && input.record?.type === "A" && await idleIpAddressReleasing(tx, input.record.content)) throw new ProviderError("Address cleanup is in progress", "transient_failure", adapter.provider);
       if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
         const [pool] = await tx.select({

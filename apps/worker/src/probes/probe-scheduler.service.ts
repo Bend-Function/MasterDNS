@@ -1,5 +1,5 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
-import { and, eq, lte } from "drizzle-orm";
+import { and, eq, isNotNull, lte, ne, or } from "drizzle-orm";
 import { addressHealthPolicies, addressHealthStates, createProbeRound, healthCheckConfigs, healthTargetWhere, lockHealthTargets, probeGroups, probeRounds, resetHealthEvidence } from "@masterdns/db";
 import { DatabaseService } from "../database.service.js";
 import { ProbeHealthService } from "./probe-health.service.js";
@@ -30,6 +30,13 @@ export class ProbeSchedulerService implements OnModuleInit, OnModuleDestroy {
       const [snapshot] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId));
       if (!snapshot || (snapshot.mode === "local" && !snapshot.slotId)) return undefined;
       const targets = await lockHealthTargets(tx, snapshot, true, now);
+      if (snapshot.slotId && !targets.length) {
+        await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(and(eq(addressHealthStates.slotId, snapshot.slotId), eq(addressHealthStates.family, snapshot.family), or(
+          ne(addressHealthStates.healthState, "unknown"), ne(addressHealthStates.latestDecision, "unknown"), ne(addressHealthStates.consecutiveSuccesses, 0), ne(addressHealthStates.consecutiveFailures, 0),
+          isNotNull(addressHealthStates.evidenceExpiresAt), isNotNull(addressHealthStates.lastCheckedAt), isNotNull(addressHealthStates.nextRoundAt),
+        )));
+        return undefined;
+      }
       const [config] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, snapshot.configId)).for("share");
       const [group] = snapshot.mode !== "local" && snapshot.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, snapshot.groupId)).for("share") : [];
       const [policy] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId)).for("share");

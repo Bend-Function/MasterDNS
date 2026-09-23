@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { eq } from "drizzle-orm";
-import { hasFreshHealthEvidence, probeObservationStats, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, addressHealthPolicies, addressHealthStates, probeObservations, probeTasks, probeRounds, probeAgents, endpointAddresses, endpoints, reconcileIntents } from "@masterdns/db";
+import { createProbeRound, hasFreshHealthEvidence, probeObservationStats, cloudAccounts, cloudInstances, cloudInterfaces, cloudAddresses, managedAddressSlots, healthCheckConfigs, addressHealthPolicies, addressHealthStates, probeObservations, probeTasks, probeRounds, probeAgents, endpointAddresses, endpoints, reconcileIntents, rotationIncidents, rotationBudgetSegments, rotationAttempts } from "@masterdns/db";
 import { randomUUID } from "node:crypto";
 import { fixture, testDatabase } from "./probe-test-utils.js";
 import { ProbeSchedulerService } from "./probe-scheduler.service.js";
@@ -109,6 +109,35 @@ it("initializes version zero exactly once and keeps verified slot health indepen
   expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id)))[0]).toMatchObject({ addressVersion: 1, healthState: "healthy", latestDecision: "success" });
   expect(await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId, f.endpoint.id))).toHaveLength(1);
 });
+it("stops probing historical cloud addresses and invalidates their healthy evidence", async () => {
+  const f = await slotTarget("external");
+  const first = await scheduler.schedulePolicy(f.policy.id, now);
+  await vote(first!.id, "success"); await health.closeRound(first!.id, first!.deadline);
+  const [iface] = await connection.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.id, f.slot.interfaceId));
+  await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, iface!.id));
+  await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, iface!.instanceId));
+  expect(await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 30000))).toBeUndefined();
+  expect(await connection.db.select().from(probeRounds).where(eq(probeRounds.slotId, f.slot.id))).toHaveLength(1);
+  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id)))[0]).toMatchObject({ healthState: "unknown", latestDecision: "unknown", evidenceExpiresAt: null });
+  await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 31000));
+  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id)))[0]!.stateChangedAt).toEqual(new Date(now.getTime() + 30000));
+  await expect(connection.db.transaction(tx => createProbeRound(tx, f.actor, { slotId: f.slot.id, addressVersion: 1, configId: f.slotConfig.id, groupId: f.group.id, consensus: { mode: "all", minimumValid: 2 }, deadline: new Date(now.getTime() + 10000), resultExpiresAt: new Date(now.getTime() + 60000) }, now))).rejects.toThrow("Slot address is no longer current");
+});
+it("continues probing the active rotation candidate while inventory has not observed it", async () => {
+  const f = await slotTarget("external");
+  const [iface] = await connection.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.id, f.slot.interfaceId));
+  await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, iface!.id));
+  await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, iface!.instanceId));
+  const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: iface!.id, kind: "host", family: "4", address: "192.0.2.55", origin: "system", scanGeneration: 1 }).returning();
+  await connection.db.update(managedAddressSlots).set({ currentVersion: 1, candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
+  const segmentId = randomUUID(); const attemptId = randomUUID();
+  const [incident] = await connection.db.insert(rotationIncidents).values({ ownerUserId: f.actor.id, slotId: f.slot.id, family: "4", physicalKey: randomUUID(), sourceEventId: randomUUID(), trigger: "manual", phase: "candidate", currentSegmentId: segmentId, currentAttemptId: attemptId, authorizationRevision: 1, policyRevision: 1, addressVersion: 1 }).returning();
+  await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 3 });
+  await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, status: "candidate", beforeInventory: {}, candidateAddressId: candidate!.id, candidateVersion: 2 });
+  expect(await scheduler.schedulePolicy(f.policy.id, now)).toMatchObject({ address: "192.0.2.55", addressVersion: 2 });
+  await connection.db.update(rotationIncidents).set({ status: "complete" }).where(eq(rotationIncidents.id, incident!.id));
+  expect(await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 30000))).toBeUndefined();
+});
 it("local-only slot monitoring produces one local vote without external tasks", async () => {
   const f = await slotTarget("local"); const r = await scheduler.schedulePolicy(f.policy.id, now);
   expect(r).toBeDefined(); expect(r!.memberIds).toEqual(["local"]);
@@ -163,6 +192,13 @@ it("local execution restrictions contribute unavailable rather than target failu
   const r = await scheduler.schedulePolicy(f.policy.id, new Date());
   await health.checkLocal(r!.id);
   expect((await connection.db.select().from(probeRounds).where(eq(probeRounds.id, r!.id)))[0]).toMatchObject({ localOutcome: "unavailable" });
+});
+it("supersedes a queued local cloud round when its address leaves inventory", async () => {
+  const f = await slotTarget("local");
+  const r = await scheduler.schedulePolicy(f.policy.id, new Date());
+  await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, f.slot.interfaceId));
+  await health.checkLocal(r!.id);
+  expect((await connection.db.select().from(probeRounds).where(eq(probeRounds.id, r!.id)))[0]).toMatchObject({ status: "superseded", consensusResult: "unknown", localOutcome: null });
 });
 it("historical healthy state does not satisfy fresh authority until the success threshold is rebuilt", async () => {
   const f = await target();

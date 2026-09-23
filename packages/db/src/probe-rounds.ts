@@ -4,6 +4,7 @@ import { consensusPolicySchema, externalHealthCheckConfigSchema, probeTaskSchema
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeRoundSequences, probeRounds, probeTasks } from "./schema/index.js";
 import { and, eq } from "drizzle-orm";
 import type { MasterDnsDatabase } from "./index.js";
+import { getCloudTargetsForSlots } from "./cloud-targets.js";
 export type ProbeTransaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
 export class ProbeRoundError extends Error { constructor(public readonly status: number, message: string) { super(message); } }
 
@@ -41,6 +42,7 @@ export async function createProbeRound(tx: ProbeTransaction, actor: { id: string
         if (!slot) throw new ProbeRoundError(404, "Slot not found");
         const [owner] = await tx.select({ id: cloudAccounts.ownerUserId }).from(cloudInterfaces).innerJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id)).innerJoin(cloudAccounts, eq(cloudInstances.accountId, cloudAccounts.id)).where(eq(cloudInterfaces.id, slot.interfaceId));
         if (!owner || (actor.role !== "admin" && owner.id !== actor.id)) throw new ProbeRoundError(404, "Slot not found");
+        if (!(await getCloudTargetsForSlots(tx, [slot.id])).get(slot.id)?.available) throw new ProbeRoundError(400, "Slot address is no longer current");
         ownerUserId = owner.id;
         const version = slot.candidateAddressId ? slot.candidateVersion : slot.currentVersion;
         const addressId = slot.candidateAddressId ?? slot.currentAddressId;

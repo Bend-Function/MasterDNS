@@ -10,6 +10,7 @@ export function cloudTargetLabel(target: CloudTargetSummary) {
 }
 
 export function cloudTargetAddresses(target: CloudTargetSummary) {
+  if (target.inventoryCurrent === false && !target.activeCandidate) return `IPv${target.slot.family} · 历史地址 ${target.candidateAddress?.address ?? target.currentAddress?.address ?? "未知"} · 当前清单中不存在`;
   if (target.candidateAddress && target.candidateAddress.id === target.currentAddress?.id) return `IPv${target.slot.family} · 待验证 ${target.candidateAddress.address}`;
   const current = target.currentAddress ? `${target.slot.currentVersion > 0 ? "当前" : "当前待验证"} ${target.currentAddress.address}` : "暂无当前地址";
   const candidate = target.candidateAddress && target.candidateAddress.id !== target.currentAddress?.id
@@ -20,7 +21,7 @@ export function cloudTargetAddresses(target: CloudTargetSummary) {
 export function selectableCloudSlots(recordType: "A" | "AAAA", slots: AddressSlot[], context: SlotContext = { accountEnabled: true, instancePresent: true, managed: true }) {
   const family = recordType === "A" ? "4" : "6";
   if (!context.accountEnabled || !context.instancePresent || !context.managed) return [];
-  return slots.filter((entry) => entry.slot.family === family && entry.inScope && entry.currentAddress !== null);
+  return slots.filter((entry) => entry.slot.family === family && entry.inScope && entry.isCurrent !== false && entry.cloudTarget?.available !== false && entry.currentAddress !== null);
 }
 
 export function slotsMatchingExistingRecord(recordType: "A" | "AAAA", address: string, slots: AddressSlot[]) {

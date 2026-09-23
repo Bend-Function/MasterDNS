@@ -70,8 +70,16 @@ async function fixture(managed = false) {
 }
 
 describe("cloud account and authorization API", () => {
+  it("marks retained addresses and slots historical when a newer complete scope omits the instance", async () => {
+    const f = await fixture();
+    await connection.db.update(cloudScanScopes).set({ generation: 2, lastCompletedAt: new Date() }).where(eq(cloudScanScopes.id, f.scope.id));
+    expect((await service.instances(f.actor, f.account.id))[0]!.addresses).toEqual([]);
+    expect((await service.instance(f.actor, f.instance.id)).addresses[0]).toMatchObject({ id: f.address.id, isCurrent: false });
+    expect((await service.slots(f.actor, f.instance.id))[0]).toMatchObject({ isCurrent: false, ref: null, cloudTarget: { inventoryCurrent: false, available: false } });
+  });
   it("lists only latest inventory IPs and labels current and candidate slots without credentials", async () => {
     const f = await fixture();
+    await connection.db.update(cloudScanScopes).set({ generation: 2 }).where(eq(cloudScanScopes.id, f.scope.id));
     await connection.db.update(cloudInstances).set({ scanGeneration: 2, name: "edge" }).where(eq(cloudInstances.id, f.instance.id));
     await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, f.iface.id));
     const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "192.0.2.20", origin: "system", scanGeneration: 2 }).returning();
@@ -85,7 +93,12 @@ describe("cloud account and authorization API", () => {
       slot: { id: f.slot.id, name: "primary", family: "4", currentVersion: 0, candidateVersion: 1 },
       currentAddress: { id: f.address.id, address: "192.0.2.10" },
       candidateAddress: { id: candidate!.id, address: "192.0.2.20" },
+      inventoryCurrent: true, activeCandidate: false, available: true,
     });
+    const detail = await service.instance(f.actor, f.instance.id);
+    expect(detail.addresses.find(address => address.id === f.address.id)).toMatchObject({ isCurrent: false });
+    expect(detail.addresses.find(address => address.id === candidate!.id)).toMatchObject({ isCurrent: true });
+    expect(slot).toMatchObject({ isCurrent: true, ref: { address: "192.0.2.20" } });
     await connection.db.update(cloudInstances).set({ metadata: { present: false } }).where(eq(cloudInstances.id, f.instance.id));
     expect((await service.instances(f.actor, f.account.id))[0]!.addresses).toEqual([]);
   });

@@ -36,6 +36,22 @@ export type CloudInventory = {
 
 export type CloudPage = { items: CloudInventory[]; cursor?: string };
 
+export type IdleStaticIp = {
+  region: string;
+  name: string;
+  address: string;
+  arn: string;
+  createdAt: string;
+};
+
+export type IdleStaticIpReleaseResult = {
+  status: "released" | "missing" | "skipped" | "pending";
+  reason?: string;
+  operationIds?: string[];
+  rejectedNoEffect?: boolean;
+  retryAfterMs?: number;
+};
+
 export type Capability = {
   available: boolean;
   reason?: string;
@@ -67,6 +83,9 @@ export interface CloudAdapter {
   discover(region: string, cursor?: string): Promise<CloudPage>;
   inspect(ref: CloudRef): Promise<CloudInventory>;
   monthlyTraffic?(ref: CloudRef, now?: Date): Promise<MonthlyTraffic>;
+  listIdleStaticIps?(region: string): Promise<IdleStaticIp[]>;
+  releaseIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
+  observeIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability;
   execute(step: CloudStep): Promise<CloudStepResult>;
   observe(step: CloudStep): Promise<CloudObservationStatus>;

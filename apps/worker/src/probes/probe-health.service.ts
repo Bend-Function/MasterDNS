@@ -2,7 +2,7 @@ import { Injectable, Logger } from "@nestjs/common";
 import { advanceRoundHealth, evaluateProbeRound } from "@masterdns/automation";
 import { CheckerRegistry } from "@masterdns/checkers";
 import { isAllowedProbeTarget, type ProbeOutcome } from "@masterdns/contracts";
-import { lockRotationContext, addressHealthPolicies, addressHealthStates, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeAgents, probeGroups, probeObservations, probeRounds } from "@masterdns/db";
+import { getCloudTargetsForSlots, lockRotationContext, addressHealthPolicies, addressHealthStates, healthCheckConfigs, healthTargetWhere, lockHealthTarget, probeAgents, probeGroups, probeObservations, probeRounds } from "@masterdns/db";
 import { and, asc, eq, gt, isNull, notInArray, sql } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
 import { HealthResultService } from "../health/health-result.service.js";
@@ -79,6 +79,15 @@ export class ProbeHealthService {
     try {
       const [round] = await this.database.db.select().from(probeRounds).where(eq(probeRounds.id, roundId));
       if (!round?.memberIds.includes("local") || round.status !== "pending" || round.localReceivedAt || round.deadline <= new Date()) return;
+      if (round.slotId) {
+        const target = (await getCloudTargetsForSlots(this.database.db, [round.slotId])).get(round.slotId);
+        const address = target?.candidateAddress ?? target?.currentAddress;
+        const version = target?.candidateAddress ? target.slot.candidateVersion : target?.slot.currentVersion;
+        if (!target?.available || address?.address !== round.address || version !== round.addressVersion) {
+          await this.database.db.update(probeRounds).set({ status: "superseded", consensusResult: "unknown", finalizedAt: new Date() }).where(and(eq(probeRounds.id, round.id), eq(probeRounds.status, "pending")));
+          return;
+        }
+      }
       const family = Number(round.family) as 4 | 6;
       const privateOptIn = process.env.ALLOW_PRIVATE_HEALTH_TARGETS === "true";
       if (!isAllowedProbeTarget(round.address, family, privateOptIn ? round.networkPolicy ?? undefined : undefined)) {

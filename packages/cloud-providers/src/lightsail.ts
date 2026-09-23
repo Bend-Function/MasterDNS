@@ -1,3 +1,4 @@
+import { isIPv4 } from "node:net";
 import {
   GetInstanceCommand,
   GetInstanceMetricDataCommand,
@@ -6,6 +7,7 @@ import {
   GetStaticIpCommand,
   GetStaticIpsCommand,
   LightsailClient,
+  ReleaseStaticIpCommand,
 } from "@aws-sdk/client-lightsail";
 import type { StaticIp } from "@aws-sdk/client-lightsail";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
@@ -17,7 +19,7 @@ import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js
 import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
 import { monthPeriod, monthlyTrafficResult, sumTraffic, trafficNumber } from "./monthly-traffic.js";
-import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation } from "./provider.js";
+import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation, IdleStaticIp, IdleStaticIpReleaseResult } from "./provider.js";
 
 type ScopedOriginal =
   | { kind: "dynamic"; address: string }
@@ -67,13 +69,94 @@ export class LightsailCloudAdapter implements CloudAdapter {
 
   private async listStaticIps(region: string): Promise<StaticIp[]> {
     const staticIps: StaticIp[] = [];
+    const seenTokens = new Set<string>();
     let pageToken: string | undefined;
     do {
       const response = await this.lightsailSend(region, new GetStaticIpsCommand({ pageToken }));
       staticIps.push(...response.staticIps ?? []);
       pageToken = response.nextPageToken;
+      if (pageToken !== undefined) {
+        if (seenTokens.has(pageToken)) throw new CloudError("invalid_cursor", false);
+        seenTokens.add(pageToken);
+      }
     } while (pageToken !== undefined);
     return staticIps;
+  }
+
+  async listIdleStaticIps(region: string): Promise<IdleStaticIp[]> {
+    try {
+      const { externalAccountId } = await this.verifyIdentity();
+      return (await this.listStaticIps(region)).flatMap(staticIp => {
+        if (staticIp.isAttached !== false || staticIp.attachedTo !== undefined) return [];
+        const identity = staticIpIdentity(staticIp, region, externalAccountId);
+        return identity === undefined ? [] : [identity];
+      });
+    } catch (error) { throw normalizeAwsError(error); }
+  }
+
+  async releaseIdleStaticIp(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult> {
+    const { externalAccountId } = await this.verifyIdentity();
+    if (!validIdleStaticIpTarget(target, externalAccountId)) return { status: "skipped", reason: "remote_identity_changed" };
+
+    let current: StaticIp | undefined;
+    try {
+      current = (await this.lightsailSend(target.region, new GetStaticIpCommand({ staticIpName: target.name }))).staticIp;
+    } catch (error) {
+      const normalized = normalizeAwsError(error);
+      if (normalized.code === "resource_not_found") return { status: "missing" };
+      throw normalized;
+    }
+    const reason = idleStaticIpChange(target, current, externalAccountId);
+    if (reason !== undefined) return { status: "skipped", reason };
+
+    let operationIds: string[] = [];
+    let releaseError: CloudError | undefined;
+    try {
+      // awsClientOptions.maxAttempts is one: a lost mutation response must only be observed.
+      const response = await this.lightsailSend(target.region, new ReleaseStaticIpCommand({ staticIpName: target.name }));
+      operationIds = (response.operations ?? []).flatMap((operation: { id?: string }) =>
+        typeof operation.id === "string" && operation.id.length > 0 ? [operation.id] : []);
+    } catch (error) { releaseError = normalizeAwsError(error); }
+
+    const observed = await this.observeIdleStaticIpWithIdentity(target, externalAccountId);
+    const receipt = operationIds.length === 0 ? {} : { operationIds };
+    if (observed.status === "released") return { status: "released", ...receipt };
+    const rejectedNoEffect = releaseError !== undefined
+      && ["permission_denied", "quota_exceeded", "rate_limited", "credentials_expired", "invalid_credentials"].includes(releaseError.code)
+      && ((observed.status === "pending" && observed.reason === "release_pending")
+        || (observed.status === "skipped" && observed.reason === "attached"));
+    const retryAfterMs = releaseError === undefined ? observed.retryAfterMs : releaseError.retryAfterMs;
+    return { status: "pending", reason: releaseError?.code ?? observed.reason ?? "release_pending", ...receipt,
+      ...(rejectedNoEffect ? { rejectedNoEffect: true } : {}),
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    };
+  }
+
+  async observeIdleStaticIp(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult> {
+    try {
+      const { externalAccountId } = await this.verifyIdentity();
+      if (!validIdleStaticIpTarget(target, externalAccountId)) return { status: "skipped", reason: "remote_identity_changed" };
+      return await this.observeIdleStaticIpWithIdentity(target, externalAccountId);
+    } catch (error) {
+      const normalized = normalizeAwsError(error);
+      return { status: "pending", reason: normalized.code,
+        ...(normalized.retryAfterMs === undefined ? {} : { retryAfterMs: normalized.retryAfterMs }),
+      };
+    }
+  }
+
+  private async observeIdleStaticIpWithIdentity(target: IdleStaticIp, externalAccountId: string): Promise<IdleStaticIpReleaseResult> {
+    try {
+      const { staticIp } = await this.lightsailSend(target.region, new GetStaticIpCommand({ staticIpName: target.name }));
+      if (staticIp === undefined) return { status: "pending", reason: "remote_identity_changed" };
+      const reason = idleStaticIpChange(target, staticIp, externalAccountId);
+      return reason === undefined ? { status: "pending", reason: "release_pending" } : { status: "skipped", reason };
+    } catch (error) {
+      const normalized = normalizeAwsError(error);
+      return normalized.code === "resource_not_found" ? { status: "released" } : { status: "pending", reason: normalized.code,
+        ...(normalized.retryAfterMs === undefined ? {} : { retryAfterMs: normalized.retryAfterMs }),
+      };
+    }
   }
 
   async verifyIdentity(): Promise<{ externalAccountId: string }> {
@@ -250,4 +333,33 @@ function sameLightsailIdentity(instanceArn: string, resourceArn: string, resourc
   const resource = resourceArn.split(":");
   return instance.length === 6 && resource.length === 6 && instance.slice(0, 5).every((part, index) => part === resource[index])
     && resource[5]?.startsWith(`${resourceType}/`) === true;
+}
+
+function staticIpIdentity(staticIp: StaticIp, region: string, externalAccountId: string): IdleStaticIp | undefined {
+  const arn = staticIp.arn;
+  if (typeof arn !== "string" || typeof staticIp.name !== "string" || !staticIp.name.trim()
+    || typeof staticIp.ipAddress !== "string" || !isIPv4(staticIp.ipAddress)
+    || !(staticIp.createdAt instanceof Date) || !Number.isFinite(staticIp.createdAt.getTime())) return undefined;
+  const parts = /^arn:(aws(?:-[a-z0-9]+)*):lightsail:([a-z0-9-]+):(\d{12}):StaticIp\/([^:\s/]+)$/.exec(arn);
+  if (!parts || parts[2] !== region || parts[3] !== externalAccountId
+    || (staticIp.location?.regionName !== undefined && staticIp.location.regionName !== region)
+    || (staticIp.resourceType !== undefined && staticIp.resourceType !== "StaticIp")) return undefined;
+  return { region, name: staticIp.name, address: staticIp.ipAddress, arn, createdAt: staticIp.createdAt.toISOString() };
+}
+
+function sameIdleStaticIp(target: IdleStaticIp, current: IdleStaticIp | undefined): boolean {
+  return current !== undefined && current.region === target.region && current.name === target.name
+    && current.address === target.address && current.arn === target.arn && current.createdAt === target.createdAt;
+}
+
+function validIdleStaticIpTarget(target: IdleStaticIp, externalAccountId: string): boolean {
+  return sameIdleStaticIp(target, staticIpIdentity({
+    name: target.name, ipAddress: target.address, arn: target.arn, createdAt: new Date(target.createdAt),
+  }, target.region, externalAccountId));
+}
+
+function idleStaticIpChange(target: IdleStaticIp, current: StaticIp | undefined, externalAccountId: string): string | undefined {
+  if (current === undefined || !sameIdleStaticIp(target, staticIpIdentity(current, target.region, externalAccountId))) return "remote_identity_changed";
+  if (current.isAttached !== false || current.attachedTo !== undefined) return "attached";
+  return undefined;
 }

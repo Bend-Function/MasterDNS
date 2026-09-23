@@ -2,8 +2,9 @@ import { cloudRotationLimitPolicySchema, cloudRotationLimitRules, cloudRotationR
 import { eq, sql } from "drizzle-orm";
 import { cloudAccounts, cloudRotationBuckets, cloudRotationLimitPolicies, cloudRotationReservations, cloudRotationLimitSwitches } from "./schema/index.js";
 import { databaseNow, type RotationTransaction } from "./rotation-context.js";
+import { idleIpReleaseInProgress } from "./idle-ip-guards.js";
 
-export type CloudRotationWriteInput = { accountId: string; service: CloudService; region: string; stepId: string; action: string; remainingSteps?: Array<{ id: string; action: string }> };
+export type CloudRotationWriteInput = { accountId: string; service: CloudService; region: string; stepId: string; action: string; idleCleanupId?: string; remainingSteps?: Array<{ id: string; action: string }> };
 export type CloudRotationWriteAdmission = { allowed: true } | { allowed: false; retryAt: Date; reason: "rotation_rate_limited"; ruleId: string };
 type Bucket = typeof cloudRotationBuckets.$inferSelect;
 const bucketKey = (identity: string, rule: string, region: string | null) => JSON.stringify([identity, rule, region]);
@@ -23,7 +24,7 @@ async function context(tx: RotationTransaction, accountId: string, service: Clou
     left join cloud_rotation_limit_policies p on p.account_id=a.id and p.service=${service}
     where a.provider=${account.provider} and a.external_account_id=${account.externalAccountId}`);
   const [setting] = await tx.select().from(cloudRotationLimitSwitches).where(eq(cloudRotationLimitSwitches.identityKey, identityKey));
-  return { identityKey, enabled: setting?.enabled ?? true, utilizationPercent: policies.find(p => p.id === accountId)!.percent, effectivePercent: Math.min(...policies.map(p => p.percent)) };
+  return { identityKey, externalAccountId: account.externalAccountId, enabled: setting?.enabled ?? true, utilizationPercent: policies.find(p => p.id === accountId)!.percent, effectivePercent: Math.min(...policies.map(p => p.percent)) };
 }
 async function buckets(tx: RotationTransaction, identityKey: string) {
   return tx.select().from(cloudRotationBuckets).where(eq(cloudRotationBuckets.identityKey, identityKey)).orderBy(cloudRotationBuckets.key).for("update");
@@ -56,6 +57,7 @@ export async function reserveCloudRotationWrite(tx: RotationTransaction, input: 
   const c = await context(tx, input.accountId, input.service);
   const rows = await buckets(tx, c.identityKey);
   const now = await databaseNow(tx);
+  if (input.service === "lightsail" && await idleIpReleaseInProgress(tx, c.externalAccountId, input.region, input.idleCleanupId)) return denied("idle_ip_cleanup", new Date(now.getTime() + 5000));
   const cooldown = rows.find(row => row.ruleId === "cooldown")?.cooldownUntil;
   if (cooldown && cooldown > now) return denied("cooldown", cooldown);
   const rules = cloudRotationRulesForAction(input.service, input.action, c.effectivePercent);

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
+import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, instanceAuthorizations, managedAddressSlots, rotationIncidents, users } from "@masterdns/db";
 import { encryptJson } from "@masterdns/crypto";
 import { Ec2CloudAdapter, LightsailCloudAdapter, evaluateCapabilities, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 vi.mock("@masterdns/cloud-providers", async (importOriginal) => ({
@@ -53,6 +53,51 @@ async function awsInventory(accountId: string, service: "ec2" | "lightsail", pri
 }
 
 describe("complete cloud scope sync", () => {
+  it.each(["ec2", "lightsail"] as const)("stages manual %s public IP drift on the same slot and invalidates old evidence", async service => {
+    const f = await fixture();
+    const item = await awsInventory(f.account.id, service);
+    f.adapter.discover.mockResolvedValue({ items: [item] });
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [row] = await connection.db.select({ slot: managedAddressSlots }).from(managedAddressSlots)
+      .innerJoin(cloudAddresses, eq(cloudAddresses.id, managedAddressSlots.currentAddressId))
+      .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId))
+      .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
+      .where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudAddresses.address, "198.51.100.10")));
+    const slot = row!.slot;
+    await connection.db.update(managedAddressSlots).set({ currentVersion: 4, candidateVersion: 6 }).where(eq(managedAddressSlots.id, slot.id));
+    await connection.db.insert(addressHealthStates).values({ slotId: slot.id, family: "4", addressId: slot.currentAddressId!, addressVersion: 4, healthState: "healthy", latestDecision: "success", consecutiveSuccesses: 3, evidenceExpiresAt: new Date(Date.now() + 60000) });
+    item.interfaces[0]!.addresses[1]!.address = "198.51.100.30";
+    expect(await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+    const [candidate] = await connection.db.select().from(cloudAddresses).where(and(eq(cloudAddresses.interfaceId, slot.interfaceId), eq(cloudAddresses.address, "198.51.100.30")));
+    expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot.id)))[0]).toMatchObject({ currentAddressId: slot.currentAddressId, currentVersion: 4, candidateAddressId: candidate!.id, candidateVersion: 7 });
+    expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, slot.id)))[0]).toMatchObject({ healthState: "unknown", latestDecision: "unknown", consecutiveSuccesses: 0, evidenceExpiresAt: null });
+    await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
+    expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot.id)))[0]!.candidateVersion).toBe(7);
+    expect(await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, slot.interfaceId))).toHaveLength(2);
+  });
+
+  it("does not replace a primary candidate while rotation is unresolved", async () => {
+    const f = await fixture();
+    await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [row] = await connection.db.select({ slot: managedAddressSlots }).from(managedAddressSlots).innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId)).innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId)).where(eq(cloudInstances.accountId, f.account.id));
+    const slot = row!.slot;
+    await connection.db.insert(rotationIncidents).values({ ownerUserId: f.account.ownerUserId, slotId: slot.id, family: "4", physicalKey: randomUUID(), sourceEventId: randomUUID(), trigger: "manual", status: "paused", currentSegmentId: randomUUID(), authorizationRevision: 1, policyRevision: 1, addressVersion: 0 });
+    f.item.interfaces[0]!.addresses[0]!.address = "192.0.2.40";
+    await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
+    expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot.id)))[0]).toMatchObject({ currentAddressId: slot.currentAddressId, candidateAddressId: null, candidateVersion: 0 });
+  });
+
+  it("invalidates historical secondary-slot health in the successful scan transaction", async () => {
+    const f = await fixture(); f.item.interfaces[0]!.addresses[0]!.primary = false;
+    await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
+    const [row] = await connection.db.select({ slot: managedAddressSlots }).from(managedAddressSlots).innerJoin(cloudInterfaces, eq(cloudInterfaces.id, managedAddressSlots.interfaceId)).innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId)).where(eq(cloudInstances.accountId, f.account.id));
+    const slot = row!.slot;
+    await connection.db.insert(addressHealthStates).values({ slotId: slot.id, family: "4", addressId: slot.currentAddressId!, addressVersion: 1, healthState: "healthy", latestDecision: "success", consecutiveSuccesses: 3, evidenceExpiresAt: new Date(Date.now() + 60000) });
+    f.item.interfaces[0]!.addresses = [];
+    expect(await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+    expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.slotId, slot.id)))[0]).toMatchObject({ healthState: "unknown", latestDecision: "unknown", consecutiveSuccesses: 0, evidenceExpiresAt: null });
+    expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot.id)))[0]!.currentAddressId).toBe(slot.currentAddressId);
+  });
   it("keeps EC2 private addresses from publicly routable CIDRs separate from public associations", async () => {
     const f = await fixture();
     const item = await awsInventory(f.account.id, "ec2", "11.0.0.4");
@@ -112,7 +157,7 @@ describe("complete cloud scope sync", () => {
     expect(address).toMatchObject({ origin: "system", remoteAllocationId: "owned-allocation" });
   });
 
-  it.each(["ec2", "lightsail"] as const)("repairs a legacy private primary collision for %s without repointing the old slot", async service => {
+  it.each([["ec2", false], ["ec2", true], ["lightsail", false], ["lightsail", true]] as const)("repairs a legacy private primary collision for %s without repointing the old slot (public first: %s)", async (service, publicFirst) => {
     const f = await fixture();
     const item = await awsInventory(f.account.id, service);
     const addresses = item.interfaces[0]!.addresses;
@@ -127,7 +172,7 @@ describe("complete cloud scope sync", () => {
     await connection.db.update(cloudAddresses).set({ metadata: {} }).where(eq(cloudAddresses.interfaceId, iface!.id));
     // Exercise an already-versioned slot; discovery must not reset its identity or pointers.
     await connection.db.update(managedAddressSlots).set({ currentVersion: 3 }).where(eq(managedAddressSlots.id, old!.id));
-    item.interfaces[0]!.addresses = addresses;
+    item.interfaces[0]!.addresses = publicFirst ? [...addresses].reverse() : addresses;
     await f.service.scanScope(f.account.id, service, "us-east-1", f.adapter as unknown as CloudAdapter);
     const after = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.interfaceId, iface!.id));
     expect(after).toHaveLength(2);
@@ -184,7 +229,7 @@ describe("complete cloud scope sync", () => {
     const [instance] = await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id));
     expect(instance).toMatchObject({ scanGeneration: 1, metadata: { present: true } });
   });
-  it("records new observations without changing existing slots or authorizations", async () => {
+  it("stages changed primary observations without publishing or changing authorizations", async () => {
     const f = await fixture(); await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
     const [instance] = await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id));
     const [iface] = await connection.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.instanceId, instance!.id));
@@ -193,7 +238,8 @@ describe("complete cloud scope sync", () => {
     f.item.interfaces[0]!.addresses[0]!.address = "192.0.2.2";
     await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);
     const [after] = await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, slot!.id));
-    expect(after).toMatchObject({ currentAddressId: slot!.currentAddressId, currentVersion: 0, candidateAddressId: null });
+    const [candidate] = await connection.db.select().from(cloudAddresses).where(and(eq(cloudAddresses.interfaceId, iface!.id), eq(cloudAddresses.address, "192.0.2.2")));
+    expect(after).toMatchObject({ currentAddressId: slot!.currentAddressId, currentVersion: 0, candidateAddressId: candidate!.id, candidateVersion: 1 });
     expect(await connection.db.select().from(cloudAddresses).where(eq(cloudAddresses.interfaceId, iface!.id))).toHaveLength(2);
     expect(await connection.db.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, instance!.id))).toEqual([]);
   });

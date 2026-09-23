@@ -5,6 +5,7 @@ import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { captureCloudPolicyLinks, auditLogs, bindingAssignments, cloudAccounts, cloudAddresses, cloudEndpointLinks, cloudInstances, cloudInterfaces, cloudScanScopes, dnsRecords, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, operationSteps, policyVersions, reconcileIntents, providerAccounts, zones } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
+import { idleIpAddressReleasing } from "@masterdns/db";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import { normalizeRecordName } from "../dns/dns-name.js";
 import { cloudRequestKey, withCloudRequest } from "./cloud-idempotency.js";
@@ -48,6 +49,7 @@ export class CloudBindingsService {
             .innerJoin(cloudAddresses, eq(cloudAddresses.id, managedAddressSlots.currentAddressId))
             .where(eq(managedAddressSlots.id, input.slotId)).for("update");
           if (!source) throw new ConflictException("Cloud slot has no observed host address");
+          if (await idleIpAddressReleasing(tx, source.address.address)) throw new ConflictException("Address cleanup is in progress");
           const [authorization] = await tx.select().from(instanceAuthorizations).where(eq(instanceAuthorizations.instanceId, source.instance.id)).for("share");
           if (!authorization?.managed) throw new ConflictException("Cloud instance is not managed");
           if ((account.regions !== null && !account.regions.includes(source.instance.region)) || source.instance.metadata.present === false || source.iface.scanGeneration !== source.generation || source.address.scanGeneration !== source.generation) throw new ConflictException("Cloud slot address is no longer present in current inventory");

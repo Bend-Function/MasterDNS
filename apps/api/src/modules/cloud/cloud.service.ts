@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy, wakeCloudRotationLimitWaits } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, users } from "@masterdns/db";
 import { CloudError, createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
 import { cloudProviderServices, cloudRotationLimitPolicySchema, validCloudRegion, type CloudProvider, type CloudService as CloudServiceName, type SlotRef, type MonthlyTrafficResponse } from "@masterdns/contracts";
@@ -133,7 +133,8 @@ export class CloudService {
     const addresses = await this.database.db.select({ instanceId: cloudInstances.id, address: cloudAddresses }).from(cloudAddresses)
       .innerJoin(cloudInterfaces, eq(cloudInterfaces.id, cloudAddresses.interfaceId))
       .innerJoin(cloudInstances, eq(cloudInstances.id, cloudInterfaces.instanceId))
-      .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInterfaces.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.kind, "host")));
+      .leftJoin(cloudScanScopes, and(eq(cloudScanScopes.accountId, cloudInstances.accountId), eq(cloudScanScopes.service, cloudInstances.service), eq(cloudScanScopes.region, cloudInstances.region)))
+      .where(and(eq(cloudInstances.accountId, accountId), sql`(${cloudScanScopes.id} is null or ${cloudScanScopes.generation} = ${cloudInstances.scanGeneration})`, eq(cloudInterfaces.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.scanGeneration, cloudInstances.scanGeneration), eq(cloudAddresses.kind, "host")));
     const byInstance = new Map<string, typeof cloudAddresses.$inferSelect[]>();
     for (const row of addresses) {
       const values = byInstance.get(row.instanceId) ?? [];
@@ -151,7 +152,10 @@ export class CloudService {
     const interfaces = await this.database.db.select().from(cloudInterfaces).where(eq(cloudInterfaces.instanceId, instanceId));
     const addresses = await this.database.db.select({ address: cloudAddresses }).from(cloudAddresses).innerJoin(cloudInterfaces, eq(cloudInterfaces.id, cloudAddresses.interfaceId)).where(eq(cloudInterfaces.instanceId, instanceId));
     const account = await this.findAccount(actor, row.instance.accountId);
-    return { ...row, inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces, addresses: addresses.map((entry) => entry.address) };
+    const [scope] = await this.database.db.select().from(cloudScanScopes).where(and(eq(cloudScanScopes.accountId, account.id), eq(cloudScanScopes.service, row.instance.service), eq(cloudScanScopes.region, row.instance.region)));
+    const instanceCurrent = row.instance.metadata.present !== false && (!scope || scope.generation === row.instance.scanGeneration);
+    const currentInterfaces = new Set(interfaces.filter(iface => instanceCurrent && iface.scanGeneration === row.instance.scanGeneration).map(iface => iface.id));
+    return { ...row, inScope: account.regions === null || account.regions.includes(row.instance.region), interfaces: interfaces.map(iface => ({ ...iface, isCurrent: currentInterfaces.has(iface.id) })), addresses: addresses.map(({ address }) => ({ ...address, isCurrent: currentInterfaces.has(address.interfaceId) && address.scanGeneration === row.instance.scanGeneration })) };
   }
 
   async slots(actor: AuthUser, instanceId: string) {
@@ -163,10 +167,10 @@ export class CloudService {
       metadata: providerMetadata(instance.metadata),
       ...(typeof instance.metadata.nativeName === "string" ? { nativeName: instance.metadata.nativeName } : {}),
       ...(typeof instance.metadata.ipv6Only === "boolean" ? { ipv6Only: instance.metadata.ipv6Only } : {}),
-      interfaces: instance.metadata.present === false ? [] : detail.interfaces.filter((iface) => iface.scanGeneration === instance.scanGeneration).map((iface) => ({
+      interfaces: detail.interfaces.filter((iface) => iface.isCurrent).map((iface) => ({
         id: iface.externalId, metadata: providerMetadata(iface.metadata),
         ...(typeof iface.metadata.deviceIndex === "number" ? { deviceIndex: iface.metadata.deviceIndex } : {}),
-        addresses: detail.addresses.filter((address) => address.interfaceId === iface.id && address.kind === "host" && address.scanGeneration === instance.scanGeneration).map((address) => ({
+        addresses: detail.addresses.filter((address) => address.interfaceId === iface.id && address.kind === "host" && address.isCurrent).map((address) => ({
           metadata: providerMetadata(address.metadata),
           ...(typeof address.metadata.privateAddress === "string" ? { privateAddress: address.metadata.privateAddress } : {}),
           ...(typeof address.metadata.resourceId === "string" ? { resourceId: address.metadata.resourceId } : {}),
@@ -182,8 +186,11 @@ export class CloudService {
       .where(eq(cloudInterfaces.instanceId, instanceId));
     const targets = await getCloudTargetsForSlots(this.database.db, rows.map(row => row.slot.id));
     return rows.map(({ slot, currentAddress, interfaceExternalId }) => {
-      const ref: SlotRef | null = currentAddress ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: currentAddress.address, family: slot.family === "4" ? 4 : 6 } : null;
-      return { slot, currentAddress, cloudTarget: targets.get(slot.id) ?? null, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
+      const cloudTarget = targets.get(slot.id) ?? null;
+      const isCurrent = !!cloudTarget && (cloudTarget.inventoryCurrent || cloudTarget.activeCandidate);
+      const selected = cloudTarget?.candidateAddress ?? cloudTarget?.currentAddress;
+      const ref: SlotRef | null = selected && isCurrent ? { ...inventory.ref, slotId: slot.id, interfaceId: interfaceExternalId, address: selected.address, family: slot.family === "4" ? 4 : 6 } : null;
+      return { slot, currentAddress, cloudTarget, isCurrent, ref, capability: ref ? evaluateCapabilities(ref, inventory) : null, inScope: detail.inScope };
     });
   }
 

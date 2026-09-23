@@ -50,6 +50,7 @@ it("creates slot config without any linked endpoint and enforces family and owne
    instance: { id: instance!.id, name: null, externalId: "i-test", service: "ec2", region: "test" },
    slot: { id: slot!.id, name: "primary", family: "4", currentVersion: 0, candidateVersion: 0 },
    currentAddress: { id: address!.id, address: "192.0.2.20" }, candidateAddress: null,
+   inventoryCurrent: true, activeCandidate: false, available: true,
  });
  expect(await service.list(stranger.actor as never)).toEqual([]);
  await expect(service.save(actor, { ...input, family: "6" })).rejects.toMatchObject({ status: 400 });
@@ -58,6 +59,11 @@ it("creates slot config without any linked endpoint and enforces family and owne
  const expiresAt = new Date(Date.now()+60000);
  const [state] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family: "4", addressId: address!.id, addressVersion: 0, latestDecision: "success", evidenceExpiresAt: expiresAt, consecutiveSuccesses: 3 }).returning();
  expect((await service.list(actor))[0]!.state?.id).toBe(state!.id);
+ await connection.db.update(cloudInterfaces).set({ scanGeneration: 2 }).where(eq(cloudInterfaces.id, nic!.id));
+ await connection.db.update(cloudInstances).set({ scanGeneration: 2 }).where(eq(cloudInstances.id, instance!.id));
+ expect((await service.list(actor))[0]).toMatchObject({ state: null, cloudTarget: { inventoryCurrent: false, available: false } });
+ await connection.db.update(cloudInterfaces).set({ scanGeneration: 1 }).where(eq(cloudInterfaces.id, nic!.id));
+ await connection.db.update(cloudInstances).set({ scanGeneration: 1 }).where(eq(cloudInstances.id, instance!.id));
  const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: nic!.id, kind: "host", family: "4", address: "192.0.2.21", origin: "system", scanGeneration: 1 }).returning();
  await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 1 }).where(eq(managedAddressSlots.id, slot!.id));
  const [changed] = await service.list(actor);
