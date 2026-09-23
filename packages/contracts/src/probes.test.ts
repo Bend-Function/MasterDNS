@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import {
+  isProbeOnline,
   heartbeatRequestSchema,
   heartbeatResponseSchema,
   leaseRequestSchema,
@@ -11,6 +12,23 @@ import {
   resultAckSchema,
   resultBatchSchema,
 } from "./probes.js";
+
+describe("probe liveness", () => {
+  const now = new Date("2026-09-15T01:00:00Z");
+  const probe = { enabled: true, revokedAt: null, lastSeenAt: now };
+
+  it("excludes never-seen, expired, disabled and revoked probes", () => {
+    expect(isProbeOnline({ ...probe, lastSeenAt: null }, now)).toBe(false);
+    expect(isProbeOnline({ ...probe, lastSeenAt: new Date(now.getTime() - 90_001) }, now)).toBe(false);
+    expect(isProbeOnline({ ...probe, enabled: false }, now)).toBe(false);
+    expect(isProbeOnline({ ...probe, revokedAt: now }, now)).toBe(false);
+  });
+
+  it("accepts a fresh heartbeat at the 90-second boundary and after recovery", () => {
+    expect(isProbeOnline({ ...probe, lastSeenAt: new Date(now.getTime() - 90_000).toISOString() }, now)).toBe(true);
+    expect(isProbeOnline(probe, now)).toBe(true);
+  });
+});
 
 const taskFixture: unknown = JSON.parse(
   readFileSync(fileURLToPath(new URL("../../../docs/contracts/fixtures/probe-task-v1.json", import.meta.url)), "utf8"),

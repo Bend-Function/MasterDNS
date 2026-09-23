@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { consensusPolicySchema, externalHealthCheckConfigSchema, probeTaskSchema, type ConsensusPolicy, type ProbeTask } from "@masterdns/contracts";
+import { consensusPolicySchema, externalHealthCheckConfigSchema, isProbeOnline, probeTaskSchema, type ConsensusPolicy, type ProbeTask } from "@masterdns/contracts";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeRoundSequences, probeRounds, probeTasks } from "./schema/index.js";
 import { and, eq } from "drizzle-orm";
 import type { MasterDnsDatabase } from "./index.js";
@@ -69,7 +69,7 @@ export async function createProbeRound(tx: ProbeTransaction, actor: { id: string
       if (!config || !configMatches) throw new ProbeRoundError(404, "Probe config not found for target");
       const [group] = input.groupId ? await tx.select().from(probeGroups).where(eq(probeGroups.id, input.groupId)).for("share") : [];
       if ((!group && !input.includeLocal) || (group && group.ownerUserId !== ownerUserId)) throw new ProbeRoundError(404, "Probe group not found for target owner");
-      const members = group ? await tx.select({ probeId: probeAgents.id, ownerUserId: probeAgents.ownerUserId, capabilities: probeAgents.capabilities, enabled: probeAgents.enabled, revokedAt: probeAgents.revokedAt }).from(probeGroupMembers).innerJoin(probeAgents, eq(probeGroupMembers.probeId, probeAgents.id)).where(eq(probeGroupMembers.groupId, group.id)) : [];
+      const members = group ? await tx.select({ probeId: probeAgents.id, ownerUserId: probeAgents.ownerUserId, capabilities: probeAgents.capabilities, enabled: probeAgents.enabled, revokedAt: probeAgents.revokedAt, lastSeenAt: probeAgents.lastSeenAt }).from(probeGroupMembers).innerJoin(probeAgents, eq(probeGroupMembers.probeId, probeAgents.id)).where(eq(probeGroupMembers.groupId, group.id)) : [];
       if ((!members.length && !input.includeLocal) || members.length > 100 || members.some(m => m.ownerUserId !== ownerUserId)) throw new ProbeRoundError(400, "Invalid probe cohort");
       const memberIds = members.map(m => m.probeId).sort();
       if (input.includeLocal) memberIds.push("local");
@@ -82,7 +82,7 @@ export async function createProbeRound(tx: ProbeTransaction, actor: { id: string
       if (counter) await tx.update(probeRoundSequences).set({ lastSequence: sequence }).where(eq(probeRoundSequences.id, counter.id));
       else await tx.insert(probeRoundSequences).values({ slotId: input.slotId, endpointId, family, lastSequence: sequence });
       const [round] = await tx.insert(probeRounds).values({ policyId: input.policyId, policyRevision: input.policyRevision, slotId: input.slotId, endpointId, endpointAddressId: input.endpointAddressId, configId: config.id, groupId: group?.id ?? null, groupRevision: group?.revision ?? null, sequence, addressVersion: input.addressVersion, configVersion: config.revision, address, family, hostname: payload.hostname, config: payload.config, networkPolicy: payload.networkPolicy, memberIds, consensus, deadline: input.deadline, resultExpiresAt: input.resultExpiresAt, createdAt: now }).returning();
-      const assignments = members.filter(m => !input.dispatchCapableOnly || (m.enabled && !m.revokedAt && (family === "4" ? m.capabilities.ipv4 : m.capabilities.ipv6)));
+      const assignments = members.filter(m => !input.dispatchCapableOnly || (isProbeOnline(m, now) && (family === "4" ? m.capabilities.ipv4 : m.capabilities.ipv6)));
       if (assignments.length) await tx.insert(probeTasks).values(assignments.map(m => ({ roundId: round!.id, probeId: m.probeId, createdAt: now })));
       return round!;
 }

@@ -667,7 +667,9 @@ async function cloudHealthFixture() {
   let sequence = 0;
   const start = Date.now();
   const round = async (decision: "success" | "failure" | "unknown") => {
-    const r = await scheduler.schedulePolicy(f.policy.id, new Date(start + sequence++ * 15000));
+    const heartbeatAt = new Date(start + sequence++ * 15000);
+    await f.d.update(db.probeAgents).set({ lastSeenAt: heartbeatAt }).where(eq(db.probeAgents.id, agent!.id));
+    const r = await scheduler.schedulePolicy(f.policy.id, heartbeatAt);
     expect(r).toBeDefined();
     if (decision !== "unknown") {
       const [task] = await f.d.select().from(db.probeTasks).where(eq(db.probeTasks.roundId, r!.id));

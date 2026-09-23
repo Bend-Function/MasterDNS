@@ -1,6 +1,14 @@
 import { z } from "zod";
 import { httpCheckConfigSchema, tcpCheckConfigSchema } from "./health.js";
 
+export const PROBE_HEARTBEAT_TIMEOUT_MS = 90_000;
+
+export function isProbeOnline(probe: { enabled: boolean; revokedAt: Date | string | null; lastSeenAt: Date | string | null }, now = new Date()): boolean {
+  if (!probe.enabled || probe.revokedAt || !probe.lastSeenAt) return false;
+  const lastSeen = new Date(probe.lastSeenAt).getTime();
+  return lastSeen <= now.getTime() && lastSeen >= now.getTime() - PROBE_HEARTBEAT_TIMEOUT_MS;
+}
+
 export const probeProtocolSchema = z.literal("probe-agent/v1");
 export const addressFamilySchema = z.union([z.literal(4), z.literal(6)]);
 export const probeOutcomeSchema = z.enum(["success", "failure", "unavailable"]);

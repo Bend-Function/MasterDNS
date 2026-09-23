@@ -43,6 +43,8 @@ The capabilities describe usable local address families. Lack of an address fami
 
 Success response: HTTP `200` with `Content-Type: application/json` and body `{}`.
 
+Agents normally send a heartbeat every 30 seconds. If no heartbeat has arrived for more than 90 seconds, the probe is shown as offline and receives no new scheduled health-check tasks. Existing round cohorts and quorum requirements are unchanged, so insufficient votes yield `unknown`, not a target failure. Heartbeat recovery automatically restores eligibility; registration and group membership are retained.
+
 ## Lease tasks
 
 `POST /api/v1/probe-agent/tasks/lease`

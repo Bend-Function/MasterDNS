@@ -50,6 +50,18 @@ it("does not shrink the fixed denominator after capability loss", async () => {
   await vote(r!.id, "failure"); await health.closeRound(r!.id, r!.deadline);
   expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id)))[0]).toMatchObject({ latestDecision: "unknown", consecutiveFailures: 0 });
 });
+it("does not dispatch to expired probes and resumes when their heartbeat recovers", async () => {
+  const f = await target();
+  await connection.db.update(probeAgents).set({ lastSeenAt: new Date(now.getTime() - 90_001) }).where(eq(probeAgents.id, f.agents[0]!.id));
+  const first = await scheduler.schedulePolicy(f.policy.id, now);
+  expect(first!.memberIds).toHaveLength(2);
+  expect((await connection.db.select().from(probeTasks).where(eq(probeTasks.roundId, first!.id))).map(task => task.probeId)).toEqual([f.agents[1]!.id]);
+  await vote(first!.id, "failure"); await health.closeRound(first!.id, first!.deadline);
+  expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id)))[0]).toMatchObject({ latestDecision: "unknown" });
+  await connection.db.update(probeAgents).set({ lastSeenAt: new Date(now.getTime() + 15_000) }).where(eq(probeAgents.id, f.agents[0]!.id));
+  const second = await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime() + 15_000));
+  expect((await connection.db.select().from(probeTasks).where(eq(probeTasks.roundId, second!.id))).map(task => task.probeId).sort()).toEqual(f.agents.map(agent => agent.id).sort());
+});
 it("external policies reject local single results", async () => {
   const f = await target();
   const service = new HealthResultService({ db: connection.db } as never);
@@ -70,6 +82,7 @@ it("accepts local as one immutable vote and cannot rewrite it or invent membersh
 it("rejects replaced addresses and expired evidence, never combining successes across a long gap", async () => {
   const f = await target(); const first = await scheduler.schedulePolicy(f.policy.id, now);
   await vote(first!.id, "success"); await health.closeRound(first!.id, first!.deadline);
+  await connection.db.update(probeAgents).set({ lastSeenAt: new Date(now.getTime() + 120_000) }).where(eq(probeAgents.ownerUserId, f.actor.id));
   const late = await scheduler.schedulePolicy(f.policy.id, new Date(now.getTime()+120000));
   await vote(late!.id, "success"); await health.closeRound(late!.id, late!.deadline);
   expect((await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.endpointId, f.endpoint.id)))[0]).toMatchObject({ consecutiveSuccesses: 1 });
@@ -172,6 +185,7 @@ it("a newer cloud candidate rejects late prior-version votes", async () => {
 it("aggregates per-probe and family without counting unavailable results as failures", async () => {
   const f = await target();
   const past = new Date(Date.now()-2*86400000);
+  await connection.db.update(probeAgents).set({ lastSeenAt: past }).where(eq(probeAgents.ownerUserId, f.actor.id));
   const r = await scheduler.schedulePolicy(f.policy.id, past);
   const tasks = await connection.db.select().from(probeTasks).where(eq(probeTasks.roundId, r!.id));
   await connection.db.insert(probeObservations).values(tasks.map((task, i) => ({ taskId: task.id, roundId: r!.id, probeId: task.probeId, leaseId: randomUUID(), addressVersion: 1, configVersion: 1, status: "accepted" as const, outcome: i === 0 ? "success" as const : "unavailable" as const, latencyMs: 2, measuredAt: past, receivedAt: past })));
