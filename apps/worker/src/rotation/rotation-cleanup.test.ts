@@ -106,7 +106,7 @@ it("new rotations release replaced user IPs after takeover without a separate le
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released" });
   expect(await f.d.transaction(tx => db.idleIpAddressReleasing(tx, f.resource.address))).toBe(false);
 });
-it.each(["history", "observed", "linked", "active", "absent"] as const)("old IP cleanup distinguishes %s slot references", async kind => {
+it.each(["history", "observed", "linked", "active", "absent"] as const)("releases an old IP despite %s slot references", async kind => {
   const oldAddressValue = { history: "198.51.100.201", observed: "198.51.100.202", linked: "198.51.100.203", active: "198.51.100.204", absent: "198.51.100.205" }[kind];
   const f = await cleanupFixture("user", "4", oldAddressValue);
   await f.d.update(db.rotationIncidents).set({ releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
@@ -124,7 +124,7 @@ it.each(["history", "observed", "linked", "active", "absent"] as const)("old IP 
   }
   if (kind === "active") await f.d.insert(db.rotationIncidents).values({ ...f.incident, id: randomUUID(), slotId: duplicate!.id, sourceEventId: randomUUID(), currentAttemptId: null });
   await f.cleanup.run(f.resource.id, new Date());
-  expect(f.state.writes).toBe(kind === "history" || kind === "absent" ? 1 : 0);
+  expect(f.state.writes).toBe(1);
 });
 it("terminates stuck cleanup permanently, including stale jobs and late failure handlers", async () => {
   const f = await cleanupFixture();
@@ -316,7 +316,7 @@ it("unassigns only the old non-primary IPv6 from the original ENI while the repl
   );
 });
 
-it("retains an IPv6 resource still referenced by an equivalent expanded DNS address", async () => {
+it("releases an IPv6 resource despite an equivalent expanded DNS address", async () => {
   const f = await cleanupFixture("system", "6");
   const [account] = await f.d
     .insert(db.providerAccounts)
@@ -343,10 +343,7 @@ it("retains an IPv6 resource still referenced by an equivalent expanded DNS addr
     remoteHash: "test",
   });
   await f.cleanup.run(f.resource.id, new Date());
-  expect(f.state.writes).toBe(0);
-  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupError).toBe(
-    "cleanup_resource_referenced",
-  );
+  expect(f.state.writes).toBe(1);
 });
 it("uses the immutable original ownership snapshot only after independent release opt-in", async () => {
   const f = await cleanupFixture("user");
@@ -395,7 +392,48 @@ async function changeAdmission(f: Awaited<ReturnType<typeof cleanupFixture>>, ch
     if (change === "address version") await tx.update(db.rotationIncidents).set({ addressVersion: 2 }).where(eq(db.rotationIncidents.id, f.incident.id));
   });
 }
-it.each(admissionChanges.flatMap(change => (["4", "6"] as const).map(family => ({ change, family }))))(
+it.each(["authorization", "rotation policy", "health policy", "health config", "probe group"] as const)(
+  "releases a published old IP after %s revision changes", async change => {
+    const f = await cleanupFixture("user");
+    await f.d.update(db.rotationIncidents).set({ releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+    await changeAdmission(f, change);
+    await f.cleanup.run(f.resource.id, new Date());
+    expect(f.state.writes).toBe(1);
+    expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "pending", cleanupError: null });
+  },
+);
+it("releases a published old IP after the slot advances to a newer address version", async () => {
+  const f = await cleanupFixture("user");
+  await f.d.update(db.rotationIncidents).set({ releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.managedAddressSlots).set({ currentVersion: 2 }).where(eq(db.managedAddressSlots.id, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+});
+it("releases a replaced Lightsail static IP after the health policy revision changes", async () => {
+  const f = await cleanupFixture("user");
+  const instanceId = `arn:aws:lightsail:us-east-1:123456789012:Instance/${randomUUID()}`;
+  const resourceId = "arn:aws:lightsail:us-east-1:123456789012:StaticIp/old-static";
+  const physicalKey = JSON.stringify(["aws", f.account.externalAccountId, "lightsail", "us-east-1", instanceId]);
+  const inventory = structuredClone(f.resource.snapshot.inventory) as typeof f.live;
+  Object.assign(inventory.ref, { service: "lightsail", instanceId });
+  Object.assign(inventory, { nativeName: "instance", ipv6Only: false });
+  Object.assign(inventory.interfaces[0]!.addresses[0]!, { allocationId: "old-static", resourceId });
+  Object.assign(f.live.ref, { service: "lightsail", instanceId });
+  Object.assign(f.live, { nativeName: "instance", ipv6Only: false });
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: "lightsail", region: "us-east-1", generation: 1 });
+  await f.d.update(db.cloudInstances).set({ service: "lightsail", externalId: instanceId }).where(eq(db.cloudInstances.id, f.instance.id));
+  await f.d.update(db.rotationIncidents).set({ physicalKey, releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationAttempts).set({ beforeInventory: inventory }).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.update(db.rotationResources).set({ allocationId: "old-static", resourceId,
+    snapshot: { ...f.resource.snapshot, slot: { ...(f.resource.snapshot.slot as object), service: "lightsail", instanceId }, inventory, ownership: inventory.interfaces[0]!.addresses[0] },
+  }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.d.update(db.addressHealthPolicies).set({ revision: 2 }).where(eq(db.addressHealthPolicies.id, f.policy.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(1);
+  const [step] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId));
+  expect(step!.plan.action).toBe("lightsail.static-ip.release");
+});
+it.each((["pause", "address version"] as const).flatMap(change => (["4", "6"] as const).map(family => ({ change, family }))))(
   "blocks new IPv$family cleanup when $change changes during cloud inspection", async ({ change, family }) => {
     const f = await cleanupFixture("system", family, family === "6" ? `2001:db8:${randomUUID().slice(0, 4)}::1` : undefined);
     f.state.beforeInspect = () => changeAdmission(f, change);
@@ -404,6 +442,14 @@ it.each(admissionChanges.flatMap(change => (["4", "6"] as const).map(family => (
     expect(await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId))).toEqual([]);
     expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStepId).toBeNull();
     expect(await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ id: f.incident.currentSegmentId, attemptsUsed: 0 }]);
+  },
+);
+it.each((["authorization", "rotation policy", "health policy", "health config", "probe group"] as const).flatMap(change => (["4", "6"] as const).map(family => ({ change, family }))))(
+  "allows published IPv$family cleanup when $change changes during cloud inspection", async ({ change, family }) => {
+    const f = await cleanupFixture("system", family, family === "6" ? `2001:db8:${randomUUID().slice(0, 4)}::1` : undefined);
+    f.state.beforeInspect = () => changeAdmission(f, change);
+    await f.cleanup.run(f.resource.id, new Date());
+    expect(f.state.writes).toBe(1);
   },
 );
 it("resumes cleanup against the original attempt and ownership snapshot", async () => {

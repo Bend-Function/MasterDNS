@@ -163,19 +163,13 @@ export class CloudIdleIpsService {
   }
   private async protected(tx: RotationTransaction, externalAccountId: string, item: IdleIpItem) {
     await lockIdleIpAddress(tx, item.address);
-    const dns = await tx.execute(sql`select 1 from dns_records where management='managed' and deleted_at is null and type='A' and content=${item.address} limit 1`);
-    if (dns.length) return "managed_dns_reference";
-    const pendingDns = await tx.execute(sql`select 1 from operation_steps s join operations o on o.id=s.operation_id where (s.status='running' or (o.status in ('pending','running','partial','failed') and s.status in ('pending','failed'))) and s.input->'record'->>'content'=${item.address} limit 1`);
-    if (pendingDns.length) return "pending_dns_reference";
-    const rotation = await tx.execute(sql`select 1 from rotation_incidents i
+    const candidate = await tx.execute(sql`select 1 from rotation_resources r join rotation_incidents i on i.id=r.incident_id
       join managed_address_slots s on s.id=i.slot_id join cloud_interfaces f on f.id=s.interface_id
       join cloud_instances v on v.id=f.instance_id join cloud_accounts a on a.id=v.account_id
       where a.provider='aws' and a.external_account_id=${externalAccountId} and v.service='lightsail' and v.region=${item.region}
-      and i.status<>'complete' and (
-        exists(select 1 from rotation_resources r where r.incident_id=i.id and (r.address=${item.address} or r.allocation_id=${item.name} or r.resource_id=${item.arn}))
-        or exists(select 1 from cloud_addresses ca where ca.id in (s.current_address_id,s.candidate_address_id) and ca.address=${item.address})
-      ) limit 1`);
-    if (rotation.length) return "rotation_in_progress";
+      and i.status<>'complete' and r.attempt_id=i.current_attempt_id and r.role='candidate'
+      and (r.address=${item.address} or r.allocation_id=${item.name} or r.resource_id=${item.arn}) limit 1`);
+    if (candidate.length) return "rotation_in_progress";
     const unresolved = await tx.execute<IdleIpRotationEvidence>(sql`select st.id as "stepId", st.attempt_id as "attemptId", st.plan, st.receipt,
       a.id as "accountId", a.external_account_id as "externalAccountId", v.region, v.external_id as "instanceId", f.external_id as "interfaceId", s.id as "slotId",
       coalesce((select jsonb_agg(jsonb_build_object('allocationId',r.allocation_id,'resourceId',r.resource_id,'address',r.address,'role',r.role,'cleanupStepId',r.cleanup_step_id))

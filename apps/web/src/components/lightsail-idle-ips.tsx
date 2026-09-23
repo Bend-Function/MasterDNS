@@ -10,7 +10,7 @@ const terminal = (item: IdleIpItem) => ["released", "missing", "skipped", "faile
 const statusLabels: Record<IdleIpItem["status"], string> = { ready: "待释放", waiting: "等待额度", in_flight: "正在释放", pending: "待云端确认", released: "已释放", missing: "已不存在", skipped: "已跳过", failed: "失败" };
 const reasonLabels: Record<string, string> = {
   managed_dns_reference: "受管 DNS 仍引用此 IP", pending_dns_reference: "待执行 DNS 变更仍引用此 IP",
-  rotation_in_progress: "轮换仍使用此 IP，或云操作尚未确认", cleanup_in_progress: "同区域清理尚未确认",
+  rotation_in_progress: "轮换候选地址待挂载，或此 IP 释放结果尚未确认", cleanup_in_progress: "同区域清理尚未确认",
   attached: "已绑定实例", remote_identity_changed: "云端地址身份已变化", invalid_static_ip_identity: "地址身份信息不完整",
   release_pending: "等待云端确认释放结果", rotation_rate_limited: "等待换址额度", rate_limited: "云厂商限流",
   permission_denied: "云账号缺少权限", credentials_expired: "凭证已过期", invalid_credentials: "凭证无效",

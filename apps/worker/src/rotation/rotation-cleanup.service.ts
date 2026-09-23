@@ -15,9 +15,6 @@ import {
   probeRoundSequences,
   resetHealthEvidence,
   databaseNow,
-  dnsRecords,
-  endpointAddresses,
-  managedAddressSlots,
   rotationAttempts,
   rotationIncidents,
   rotationLeases,
@@ -161,8 +158,6 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         if (!physical || physical.unresolvedStepId || (physical.incidentId && physical.incidentId !== incident.id)) return;
         const [resource] = await tx.select().from(rotationResources).where(eq(rotationResources.id, r.id)).for("update");
         if (!resource) return;
-        // Match idle cleanup's remote-account -> address order, and serialize
-        // reference checks/admission with DNS publication of the old address.
         await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${JSON.stringify([current.account.provider, current.account.externalAccountId, current.instance.service])}, 624713))`);
         await lockIdleIpAddress(tx, resource.address);
         const now = await databaseNow(tx);
@@ -272,14 +267,15 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
   private async eligible(tx: RotationTransaction, c: RotationContext, incident: typeof rotationIncidents.$inferSelect, r: Resource, now: Date) {
     const error = rotationAuthorizationError(c, incident.trigger);
     if (error) throw new Error(error);
-    const health = await lockRotationHealth(tx, c);
-    if (incident.physicalKey !== c.physicalKey || incident.authorizationRevision !== c.authorization!.revision ||
-      incident.policyRevision !== c.policy!.revision || incident.addressVersion !== c.addressVersion || (incident.trigger !== "manual" && !healthRevisionMatches(incident, health)))
+    if (incident.physicalKey !== c.physicalKey || incident.addressVersion !== r.cleanupAddressVersion)
       throw new Error("cleanup_incident_changed");
     if (!r.cleanupDueAt || r.cleanupDueAt > now) throw new Error("cleanup_grace_pending");
     if (r.origin !== "system" && !incident.releaseOldAddress && !c.authorization!.allowReleaseAddress) throw new Error("original_address_release_not_authorized");
     if (r.origin === "system" && !r.ownershipAttemptId) throw new Error("resource_ownership_ambiguous");
-    if (c.slot.candidateAddressId || c.slot.currentVersion !== r.cleanupAddressVersion || c.address?.address === r.address)
+    const protectedIds = [c.slot.currentAddressId, c.slot.candidateAddressId].filter((id): id is string => !!id);
+    const [protectedAddress] = protectedIds.length ? await tx.select({ id: cloudAddresses.id }).from(cloudAddresses)
+      .where(and(inArray(cloudAddresses.id, protectedIds), sql`${cloudAddresses.address}::inet = ${r.address}::inet`)) : [];
+    if (protectedAddress)
       throw new Error("cleanup_current_candidate_retained");
     const [publication] = await tx
       .select()
@@ -287,39 +283,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       .where(
         and(
           eq(rotationPublications.slotId, c.slot.id),
-          eq(rotationPublications.addressVersion, c.slot.currentVersion),
+          eq(rotationPublications.addressVersion, r.cleanupAddressVersion),
           eq(rotationPublications.status, "applied"),
         ),
       );
     if (!publication) throw new Error("cleanup_publication_pending");
-    const [endpoint] = await tx
-      .select({ id: endpointAddresses.id })
-      .from(endpointAddresses)
-      .where(and(sql`${endpointAddresses.address}::inet = ${r.address}::inet`, inArray(endpointAddresses.state, ["current", "candidate"])));
-    const [record] = await tx
-      .select({ id: dnsRecords.id })
-      .from(dnsRecords)
-      .where(
-        and(
-          sql`case when ${dnsRecords.type} in ('A','AAAA') then ${dnsRecords.content}::inet = ${r.address}::inet else false end`,
-          isNull(dnsRecords.deletedAt),
-        ),
-      );
-    const [slot] = await tx.execute(sql`select s.id from managed_address_slots s
-      join cloud_addresses a on a.id in (s.current_address_id,s.candidate_address_id)
-      join cloud_interfaces f on f.id=s.interface_id join cloud_instances v on v.id=f.instance_id
-      left join cloud_scan_scopes scope on scope.account_id=v.account_id and scope.service=v.service and scope.region=v.region
-      where a.address::inet=${r.address}::inet and (
-        (v.metadata->>'present' is distinct from 'false' and a.inventory_present=true and f.scan_generation=v.scan_generation and a.scan_generation=v.scan_generation
-          and (scope.id is null or scope.generation=v.scan_generation))
-        or exists(select 1 from cloud_endpoint_links link where link.slot_id=s.id)
-        or exists(select 1 from rotation_incidents i left join rotation_leases l on l.physical_key=i.physical_key
-          where i.slot_id=s.id and (i.status<>'complete' or l.unresolved_step_id is not null))
-      ) limit 1`);
-    const [pendingDns] = await tx.execute(sql`select 1 from operation_steps step join operations op on op.id=step.operation_id
-      where (step.status='running' or (op.status in ('pending','running','partial','failed') and step.status in ('pending','failed')))
-      and case when step.input->'record'->>'type' in ('A','AAAA') then (step.input->'record'->>'content')::inet=${r.address}::inet else false end limit 1`);
-    if (endpoint || record || slot || pendingDns) throw new Error("cleanup_resource_referenced");
   }
   private async plan(tx: RotationTransaction, c: RotationContext, r: Resource, live?: CloudInventory) {
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, r.attemptId));

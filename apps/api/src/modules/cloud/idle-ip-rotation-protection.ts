@@ -21,45 +21,53 @@ function record(value: unknown): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-/** Unknown evidence retains the regional exclusion; valid steps protect only their resource. */
 export function unresolvedRotationProtectsIdleIp(target: IdleStaticIp, evidence: IdleIpRotationEvidence): boolean {
+  if (target.region !== evidence.region) return false;
+  const action = typeof evidence.plan === "object" && evidence.plan !== null && "action" in evidence.plan ? evidence.plan.action : undefined;
+  const stored = Array.isArray(evidence.resources) && evidence.resources.some(resource => {
+    if (typeof resource !== "object" || resource === null || Array.isArray(resource)) return false;
+    const value = resource as Record<string, unknown>;
+    return ((value.role === "candidate" && action !== "lightsail.static-ip.release")
+      || (value.role === "original" && action === "lightsail.static-ip.release" && value.cleanupStepId === evidence.stepId))
+      && (value.allocationId === target.name || value.resourceId === target.arn || value.address === target.address);
+  });
   try {
     const plan = record(evidence.plan) as unknown as CloudStep;
     const args = rotationArguments(plan), slot = args.slot;
     if (plan.id !== evidence.stepId || args.attemptId !== evidence.attemptId
       || slot.service !== "lightsail" || slot.accountId !== evidence.accountId || slot.region !== evidence.region
       || slot.instanceId !== evidence.instanceId || slot.interfaceId !== evidence.interfaceId || slot.slotId !== evidence.slotId
-      || isIP(slot.address) !== slot.family || !Array.isArray(evidence.resources)) return true;
+      || isIP(slot.address) !== slot.family || !Array.isArray(evidence.resources)) return stored;
     if (evidence.receipt !== null) record(evidence.receipt);
     const original = args.before.interfaces.find(iface => iface.id === slot.interfaceId)?.addresses.find(address => address.family === slot.family && address.address === slot.address);
-    if (!original) return true;
-    if (["lightsail.ipv6.disable", "lightsail.ipv6.enable"].includes(plan.action)) return slot.family !== 6 || args.phase !== "rotation";
+    if (!original) return stored;
+    if (["lightsail.ipv6.disable", "lightsail.ipv6.enable"].includes(plan.action)) return stored;
     const candidate = ["lightsail.static-ip.allocate", "lightsail.static-ip.attach"].includes(plan.action);
-    if ((!candidate && !["lightsail.static-ip.detach", "lightsail.static-ip.release"].includes(plan.action)) || slot.family !== 4) return true;
-    if (args.phase !== (plan.action === "lightsail.static-ip.release" ? "post_publish_cleanup" : "rotation")) return true;
+    if ((!candidate && plan.action !== "lightsail.static-ip.release") || slot.family !== 4) return stored;
+    if (args.phase !== (candidate ? "rotation" : "post_publish_cleanup")) return stored;
     const expectedName = candidate ? rotationResourceName(plan) : original.allocationId;
-    if (typeof expectedName !== "string" || !expectedName.trim()) return true;
+    if (typeof expectedName !== "string" || !expectedName.trim()) return stored;
     const identities: Array<Record<string, unknown>> = [candidate ? { allocationId: expectedName } : original];
     if (!candidate && args.ownershipSnapshot !== undefined) {
       const proof = record(args.ownershipSnapshot);
       if (proof.accountId !== slot.accountId || proof.instanceId !== slot.instanceId || proof.interfaceId !== slot.interfaceId
         || proof.address !== slot.address || proof.allocationId !== expectedName
-        || (original.resourceId !== undefined && proof.resourceId !== original.resourceId)) return true;
+        || (original.resourceId !== undefined && proof.resourceId !== original.resourceId)) return stored || expectedName === target.name;
       identities.push(proof);
     }
     for (const receipt of [evidence.receipt, args.receipt, candidate ? args.candidateReceipt : args.cleanupReceipt]) {
       if (receipt !== undefined && receipt !== null) {
         const value = record(receipt);
-        if ([value.allocationId, value.remoteId].some(name => name !== undefined && name !== null && name !== expectedName)) return true;
+        if ([value.allocationId, value.remoteId].some(name => name !== undefined && name !== null && name !== expectedName)) return stored || expectedName === target.name;
         identities.push({ allocationId: value.allocationId, remoteId: value.remoteId, resourceId: value.resourceId, address: value.candidateAddress });
       }
     }
     for (const resource of evidence.resources) {
       const value = record(resource);
-      if (value.role !== "original" && value.role !== "candidate") return true;
-      if (value.cleanupStepId === evidence.stepId || (value.role === (candidate ? "candidate" : "original") && value.allocationId === expectedName)) identities.push(value);
+      if (value.role !== "original" && value.role !== "candidate") return stored || expectedName === target.name;
+      if (value.role === (candidate ? "candidate" : "original") && (value.cleanupStepId === evidence.stepId || value.allocationId === expectedName)) identities.push(value);
     }
-    return identities.some(identity => {
+    return stored || identities.some(identity => {
       let matches = false;
       for (const [key, expected] of [["allocationId", target.name], ["remoteId", target.name], ["resourceId", target.arn], ["address", target.address]] as const) {
         const value = identity[key];
@@ -75,5 +83,5 @@ export function unresolvedRotationProtectsIdleIp(target: IdleStaticIp, evidence:
       }
       return matches;
     });
-  } catch { return true; }
+  } catch { return stored; }
 }

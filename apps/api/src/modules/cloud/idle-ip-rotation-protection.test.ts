@@ -19,11 +19,15 @@ it.each(["lightsail.static-ip.allocate", "lightsail.static-ip.attach"] as const)
   expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });
 
-it.each(["lightsail.static-ip.detach", "lightsail.static-ip.release"] as const)("scopes unresolved %s protection to the exact original", action => {
-  const row = evidence(action);
+it("scopes an unresolved release to the exact original", () => {
+  const row = evidence("lightsail.static-ip.release");
   expect(unresolvedRotationProtectsIdleIp({ ...candidate, name: original.allocationId, address: original.address, arn: original.resourceId }, row)).toBe(true);
   expect(unresolvedRotationProtectsIdleIp(candidate, row)).toBe(false);
   expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
+});
+it("does not treat an unresolved detach as a release claim", () => {
+  const row = evidence("lightsail.static-ip.detach");
+  expect(unresolvedRotationProtectsIdleIp({ ...candidate, name: original.allocationId, address: original.address, arn: original.resourceId }, row)).toBe(false);
 });
 
 it("uses durable receipt and resource identities alongside the planned candidate name", () => {
@@ -36,28 +40,28 @@ it("uses durable receipt and resource identities alongside the planned candidate
 
 it("does not let an unrelated historical resource widen a release target", () => {
   const row = evidence("lightsail.static-ip.release");
-  row.resources = [{ role: "candidate", allocationId: unrelated.name, resourceId: unrelated.arn, address: unrelated.address, cleanupStepId: null }];
+  row.resources = [{ role: "candidate", allocationId: unrelated.name, resourceId: unrelated.arn, address: unrelated.address, cleanupStepId: row.stepId }];
   expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });
 
-it("does not narrow protection using a receipt that conflicts with the planned candidate", () => {
+it("does not block an unrelated IP when a receipt conflicts with the planned candidate", () => {
   const row = evidence("lightsail.static-ip.attach");
   row.receipt = { allocationId: "a-different-candidate" };
-  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(true);
+  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });
 
-it("does not narrow protection using an unexpected action phase", () => {
+it("does not widen protection for an unexpected action phase", () => {
   const row = evidence("lightsail.static-ip.release");
   row.plan.arguments.phase = "rotation";
-  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(true);
+  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });
 
-it("uses the persisted cleanup ownership snapshot and rejects conflicting evidence conservatively", () => {
+it("uses the persisted cleanup ownership snapshot without blocking unrelated IPs", () => {
   const row = evidence("lightsail.static-ip.release");
   row.plan.arguments.ownershipSnapshot = { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: original.allocationId, address: original.address, resourceId: original.resourceId };
   expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
   row.plan.arguments.ownershipSnapshot = { ...row.plan.arguments.ownershipSnapshot as object, address: "203.0.113.99" };
-  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(true);
+  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });
 
 it.each(["lightsail.ipv6.disable", "lightsail.ipv6.enable"] as const)("valid %s steps do not protect static IPs", action => {
@@ -75,6 +79,13 @@ it.each([
   { receipt: "malformed" },
   { resources: "malformed" },
   { resources: [{ role: "unknown" }] },
-])("keeps malformed unresolved evidence conservative: %j", patch => {
-  expect(unresolvedRotationProtectsIdleIp(unrelated, { ...evidence("lightsail.static-ip.release"), ...patch })).toBe(true);
+])("does not block unrelated IPs for malformed unresolved evidence: %j", patch => {
+  expect(unresolvedRotationProtectsIdleIp(unrelated, { ...evidence("lightsail.static-ip.release"), ...patch })).toBe(false);
+});
+it("protects an exact candidate resource despite malformed step evidence", () => {
+  const row = evidence("lightsail.static-ip.allocate");
+  row.plan = null as never;
+  row.resources = [{ role: "candidate", allocationId: candidate.name, resourceId: candidate.arn, address: candidate.address }];
+  expect(unresolvedRotationProtectsIdleIp(candidate, row)).toBe(true);
+  expect(unresolvedRotationProtectsIdleIp(unrelated, row)).toBe(false);
 });

@@ -92,15 +92,15 @@ it("rejects expired previews and account region changes before writes", async ()
   await expect(service.execute(f.actor as never, f.account.id, fresh.id, 0)).rejects.toMatchObject({ status: 409 });
   expect(fake.calls).toBe(0);
 });
-it("rechecks managed DNS created after confirmation and skips deletion", async () => {
+it("releases a cloud-idle IP despite managed DNS created after confirmation", async () => {
   const f = await fixture(), preview = await service.preview(f.actor as never, f.account.id);
   await service.confirm(f.actor as never, f.account.id, preview.id);
   const [provider] = await connection.client`insert into provider_accounts(owner_user_id,provider,name,credential_ciphertext,credential_iv,credential_tag) values (${f.actor.id},'cloudflare','dns','x','x','x') returning id`;
   const [zone] = await connection.client`insert into zones(provider_account_id,external_id,name_ascii) values (${provider!.id},'zone','test.example') returning id`;
   const [pool] = await connection.client`insert into endpoint_pools(owner_user_id,name,strategy) values (${f.actor.id},'pool','primary_backup') returning id`;
   await connection.client`insert into dns_records(zone_id,external_id,type,name,content,ttl,management,remote_hash,managed_by_pool_id) values (${zone!.id},'record','A','test.example','203.0.113.9',60,'managed','hash',${pool!.id})`;
-  expect((await service.execute(f.actor as never, f.account.id, preview.id, 0)).items[0]).toMatchObject({ status: "skipped", reason: "managed_dns_reference" });
-  expect(fake.calls).toBe(0);
+  expect((await service.execute(f.actor as never, f.account.id, preview.id, 0)).items[0]).toMatchObject({ status: "released" });
+  expect(fake.calls).toBe(1);
 });
 it("records explicit release rejection as a failure instead of a permanent pending lock", async () => {
   const f = await fixture(), preview = await service.preview(f.actor as never, f.account.id);
@@ -205,10 +205,21 @@ it("rechecks matching unresolved rotation evidence that appears after confirmati
   expect(fake.calls).toBe(0);
 });
 
-it("retains conservative protection when an unresolved plan is malformed", async () => {
+it("does not block an unrelated idle IP when an unresolved plan is malformed", async () => {
   const f = await fixture(), rotation = await unresolvedRotation(f, "lightsail.static-ip.release");
   await connection.db.update(rotationSteps).set({ plan: { ...rotation.plan, arguments: {} } }).where(eq(rotationSteps.id, rotation.plan.id));
-  expect((await service.preview(f.actor as never, f.account.id)).items[0]).toMatchObject({ status: "skipped", reason: "rotation_in_progress" });
+  expect((await service.preview(f.actor as never, f.account.id)).items[0]).toMatchObject({ status: "ready" });
+});
+it("protects a precisely identified candidate when its unresolved plan is malformed", async () => {
+  const f = await fixture(), rotation = await unresolvedRotation(f, "lightsail.static-ip.allocate");
+  const candidate = { ...fake.items[0], name: `masterdns-${rotation.attemptId}`, address: "203.0.113.10", arn: "arn:aws:lightsail:ap-northeast-1:123456789012:StaticIp/candidate" };
+  fake.items.push(candidate);
+  await connection.db.insert(rotationResources).values({ incidentId: rotation.incident.id, attemptId: rotation.attemptId,
+    address: candidate.address, allocationId: candidate.name, resourceId: candidate.arn, origin: "system", role: "candidate", snapshot: {} });
+  await connection.db.update(rotationSteps).set({ plan: { ...rotation.plan, action: "unknown" as never, arguments: {} } }).where(eq(rotationSteps.id, rotation.plan.id));
+  const preview = await service.preview(f.actor as never, f.account.id);
+  expect(preview.items.find(item => item.name === candidate.name)).toMatchObject({ status: "skipped", reason: "rotation_in_progress" });
+  expect(preview.items.find(item => item.address === "203.0.113.9")).toMatchObject({ status: "ready" });
 });
 
 it("does not block unrelated static IPs for terminated unresolved IPv6 steps", async () => {
@@ -216,10 +227,12 @@ it("does not block unrelated static IPs for terminated unresolved IPv6 steps", a
   expect((await service.preview(f.actor as never, f.account.id)).items[0]).toMatchObject({ status: "ready" });
 });
 
-it("keeps original and candidate resources protected for active rotations without unresolved steps", async () => {
+it("protects an active candidate but not its original without unresolved steps", async () => {
   const f = await fixture(), rotation = await unresolvedRotation(f, "lightsail.static-ip.attach", true);
   await connection.db.update(rotationLeases).set({ unresolvedStepId: null }).where(eq(rotationLeases.physicalKey, rotation.physicalKey));
   await connection.db.insert(rotationResources).values({ incidentId: rotation.incident.id, attemptId: rotation.attemptId, address: fake.items[0].address, allocationId: fake.items[0].name, resourceId: fake.items[0].arn, origin: "system", role: "candidate", snapshot: {} });
   fake.items.push(rotation.original);
-  expect((await service.preview(f.actor as never, f.account.id)).items.every(item => item.reason === "rotation_in_progress")).toBe(true);
+  const preview = await service.preview(f.actor as never, f.account.id);
+  expect(preview.items.find(item => item.name === fake.items[0].name)).toMatchObject({ status: "skipped", reason: "rotation_in_progress" });
+  expect(preview.items.find(item => item.name === rotation.original.name)).toMatchObject({ status: "ready" });
 });
