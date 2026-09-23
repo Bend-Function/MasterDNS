@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { BadRequestException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import type { HealthCheckJob } from "@masterdns/contracts";
 import { createOpaqueToken, hashToken } from "@masterdns/crypto";
 import {
@@ -11,6 +11,7 @@ import {
   endpoints,
   healthCheckConfigs,
   reconcileIntents,
+  instanceLifecycleAddressDeleting,
 } from "@masterdns/db";
 import { and, eq, gt, isNull, or, sql } from "drizzle-orm";
 import type { AuthUser } from "../../auth/auth.types.js";
@@ -199,6 +200,9 @@ export class DdnsService {
       const withdrawnFamilies: ("4" | "6")[] = [];
       const publishedWithdrawals: ("4" | "6")[] = [];
       let addressStateChanged = false;
+      for (const address of reported.map(entry => entry.address).filter((value): value is string => value !== null).sort()) {
+        if (await instanceLifecycleAddressDeleting(tx, address)) throw new ConflictException("云实例正在删除，不能上报其地址");
+      }
       for (const address of reported) {
         const [current, candidate] = await Promise.all([
           tx.select().from(endpointAddresses).where(and(eq(endpointAddresses.endpointId, owned.endpoint.id), eq(endpointAddresses.family, address.family), eq(endpointAddresses.state, "current"))).limit(1),

@@ -1,5 +1,6 @@
 import { isIPv4 } from "node:net";
 import {
+  DeleteInstanceCommand,
   GetInstanceCommand,
   GetInstanceMetricDataCommand,
   GetInstancesCommand,
@@ -8,16 +9,19 @@ import {
   GetStaticIpsCommand,
   LightsailClient,
   ReleaseStaticIpCommand,
+  StartInstanceCommand,
+  StopInstanceCommand,
 } from "@aws-sdk/client-lightsail";
 import type { StaticIp } from "@aws-sdk/client-lightsail";
 import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
-import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
+import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudPowerState, CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
-import { awsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
+import { createAwsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
 import { evaluateCapabilities } from "./capabilities.js";
 import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js";
 import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
+import { assertLifecycleAction, assertLifecycleSnapshot, lifecycleNoWrite, operationIds, sameLifecycleRef } from "./lifecycle.js";
 import { monthPeriod, monthlyTrafficResult, sumTraffic, trafficNumber } from "./monthly-traffic.js";
 import type { AwsAdapterDependencies, AwsCredentials, AwsSend, Capability, CloudAdapter, CloudInventory, CloudPage, CloudStepResult, CloudObservation, IdleStaticIp, IdleStaticIpReleaseResult } from "./provider.js";
 
@@ -40,6 +44,7 @@ export type LightsailInspectionScope = {
 
 export class LightsailCloudAdapter implements CloudAdapter {
   private readonly credentialSource: ReturnType<typeof createAwsCredentialSource>;
+  private readonly clientOptions: ReturnType<typeof createAwsClientOptions>;
   private readonly stsClient: STSClient;
   private readonly lightsailClients = new Map<string, LightsailClient>();
 
@@ -48,8 +53,9 @@ export class LightsailCloudAdapter implements CloudAdapter {
     credentials: AwsCredentials,
     private readonly dependencies: AwsAdapterDependencies = {},
   ) {
-    this.credentialSource = createAwsCredentialSource(credentials);
-    this.stsClient = new STSClient({ ...awsClientOptions, region: "us-east-1", credentials: this.credentialSource });
+    this.clientOptions = createAwsClientOptions(credentials.proxyUrl);
+    this.credentialSource = createAwsCredentialSource(credentials, this.clientOptions);
+    this.stsClient = new STSClient({ ...this.clientOptions, region: "us-east-1", credentials: this.credentialSource });
   }
 
   private stsSend(command: GetCallerIdentityCommand) {
@@ -61,7 +67,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
     if (this.dependencies.lightsailSend !== undefined) return this.dependencies.lightsailSend(command);
     let client = this.lightsailClients.get(region);
     if (client === undefined) {
-      client = new LightsailClient({ ...awsClientOptions, region, credentials: this.credentialSource });
+      client = new LightsailClient({ ...this.clientOptions, region, credentials: this.credentialSource });
       this.lightsailClients.set(region, client);
     }
     return (client.send.bind(client) as AwsSend)(command);
@@ -112,7 +118,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
     let operationIds: string[] = [];
     let releaseError: CloudError | undefined;
     try {
-      // awsClientOptions.maxAttempts is one: a lost mutation response must only be observed.
+      // The shared client options use one attempt: a lost mutation response must only be observed.
       const response = await this.lightsailSend(target.region, new ReleaseStaticIpCommand({ staticIpName: target.name }));
       operationIds = (response.operations ?? []).flatMap((operation: { id?: string }) =>
         typeof operation.id === "string" && operation.id.length > 0 ? [operation.id] : []);
@@ -231,6 +237,56 @@ export class LightsailCloudAdapter implements CloudAdapter {
     }
   }
 
+  async inspectLifecycle(ref: CloudRef): Promise<CloudLifecycleSnapshot> {
+    validateLightsailLifecycleRef(ref, this.accountId);
+    let nativeName: string;
+    try {
+      nativeName = await this.findNameByArn(ref.region, ref.instanceId);
+    } catch (error) {
+      throw normalizeAwsError(error);
+    }
+    try {
+      const { instance } = await this.lightsailSend(ref.region, new GetInstanceCommand({ instanceName: nativeName }));
+      if (instance?.arn !== ref.instanceId || instance.name !== nativeName) throw new CloudError("remote_identity_changed", false);
+      return { ref, identity: ref.instanceId, state: lightsailLifecycleState(instance.state?.name), nativeName };
+    } catch (error) {
+      const normalized = normalizeAwsError(error);
+      if (normalized.code === "resource_not_found") return { ref, identity: ref.instanceId, state: "deleted", nativeName };
+      throw normalized;
+    }
+  }
+
+  async mutateLifecycle(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt> {
+    assertLifecycleAction(action);
+    assertLifecycleSnapshot(snapshot, this.accountId, "lightsail");
+    validateLightsailLifecycleRef(snapshot.ref, this.accountId);
+    if (snapshot.identity !== snapshot.ref.instanceId || typeof snapshot.nativeName !== "string" || !snapshot.nativeName) throw new CloudError("remote_identity_changed", false);
+    let current: CloudLifecycleSnapshot;
+    try {
+      const { instance } = await this.lightsailSend(snapshot.ref.region, new GetInstanceCommand({ instanceName: snapshot.nativeName }));
+      if (instance?.arn !== snapshot.identity || instance.name !== snapshot.nativeName) throw new CloudError("remote_identity_changed", false);
+      current = { ref: snapshot.ref, identity: instance.arn, state: lightsailLifecycleState(instance.state?.name), nativeName: snapshot.nativeName };
+    } catch (error) {
+      const normalized = normalizeAwsError(error);
+      if (normalized.code !== "resource_not_found") throw normalized;
+      current = { ref: snapshot.ref, identity: snapshot.identity, state: "deleted", nativeName: snapshot.nativeName };
+    }
+    if (!sameLifecycleRef(current.ref, snapshot.ref) || current.identity !== snapshot.identity) throw new CloudError("remote_identity_changed", false);
+    const noWrite = lifecycleNoWrite(action, current.state);
+    if (noWrite !== undefined) return noWrite;
+    try {
+      const response = action === "start"
+        ? await this.lightsailSend(snapshot.ref.region, new StartInstanceCommand({ instanceName: snapshot.nativeName }))
+        : action === "stop"
+          ? await this.lightsailSend(snapshot.ref.region, new StopInstanceCommand({ instanceName: snapshot.nativeName, force: false }))
+          : await this.lightsailSend(snapshot.ref.region, new DeleteInstanceCommand({ instanceName: snapshot.nativeName, forceDeleteAddOns: false }));
+      const ids = operationIds(response.operations);
+      return ids.length === 0 ? {} : { operationIds: ids };
+    } catch (error) {
+      throw normalizeAwsError(error);
+    }
+  }
+
   async monthlyTraffic(ref: CloudRef, now = new Date()) {
     if (ref.accountId !== this.accountId || ref.service !== "lightsail") throw new CloudError("resource_not_found", false);
     try {
@@ -326,6 +382,19 @@ export class LightsailCloudAdapter implements CloudAdapter {
   async observe(step: CloudStep): Promise<"pending" | "applied" | "not_applied" | "ambiguous"> {
     return (await this.observeDetails(step)).status;
   }
+}
+
+function validateLightsailLifecycleRef(ref: CloudRef, accountId: string): void {
+  const match = /^arn:(?:aws|aws-[a-z0-9-]+):lightsail:([a-z]{2}(?:-[a-z0-9]+)+-[0-9]+):[0-9]{12}:Instance\/[A-Za-z0-9-]+$/.exec(ref.instanceId);
+  if (ref.accountId !== accountId || ref.service !== "lightsail" || match?.[1] !== ref.region) throw new CloudError("remote_identity_changed", false);
+}
+
+function lightsailLifecycleState(value: unknown): CloudPowerState {
+  if (value === "running") return "running";
+  if (value === "stopped") return "stopped";
+  if (value === "pending") return "starting";
+  if (value === "stopping") return "stopping";
+  return "unknown";
 }
 
 function sameLightsailIdentity(instanceArn: string, resourceArn: string, resourceType: string): boolean {

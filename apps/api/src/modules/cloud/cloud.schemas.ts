@@ -21,7 +21,7 @@ export const cloudEnabledSchema = z.object({ enabled: z.boolean() }).strict();
 export const cloudAuthorizationSchema = z.object({
   revision: z.number().int().min(0), managed: z.boolean(),
   allowIpv4Rotation: z.boolean().optional(), allowIpv6Rotation: z.boolean().optional(),
-  allowStopStart: z.boolean().optional(), allowReleaseAddress: z.boolean().optional(),
+  allowStopStart: z.boolean().optional(), allowDelete: z.boolean().optional(), allowReleaseAddress: z.boolean().optional(),
 }).strict();
 export const cloudBindingSchema = z.object({
   zoneId: z.string().uuid(), fqdn: z.string().trim().min(1).max(255), recordType: z.enum(["A", "AAAA"]), slotId: z.string().uuid(),

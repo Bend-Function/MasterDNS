@@ -32,6 +32,13 @@ function candidateSnapshot(): RotationSnapshot {
 }
 
 describe("rotation preparation and cloud steps", () => {
+  it("blocks new rotation writes during lifecycle control while still observing accepted writes", () => {
+    const state = snapshot();
+    state.authorization.lifecycleBlocked = true;
+    expect(nextRotationAction(state, now)).toEqual({ kind: "pause", reason: "instance_lifecycle_busy" });
+    state.attempt!.steps = [{ ...prepared, status: "in_flight", observeDeadline: now + 120000 }];
+    expect(nextRotationAction(state, now)).toMatchObject({ kind: "observe", stepId: prepared.stepId });
+  });
   it("prepares a durable attempt before cloud execution and preserves DB identities on dispatch", () => {
     const state = snapshot();
     expect(nextRotationAction({ ...state, attempt: null }, now)).toEqual({ kind: "execute", operation: "prepare_attempt", budgetSegmentId: "segment-1" });

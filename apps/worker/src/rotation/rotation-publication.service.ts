@@ -42,6 +42,7 @@ export function effectiveOldTtl(ttl: number, provider: string) {
   return ttl > 1 ? ttl : provider === "cloudflare" ? 300 : 86400;
 }
 export function publicationAuthorizationError(c: RotationContext) {
+  if (c.lifecycleBlocked) return "instance_lifecycle_busy";
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed) return "authorization_revoked";
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
   if (!c.iface || !c.address?.inventoryPresent || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration)

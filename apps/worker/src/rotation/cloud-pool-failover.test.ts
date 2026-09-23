@@ -106,6 +106,8 @@ async function poolFixture(recoveryMode: "automatic" | "keep_current" = "automat
   const round = async (policyId: string, outcome: "success" | "failure", rounds = 1) => {
     for (let n = 0; n < rounds; n++) {
       timestamp += 15000;
+      // Simulate online probes as the test advances its scheduling clock.
+      for (const agent of agents) await d.update(db.probeAgents).set({ lastSeenAt: new Date(timestamp) }).where(eq(db.probeAgents.id, agent.id));
       const current = await scheduler.schedulePolicy(policyId, new Date(timestamp));
       expect(current).toBeDefined();
       const tasks = await d.select().from(db.probeTasks).where(eq(db.probeTasks.roundId, current!.id));

@@ -104,6 +104,7 @@ it.each(["external", "mixed"] as const)("fails over published DDNS through %s pr
   const base = new Date("2026-09-20T00:00:00Z");
   async function observedRounds(tick: number, outcomes: Map<string, "success" | "failure">) {
     const now = new Date(base.getTime() + tick * 15_000);
+    for (const agent of f.agents) await d.update(db.probeAgents).set({ lastSeenAt: now }).where(eq(db.probeAgents.id, agent.id));
     for (const policy of policies) await scheduler.schedulePolicy(policy.id, now);
     const rounds = (await d.select().from(db.probeRounds).where(eq(db.probeRounds.status, "pending"))).filter(round => round.endpointId === f.endpoint.id || round.endpointId === backup!.id);
     expect(rounds.map(round => round.endpointAddressId).sort()).toEqual([...outcomes.keys()].sort());

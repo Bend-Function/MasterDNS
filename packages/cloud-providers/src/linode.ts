@@ -1,14 +1,16 @@
 import { isIP } from "node:net";
-import type { CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
+import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudPowerState, CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 import { CloudError } from "./errors.js";
+import { assertLifecycleAction, assertLifecycleSnapshot, lifecycleNoWrite, sameLifecycleRef } from "./lifecycle.js";
 import { monthlyTrafficResult, trafficNumber } from "./monthly-traffic.js";
 import { LinodeHttp } from "./linode-http.js";
 import { executeLinodeRotation, observeLinodeRotation } from "./linode-rotation.js";
 import type { Capability, CloudAdapter, CloudAddress, CloudInventory, CloudPage, LinodeCredentials } from "./provider.js";
+import { createCloudFetch } from "./proxy.js";
 
 export type LinodeIp = { address?: string; type?: string; public?: boolean; linode_id?: number; region?: string; reserved?: boolean };
 export type LinodeEvent = { id: number; action?: string; entity?: { type?: string; id?: number }; status?: string; username?: string };
-type LinodeInstance = { id: number; label?: string; region?: string; status?: string; interface_generation?: string };
+type LinodeInstance = { id: number; label?: string; region?: string; status?: string; created?: string; interface_generation?: string };
 type LinodeConfig = { id?: number; helpers?: { network?: boolean }; run_level?: string; interfaces?: Array<{ purpose?: string; primary?: boolean; ipv4?: unknown; ip_ranges?: unknown[]; subnet_id?: unknown; vpc_id?: unknown }> | null };
 type LinodeIps = { ipv4?: { public?: LinodeIp[]; shared?: unknown[]; reserved?: LinodeIp[] }; ipv6?: { slaac?: LinodeIp; global?: unknown[] } };
 const no = (reason: string): Capability => ({ available: false, reason, permission: "unverified", requiresStop: false, releasesOldAddress: false, canRestoreOldAddress: false });
@@ -50,7 +52,8 @@ export class LinodeCloudAdapter implements CloudAdapter {
   private username?: string;
   constructor(readonly accountId: string, credentials: LinodeCredentials, dependencies: { fetch?: typeof fetch } = {}) {
     if (credentials.kind !== "linode_token" || !credentials.token.trim()) throw new CloudError("invalid_credentials", false);
-    this.http = new LinodeHttp(credentials.token, dependencies.fetch);
+    const proxyFetch = createCloudFetch(credentials.proxyUrl);
+    this.http = new LinodeHttp(credentials.token, dependencies.fetch ?? proxyFetch);
   }
   async verifyIdentity(): Promise<{ externalAccountId: string }> {
     const profile = await this.http.request<{ username?: string }>("/profile");
@@ -141,8 +144,51 @@ export class LinodeCloudAdapter implements CloudAdapter {
     return { ref: { ...ref }, name: instance.label ?? ref.instanceId, state: instance.status ?? "unknown", metadata,
       interfaces: [{ id: legacy ? "public" : "linode-public", deviceIndex: 0, metadata: { interfaceGeneration: metadata.interfaceGeneration, ...(config?.id === undefined ? {} : { configId: config.id }) }, addresses }] };
   }
+  async inspectLifecycle(ref: CloudRef): Promise<CloudLifecycleSnapshot> {
+    this.validateRef(ref);
+    let instance: LinodeInstance;
+    try {
+      instance = await this.http.request<LinodeInstance>(`/linode/instances/${ref.instanceId}`);
+    } catch (error) {
+      if (error instanceof CloudError && error.code === "resource_not_found") return { ref, identity: ref.instanceId, state: "deleted" };
+      throw error;
+    }
+    if (String(instance.id) !== ref.instanceId || instance.region !== ref.region) throw new CloudError("remote_identity_changed", false);
+    if (typeof instance.created !== "string" || !instance.created || !Number.isFinite(Date.parse(instance.created))) throw new CloudError("remote_identity_changed", false);
+    return { ref, identity: linodeLifecycleIdentity(instance), state: linodeLifecycleState(instance.status),
+      ...(typeof instance.label === "string" && instance.label ? { nativeName: instance.label } : {}),
+    };
+  }
+  async mutateLifecycle(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt> {
+    assertLifecycleAction(action);
+    assertLifecycleSnapshot(snapshot, this.accountId, "linode");
+    this.validateRef(snapshot.ref);
+    const current = await this.inspectLifecycle(snapshot.ref);
+    if (!sameLifecycleRef(current.ref, snapshot.ref)
+      || (current.state !== "deleted" && current.identity !== snapshot.identity)) throw new CloudError("remote_identity_changed", false);
+    const noWrite = lifecycleNoWrite(action, current.state);
+    if (noWrite !== undefined) return noWrite;
+    const root = `/linode/instances/${snapshot.ref.instanceId}`;
+    if (action === "start") await this.http.request(`${root}/boot`, { method: "POST", body: {} });
+    else if (action === "stop") await this.http.request(`${root}/shutdown`, { method: "POST", body: {} });
+    else await this.http.request(root, { method: "DELETE" });
+    return {};
+  }
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability { return linodeCapabilities(slot, inventory); }
   execute(step: CloudStep) { return executeLinodeRotation(step, this); }
   async observe(step: CloudStep) { return (await this.observeDetails(step)).status; }
   observeDetails(step: CloudStep) { return observeLinodeRotation(step, this); }
+}
+
+function linodeLifecycleIdentity(instance: LinodeInstance): string {
+  return `${instance.id}:${instance.region}:${instance.created}`;
+}
+
+function linodeLifecycleState(value: unknown): CloudPowerState {
+  if (value === "running") return "running";
+  if (value === "offline") return "stopped";
+  if (value === "booting" || value === "provisioning") return "starting";
+  if (value === "shutting_down") return "stopping";
+  if (value === "deleting") return "deleting";
+  return "unknown";
 }

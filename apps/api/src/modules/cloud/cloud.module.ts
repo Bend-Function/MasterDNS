@@ -6,6 +6,10 @@ import { CloudIdleIpsService } from "./cloud-idle-ips.service.js";
 import { CloudIdleIpsController } from "./cloud-idle-ips.controller.js";
 import { CloudStateResetService } from "./cloud-state-reset.service.js";
 import { CloudStateResetController } from "./cloud-state-reset.controller.js";
+import { CloudLifecycleController } from "./cloud-lifecycle.controller.js";
+import { CloudLifecycleService } from "./cloud-lifecycle.service.js";
+import { CloudProxyController } from "./cloud-proxy.controller.js";
+import { CloudProxyService } from "./cloud-proxy.service.js";
 
-@Module({ controllers: [CloudController, CloudIdleIpsController, CloudStateResetController], providers: [CloudService, CloudBindingsService, CloudIdleIpsService, CloudStateResetService], exports: [CloudService, CloudBindingsService] })
+@Module({ controllers: [CloudController, CloudIdleIpsController, CloudStateResetController, CloudLifecycleController, CloudProxyController], providers: [CloudService, CloudBindingsService, CloudIdleIpsService, CloudStateResetService, CloudLifecycleService, CloudProxyService], exports: [CloudService, CloudBindingsService] })
 export class CloudModule {}

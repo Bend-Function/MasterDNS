@@ -1,6 +1,7 @@
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationPolicies } from "./schema/index.js";
 import type { MasterDnsDatabase } from "./index.js";
+import { instanceLifecycleBlocksRotation } from "./cloud-lifecycle.js";
 export type RotationTransaction = Parameters<Parameters<MasterDnsDatabase["transaction"]>[0]>[0];
 export async function databaseNow(tx: RotationTransaction) {
   const rows = await tx.execute<{ now: Date }>(sql`select clock_timestamp() as now`);
@@ -26,11 +27,13 @@ export async function lockRotationContext(tx: RotationTransaction, slotId: strin
     .innerJoin(cloudAccounts, eq(cloudAccounts.id, cloudInstances.accountId)).innerJoin(instanceAuthorizations, eq(instanceAuthorizations.instanceId, cloudInstances.id))
     .where(and(eq(cloudAccounts.provider, account.provider), eq(cloudAccounts.externalAccountId, account.externalAccountId), eq(cloudInstances.service, instance.service), eq(cloudInstances.region, instance.region), eq(cloudInstances.externalId, instance.externalId), ne(cloudInstances.id, instance.id), eq(instanceAuthorizations.managed, true))) : [];
   const physicalKey = JSON.stringify([account.provider, account.externalAccountId, instance.service, instance.region, instance.externalId]);
-  return { account, instance, iface, slot, address, authorization, policy, scope, physicalKey, conflictingManager: conflicts.length > 0,
+  const lifecycleBlocked = await instanceLifecycleBlocksRotation(tx, physicalKey);
+  return { account, instance, iface, slot, address, authorization, policy, scope, physicalKey, lifecycleBlocked, conflictingManager: conflicts.length > 0,
     addressVersion: slot.candidateAddressId ? slot.candidateVersion : slot.currentVersion };
 }
 export type RotationContext = Awaited<ReturnType<typeof lockRotationContext>>;
 export function rotationAuthorizationError(c: RotationContext, trigger: "health" | "manual" = "health"): string | undefined {
+  if (c.lifecycleBlocked) return "instance_lifecycle_busy";
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed) return "authorization_revoked";
   if ((trigger === "health" && !c.policy?.enabled) || !(c.slot.family === "4" ? c.authorization.allowIpv4Rotation : c.authorization.allowIpv6Rotation)) return "family_disabled";
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";

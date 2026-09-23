@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import type { RotationTransaction } from "./rotation-context.js";
+import { instanceLifecycleAddressDeleting } from "./cloud-lifecycle.js";
 
 export async function idleIpReleaseInProgress(tx: RotationTransaction, externalAccountId: string, region: string, exceptBatchId?: string) {
   const rows = await tx.execute(sql`select 1 from cloud_idle_ip_cleanups b, jsonb_array_elements(b.items) item
@@ -10,6 +11,7 @@ export async function idleIpReleaseInProgress(tx: RotationTransaction, externalA
 
 export async function idleIpAddressReleasing(tx: RotationTransaction, address: string) {
   await lockIdleIpAddress(tx, address);
+  if (await instanceLifecycleAddressDeleting(tx, address)) return true;
   const rows = await tx.execute(sql`select 1 from cloud_idle_ip_cleanups b, jsonb_array_elements(b.items) item
     where item->>'address'=${address} and item->>'status' in ('in_flight','pending') limit 1`);
   if (rows.length) return true;

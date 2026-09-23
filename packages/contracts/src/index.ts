@@ -1,4 +1,5 @@
 export * from "./cloud.js";
+export * from "./cloud-lifecycle.js";
 export * from "./dns.js";
 export * from "./errors.js";
 export * from "./health.js";

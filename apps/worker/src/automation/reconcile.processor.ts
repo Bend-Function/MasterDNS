@@ -3,6 +3,7 @@ import { evaluateStrategy } from "@masterdns/automation";
 import type { DnsRecordInput, NotificationEvent, PoolReconcileJob, StrategyDecision } from "@masterdns/contracts";
 import { queueNames } from "@masterdns/contracts";
 import {
+  instanceLifecycleAddressDeleting,
   cloudEndpointLinks,
   rotationPublications,
   lockRotationContexts,
@@ -289,6 +290,10 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         desiredSnapshot: decision,
       }).returning({ id: operations.id });
       if (!operation) throw new Error("Pool operation insert returned no row");
+      for (const step of pending) {
+        const record = step.input.record as DnsRecordInput | undefined;
+        if (step.action !== "delete" && record && ["A", "AAAA"].includes(record.type) && await instanceLifecycleAddressDeleting(tx, record.content)) throw new Error("instance_lifecycle_busy");
+      }
       await tx.insert(operationSteps).values(pending.map((step, index) => ({
         operationId: operation.id,
         sequence: index + 1,

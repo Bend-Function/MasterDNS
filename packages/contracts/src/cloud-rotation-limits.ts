@@ -15,14 +15,16 @@ const actions: Record<CloudService, Record<string, string>> = {
     "ec2.auto-ipv4.disable": "ModifyNetworkInterfaceAttribute", "ec2.auto-ipv4.enable": "ModifyNetworkInterfaceAttribute",
     "ec2.eip.allocate": "AllocateAddress", "ec2.eip.associate": "AssociateAddress", "ec2.eip.release": "ReleaseAddress",
     "ec2.ipv6.assign": "AssignIpv6Addresses", "ec2.ipv6.unassign": "UnassignIpv6Addresses",
+    "ec2.instance.start": "StartInstances", "ec2.instance.stop": "StopInstances", "ec2.instance.delete": "TerminateInstances",
   },
   lightsail: {
     "lightsail.static-ip.allocate": "AllocateStaticIp", "lightsail.static-ip.detach": "DetachStaticIp",
     "lightsail.static-ip.attach": "AttachStaticIp", "lightsail.static-ip.release": "ReleaseStaticIp",
     "lightsail.ipv6.disable": "SetIpAddressType", "lightsail.ipv6.enable": "SetIpAddressType",
+    "lightsail.instance.start": "StartInstance", "lightsail.instance.stop": "StopInstance", "lightsail.instance.delete": "DeleteInstance",
   },
-  azure_vm: { "azure.public-ip.allocate": "PublicIPAddresses.CreateOrUpdate", "azure.public-ip.associate": "NetworkInterfaces.CreateOrUpdate", "azure.public-ip.delete": "PublicIPAddresses.Delete" },
-  linode: { "linode.ipv4.allocate": "InstanceIP.Allocate", "linode.instance.reboot": "Instance.Reboot", "linode.ipv4.release": "InstanceIP.Delete" },
+  azure_vm: { "azure.public-ip.allocate": "PublicIPAddresses.CreateOrUpdate", "azure.public-ip.associate": "NetworkInterfaces.CreateOrUpdate", "azure.public-ip.delete": "PublicIPAddresses.Delete", "azure_vm.instance.start": "VirtualMachines.Start", "azure_vm.instance.stop": "VirtualMachines.Deallocate", "azure_vm.instance.delete": "VirtualMachines.Delete" },
+  linode: { "linode.ipv4.allocate": "InstanceIP.Allocate", "linode.instance.reboot": "Instance.Reboot", "linode.ipv4.release": "InstanceIP.Delete", "linode.instance.start": "Instance.Boot", "linode.instance.stop": "Instance.Shutdown", "linode.instance.delete": "Instance.Delete" },
 };
 export function cloudRotationOperation(service: CloudService, action: string): string {
   const operation = Object.hasOwn(actions[service] ?? {}, action) ? actions[service][action] : undefined;
@@ -36,12 +38,12 @@ export function cloudRotationLimitRules(service: CloudService, utilizationPercen
   const window = (id: string, operations: string[], capacity: number, seconds: number, scope: "region" | "global"): CloudRotationLimitRule => ({ id, name: id, operations, scope, kind: "sliding_window", officialCapacity: capacity, capacity: Math.max(1, Math.floor(capacity * percent)), officialRefillPerSecond: null, refillPerSecond: null, windowSeconds: seconds });
   const operations = [...new Set(Object.values(actions[service] ?? {}))];
   switch (service) {
-    case "ec2": return operations.map(operation => bucket(`ec2.${operation}`, [operation], ["ModifyNetworkInterfaceAttribute", "AssignIpv6Addresses"].includes(operation) ? 100 : 50, 5));
+    case "ec2": return operations.map(operation => bucket(`ec2.${operation}`, [operation], operation === "StartInstances" ? 5 : ["ModifyNetworkInterfaceAttribute", "AssignIpv6Addresses", "TerminateInstances"].includes(operation) ? 100 : 50, operation === "StartInstances" ? 2 : 5));
     case "lightsail": {
-      const staticOperations = operations.filter(operation => operation !== "SetIpAddressType");
-      return [...operations.map(operation => bucket(`lightsail.${operation}`, [operation], 1, 1)), window("lightsail.static-ip.hour", staticOperations, 50, 3600, "global"), window("lightsail.static-ip.day", staticOperations, 500, 86400, "global")];
+      const staticOperations = operations.filter(operation => ["AllocateStaticIp", "AttachStaticIp", "DetachStaticIp", "ReleaseStaticIp"].includes(operation));
+      return [...operations.map(operation => bucket(`lightsail.${operation}`, [operation], ["StartInstance", "StopInstance", "DeleteInstance"].includes(operation) ? 20 : 1, ["StartInstance", "StopInstance"].includes(operation) ? 10 : 1)), window("lightsail.static-ip.hour", staticOperations, 50, 3600, "global"), window("lightsail.static-ip.day", staticOperations, 500, 86400, "global")];
     }
-    case "azure_vm": return [bucket("azure.arm.writes", operations.filter(operation => !operation.endsWith(".Delete")), 200, 10), bucket("azure.arm.deletes", operations.filter(operation => operation.endsWith(".Delete")), 200, 10), window("azure.network.mutations", operations, 1000, 300, "region")];
+    case "azure_vm": return [bucket("azure.arm.writes", operations.filter(operation => !operation.endsWith(".Delete")), 200, 10), bucket("azure.arm.deletes", operations.filter(operation => operation.endsWith(".Delete")), 200, 10), window("azure.network.mutations", operations.filter(operation => !operation.startsWith("VirtualMachines.")), 1000, 300, "region")];
     case "linode": return [window("linode.mutations", operations, 1600, 60, "global")];
     default: throw new Error("unsupported_cloud_service");
   }

@@ -97,10 +97,12 @@ export class CloudService {
     const current = await this.findAccount(actor, id);
     if (!credentialsMatchProvider(current.provider, input.credentials)) throw new BadRequestException("Credentials do not match provider");
     const service = cloudProviderServices[current.provider][0]!;
-    const expectedIdentity = current.externalAccountId ?? (await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: decryptJson<CloudCredentials>({ ciphertext: current.credentialCiphertext, iv: current.credentialIv, tag: current.credentialTag, keyVersion: current.credentialKeyVersion }, this.encryptionKey) }).verifyIdentity()).externalAccountId;
-    const identity = await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: input.credentials as CloudCredentials }).verifyIdentity();
+    const currentCredentials = decryptJson<CloudCredentials>({ ciphertext: current.credentialCiphertext, iv: current.credentialIv, tag: current.credentialTag, keyVersion: current.credentialKeyVersion }, this.encryptionKey);
+    const rotatedCredentials = { ...input.credentials, ...(currentCredentials.proxyUrl === undefined ? {} : { proxyUrl: currentCredentials.proxyUrl }) } as CloudCredentials;
+    const expectedIdentity = current.externalAccountId ?? (await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: currentCredentials }).verifyIdentity()).externalAccountId;
+    const identity = await createCloudAdapter({ accountId: id, provider: current.provider, service, credentials: rotatedCredentials }).verifyIdentity();
     if (identity.externalAccountId !== expectedIdentity) throw new ConflictException("Credentials belong to another cloud account; create a separate cloud account");
-    return this.updateAccount(actor, id, { ...this.encryptedCredentials(input.credentials), externalAccountId: expectedIdentity }, "cloud_account.credentials_rotate", current.credentialCiphertext);
+    return this.updateAccount(actor, id, { ...this.encryptedCredentials(rotatedCredentials), externalAccountId: expectedIdentity }, "cloud_account.credentials_rotate", current.credentialCiphertext);
   }
 
   async setEnabled(actor: AuthUser, id: string, enabled: boolean) {
@@ -270,6 +272,7 @@ export class CloudService {
         allowIpv4Rotation: input.managed && (input.allowIpv4Rotation ?? false),
         allowIpv6Rotation: input.managed && (input.allowIpv6Rotation ?? false),
         allowStopStart: input.managed && (input.allowStopStart ?? false),
+        allowDelete: input.managed && (input.allowDelete ?? false),
         allowReleaseAddress: input.managed && (input.allowReleaseAddress ?? false),
         updatedByUserId: actor.id, updatedAt: new Date(),
       };

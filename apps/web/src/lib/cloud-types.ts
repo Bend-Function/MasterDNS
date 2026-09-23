@@ -48,6 +48,7 @@ export type CloudAuthorization = {
   allowIpv4Rotation: boolean;
   allowIpv6Rotation: boolean;
   allowStopStart: boolean;
+  allowDelete?: boolean;
   allowReleaseAddress: boolean;
   updatedAt?: string;
 };

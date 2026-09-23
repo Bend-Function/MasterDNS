@@ -6,6 +6,10 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./cloud-lifecycle": {
+      "types": "./dist/cloud-lifecycle.d.ts",
+      "default": "./dist/cloud-lifecycle.js"
+    },
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"

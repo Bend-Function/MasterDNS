@@ -44,7 +44,7 @@ export class RotationStore {
     const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, incident.addressVersion)));
     const snapshot: RotationSnapshot = {
       phase: incident.phase,
-      authorization: { managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
+      authorization: { lifecycleBlocked: c.lifecycleBlocked, managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
         regionAllowed: !!c.scope && (c.account.regions === null || c.account.regions.includes(c.instance.region)), conflictingManager: c.conflictingManager },
       revisions: { authorization: c.authorization?.revision ?? 0, policy: c.policy?.revision ?? 0, address: c.addressVersion },
       expectedRevisions: { authorization: incident.authorizationRevision, policy: incident.policyRevision, address: incident.addressVersion },

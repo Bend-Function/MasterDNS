@@ -171,6 +171,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     allowIpv4Rotation: boolean("allow_ipv4_rotation").notNull().default(false),
     allowIpv6Rotation: boolean("allow_ipv6_rotation").notNull().default(false),
     allowStopStart: boolean("allow_stop_start").notNull().default(false),
+    allowDelete: boolean("allow_delete").notNull().default(false),
     allowReleaseAddress: boolean("allow_release_address").notNull().default(false),
     updatedByUserId: uuid("updated_by_user_id").references(dependencies.userId, { onDelete: "set null" }),
     ...timestamps,

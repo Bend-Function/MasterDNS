@@ -84,6 +84,7 @@ export function authorizationPayload(value: CloudAuthorization): AuthorizationPa
     allowIpv4Rotation: value.allowIpv4Rotation,
     allowIpv6Rotation: value.allowIpv6Rotation,
     allowStopStart: value.allowStopStart,
+    allowDelete: value.allowDelete ?? false,
     allowReleaseAddress: value.allowReleaseAddress,
   };
 }
@@ -112,6 +113,8 @@ export function capabilityReason(reason?: string) {
   return ({
     rotation_in_progress: "此实例还有未完成的轮换，当前槽位暂不可再次换址",
     rotation_uncertain: "先前云操作的结果尚未确认，当前槽位暂不可再次换址",
+    lifecycle_pending: "此实例已有启动、停止或删除操作等待完成",
+    instance_lifecycle_busy: "实例正在执行启动、停止或删除操作；完成前暂停新的换址与发布",
     cloud_state_reset: "已同步云端并清除旧流程的本地阻塞",
     private_ipv4_unsupported: "私网或保留 IPv4 地址不支持自动轮换，请使用公网 IPv4 槽位",
     inventory_mismatch: "清单身份不匹配", interface_not_found: "网卡已不存在", address_not_found: "地址已不存在", lightsail_ipv6_only: "IPv6-only 套餐不支持", secondary_interface_unsupported: "不支持次要网卡", primary_ipv6_immutable: "Primary IPv6 不可轮换，可绑定与监控",
@@ -176,7 +179,7 @@ function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuth
   return authorizationFields.some((field) => saved[field] !== draft[field]);
 }
 
-const authorizationFields = ["managed", "allowIpv4Rotation", "allowIpv6Rotation", "allowStopStart", "allowReleaseAddress"] as const;
+const authorizationFields = ["managed", "allowIpv4Rotation", "allowIpv6Rotation", "allowStopStart", "allowDelete", "allowReleaseAddress"] as const;
 
 export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean): string | null {
   if (!slot.capability?.requiresStop) return null;

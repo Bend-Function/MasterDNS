@@ -17,6 +17,7 @@ import {
   probeRounds,
   prepareCloudPolicyRestore,
   lockRotationContexts,
+  instanceLifecycleAddressDeleting,
   auditLogs,
   bindingAssignments,
   bindingEndpointHealth,
@@ -475,6 +476,7 @@ export class PoolsService {
       if (!source) throw new NotFoundException("云地址与 Pool 必须属于同一用户");
       // Cloud hierarchy precedes the Pool lock, matching publication and recovery.
       const c = (await lockRotationContexts(tx, [slotId])).get(slotId)!;
+      if (c.address && await instanceLifecycleAddressDeleting(tx, c.address.address)) throw new ConflictException("云实例正在删除，不能引用其地址");
       await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${poolId}))`);
       const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, poolId)).for("update");
       if (!pool || c.account.ownerUserId !== pool.ownerUserId || (actor.role !== "admin" && pool.ownerUserId !== actor.id)) throw new NotFoundException("IP Pool 不存在");
@@ -500,6 +502,9 @@ export class PoolsService {
   async createEndpoint(actor: AuthUser, poolId: string, input: CreateEndpointInput) {
     await this.findOwnedPool(actor, poolId);
     const endpoint = await this.database.db.transaction(async (tx) => {
+      for (const address of [input.ipv4, input.ipv6].filter((value): value is string => !!value).sort()) {
+        if (await instanceLifecycleAddressDeleting(tx, address)) throw new ConflictException("云实例正在删除，不能引用其地址");
+      }
       const [created] = await tx.insert(endpoints).values({
         poolId,
         name: input.name,
@@ -523,6 +528,9 @@ export class PoolsService {
     const current = await this.findEndpoint(poolId, endpointId);
     const { ipv4, ipv6, forceApply, addressMode, ...fields } = input;
     const updated = await this.database.db.transaction(async (tx) => {
+      for (const address of [ipv4, ipv6].filter((value): value is string => !!value).sort()) {
+        if (await instanceLifecycleAddressDeleting(tx, address)) throw new ConflictException("云实例正在删除，不能引用其地址");
+      }
       const [lockedEndpoint] = await tx.select().from(endpoints).where(and(
         eq(endpoints.id, endpointId),
         eq(endpoints.poolId, poolId),
@@ -1014,6 +1022,9 @@ export async function restoreEndpointPolicy(
       && address.source === "static"
     ));
     if (desired.length > 0) {
+      for (const address of [...new Set(desired.map(entry => entry.address))].sort()) {
+        if (await instanceLifecycleAddressDeleting(tx, address)) throw new ConflictException("云实例正在删除，不能恢复其地址引用");
+      }
       await tx.insert(endpointAddresses).values(desired.map((address) => ({
         endpointId: endpoint.id,
         family: address.family,

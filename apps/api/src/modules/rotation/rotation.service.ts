@@ -107,7 +107,7 @@ export class RotationService {
   }
   private async transaction<T>(action: (tx: RotationTransaction) => Promise<T>) {
     try { return await this.database.db.transaction(action); }
-    catch (error) { if (error instanceof Error && /^(rotation_|cloud_observation_required|external_health_required|confirmed_failure_required|authorization_revoked|family_disabled|region_excluded|resource_not_found|conflicting_manager)/.test(error.message)) throw new ConflictException(error.message); throw error; }
+    catch (error) { if (error instanceof Error && /^(rotation_|cloud_observation_required|external_health_required|confirmed_failure_required|authorization_revoked|family_disabled|region_excluded|resource_not_found|conflicting_manager|instance_lifecycle_busy)/.test(error.message)) throw new ConflictException(error.message); throw error; }
   }
   private async wake(incidentId: string) { await this.queues.rotation.add("rotate", { incidentId }, { jobId: `rotation-${incidentId}`, removeOnComplete: true, removeOnFail: true }).catch(() => undefined); }
 }

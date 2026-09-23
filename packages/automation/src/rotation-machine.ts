@@ -45,6 +45,7 @@ export type RotationSnapshot = {
     present: boolean;
     regionAllowed: boolean;
     conflictingManager: boolean;
+    lifecycleBlocked?: boolean;
   };
   revisions: RotationRevisions;
   expectedRevisions: RotationRevisions;
@@ -72,7 +73,7 @@ export type RotationPauseReason = RotationCloudRejection
   | "authorization_changed" | "configuration_changed" | "address_version_changed" | "stale_fence"
   | "attempts_exhausted" | "resource_ownership_ambiguous" | "cloud_not_applied"
   | "candidate_failed" | "dns_partial" | "cleanup_not_authorized" | "cleanup_failed"
-  | "invalid_snapshot";
+  | "invalid_snapshot" | "instance_lifecycle_busy";
 
 export type RotationAction =
   | { kind: "wait"; reason: "instance_busy" | "cooldown" | "candidate_required" | "probe_insufficient" | "publication_required" | "cleanup_grace" | RotationCloudRejection; until?: number }
@@ -137,6 +138,7 @@ export function nextRotationAction(snapshot: RotationSnapshot, now: number): Rot
 
 function writeGate(snapshot: RotationSnapshot): RotationAction | undefined {
   const auth = snapshot.authorization;
+  if (auth.lifecycleBlocked) return { kind: "pause", reason: "instance_lifecycle_busy" };
   if (!auth.managed) return { kind: "pause", reason: "authorization_revoked" };
   if (!auth.familyEnabled) return { kind: "pause", reason: "family_disabled" };
   if (!auth.present) return { kind: "pause", reason: "resource_not_found" };

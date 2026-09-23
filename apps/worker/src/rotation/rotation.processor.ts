@@ -75,6 +75,6 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
 }
 function safeError(error: unknown) {
   if (error instanceof CloudError) return error.code;
-  if (error instanceof Error && ["authorization_changed", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "rotation_limit_too_low"].includes(error.message)) return error.message;
+  if (error instanceof Error && ["authorization_changed", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "rotation_limit_too_low", "instance_lifecycle_busy"].includes(error.message)) return error.message;
   return "rotation_runtime_failed";
 }

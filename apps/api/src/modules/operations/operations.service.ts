@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { dnsRecordInputSchema, type DnsRecordInput, type OperationSource } from "@masterdns/contracts";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { endpointPools, dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones } from "@masterdns/db";
+import { endpointPools, dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones, instanceLifecycleAddressDeleting } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -75,6 +75,7 @@ export class OperationsService {
         )).limit(1);
         if (binding) throw new ConflictException("DNS record is managed by an IP Pool");
       }
+      if (input.action !== "delete" && input.record && ["A", "AAAA"].includes(input.record.type) && await instanceLifecycleAddressDeleting(tx, input.record.content)) throw new ConflictException("云实例正在删除，不能将 DNS 指向其地址");
       await tx.insert(operationSteps).values({
         operationId: operation.id,
         sequence: 1,
@@ -187,6 +188,11 @@ export class OperationsService {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
         const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, operation.resourceId));
         if (!pool || (operation.policyRevision !== null && pool.policyRevision !== operation.policyRevision) || (operation.decisionRevision !== null && pool.decisionRevision !== operation.decisionRevision)) throw new ConflictException("该操作已被新策略或地址决策替代，请重新协调 Pool");
+      }
+      const retrySteps = await tx.select().from(operationSteps).where(and(eq(operationSteps.operationId, id), eq(operationSteps.status, "failed")));
+      for (const step of retrySteps) {
+        const record = (step.input as { record?: DnsRecordInput }).record;
+        if (step.action !== "delete" && record && ["A", "AAAA"].includes(record.type) && await instanceLifecycleAddressDeleting(tx, record.content)) throw new ConflictException("云实例正在删除，不能重试其地址发布");
       }
       await tx.update(operationSteps).set({ status: "pending", errorCode: null, errorDetail: null, nextRetryAt: null, finishedAt: null, updatedAt: new Date() })
         .where(and(eq(operationSteps.operationId, id), eq(operationSteps.status, "failed")));

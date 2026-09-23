@@ -11,6 +11,7 @@ import { ReconcileProcessor } from "./automation/reconcile.processor.js";
 import { ReconcileOutboxService } from "./automation/reconcile-outbox.service.js";
 import { CloudRuntimeService } from "./cloud/cloud-runtime.service.js";
 import { CloudSyncService } from "./cloud/cloud-sync.service.js";
+import { CloudLifecycleService } from "./cloud/cloud-lifecycle.service.js";
 import { DatabaseService } from "./database.service.js";
 import { HealthProcessor } from "./health/health.processor.js";
 import { HealthRetentionService } from "./health/health-retention.service.js";
@@ -30,6 +31,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
     DatabaseService,
     CloudRuntimeService,
     CloudSyncService,
+    CloudLifecycleService,
     QueueRuntimeService,
     ProviderRuntimeService,
     OperationProcessor,

@@ -6,6 +6,7 @@ export * from "./errors.js";
 export * from "./factory.js";
 export * from "./lightsail.js";
 export * from "./provider.js";
+export * from "./proxy.js";
 export * from "./rotation-plan.js";
 export * from "./resource-ownership.js";
 export * from "./azure.js";

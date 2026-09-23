@@ -5,6 +5,7 @@ import { withDnsZoneLock } from "@masterdns/automation";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users, zones } from "@masterdns/db";
+import { decryptJson, encryptJson } from "@masterdns/crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 
 const identityHook = vi.hoisted(() => ({ run: undefined as (() => Promise<void>) | undefined }));
@@ -239,6 +240,15 @@ describe("cloud account and authorization API", () => {
     await expect(service.rotateCredentials(f.actor, f.account.id, { credentials: { kind: "access_key", accessKeyId: "other-access-key", secretAccessKey: "other-secret-access-key" } })).rejects.toMatchObject({ status: 409 });
     const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
     expect(stored!.externalAccountId).toBe("123456789012");
+  });
+  it("preserves an encrypted proxy URL when rotating cloud credentials", async () => {
+    const f = await fixture();
+    const key = Buffer.alloc(32, 1);
+    const encrypted = encryptJson({ kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key", proxyUrl: "socks5h://alice:secret@proxy.example:1080" }, key);
+    await connection.db.update(cloudAccounts).set({ credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag, credentialKeyVersion: encrypted.keyVersion }).where(eq(cloudAccounts.id, f.account.id));
+    await service.rotateCredentials(f.actor, f.account.id, { credentials: { kind: "access_key", accessKeyId: "rotated-access-key", secretAccessKey: "rotated-secret-access-key" } });
+    const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+    expect(decryptJson({ ciphertext: stored!.credentialCiphertext, iv: stored!.credentialIv, tag: stored!.credentialTag, keyVersion: stored!.credentialKeyVersion }, key)).toMatchObject({ accessKeyId: "rotated-access-key", proxyUrl: "socks5h://alice:secret@proxy.example:1080" });
   });
   it("rejects a concurrent first runtime identity pin during credential verification", async () => {
     const f = await fixture();

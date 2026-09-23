@@ -63,3 +63,5 @@ export * from "./cloud-targets.js";
 export * from "./cloud-rotation-limits.js";
 export * from "./rotation-termination.js";
 export * from "./idle-ip-guards.js";
+
+export * from "./cloud-lifecycle.js";

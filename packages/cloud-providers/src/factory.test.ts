@@ -16,3 +16,6 @@ it.each([
 ])("rejects mismatched or unknown cloud dispatch: $service / $provider", config => {
   expect(() => cloud.createCloudAdapter({ accountId: "account", ...config } as never)).toThrow();
 });
+it.each(["http://proxy.example:8080", "socks5h://proxy.example:1080/path", "socks5h:///missing-host"])("rejects invalid proxy credentials: %s", proxyUrl => {
+  expect(() => cloud.createCloudAdapter({ accountId: "account", service: "ec2", provider: "aws", credentials: { kind: "access_key", accessKeyId: "key", secretAccessKey: "secret", proxyUrl } })).toThrow("Invalid SOCKS proxy URL");
+});

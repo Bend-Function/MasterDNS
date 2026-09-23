@@ -380,6 +380,7 @@ function createTransaction(
   insertCalls: Array<{ table: unknown; values: Record<string, unknown> }>,
 ) {
   return {
+    execute: vi.fn(async () => []),
     select: vi.fn(() => ({
       from: vi.fn((table: unknown) => ({
         where: vi.fn(() => ({
@@ -414,6 +415,7 @@ function createRestoreTransaction(
   insertCalls: Array<{ table: unknown; values: unknown }>,
 ) {
   return {
+    execute: vi.fn(async () => []),
     select: vi.fn(() => ({
       from: vi.fn((table: unknown) => ({
         where: vi.fn(() => ({

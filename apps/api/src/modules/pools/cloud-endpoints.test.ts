@@ -4,6 +4,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import * as db from "@masterdns/db";
 import { PoolsService } from "./pools.service.js";
+import { OperationsService } from "../operations/operations.service.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 
 let admin: ReturnType<typeof db.createDatabase>, connection: ReturnType<typeof db.createDatabase>, service: PoolsService;
@@ -52,6 +53,20 @@ it("keeps cloud and Pool ownership aligned even for administrators", async () =>
   await expect(service.addCloudEndpoint(f.actor, f.pool.id, other.slot.id, randomUUID())).rejects.toMatchObject({ status: 404 });
   await expect(service.addCloudEndpoint({ ...f.actor, role: "admin" }, f.pool.id, other.slot.id, randomUUID())).rejects.toMatchObject({ status: 404 });
   expect(await f.d.select().from(db.endpoints).where(eq(db.endpoints.poolId, f.pool.id))).toEqual([]);
+});
+it("rejects cloud and static address references after an instance deletion is queued", async () => {
+  const f = await fixture();
+  f.address.address = "192.0.2.233";
+  await f.d.update(db.cloudAddresses).set({ address: f.address.address }).where(eq(db.cloudAddresses.id, f.address.id));
+  await f.d.insert(db.cloudLifecycleOperations).values({ instanceId: f.instance.id, physicalKey: JSON.stringify(["aws", f.account.externalAccountId, "ec2", "us-east-1", f.instance.externalId]), ownerUserId: f.actor.id, actorUserId: f.actor.id, source: "user", action: "delete", externalAccountId: f.account.externalAccountId!, credentialFingerprint: "test", protectedAddresses: [f.address.address] });
+  await expect(service.addCloudEndpoint(f.actor, f.pool.id, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409 });
+  await expect(service.createEndpoint(f.actor, f.pool.id, { name: "manual", addressMode: "static", ipv4: f.address.address, priority: 100, lifecycle: "enabled" })).rejects.toMatchObject({ status: 409 });
+  expect(await f.d.select().from(db.endpoints).where(eq(db.endpoints.poolId, f.pool.id))).toEqual([]);
+  const [dnsAccount] = await f.d.insert(db.providerAccounts).values({ ownerUserId: f.actor.id, provider: "cloudflare", name: "DNS", credentialCiphertext: "test", credentialIv: "test", credentialTag: "test" }).returning();
+  const [zone] = await f.d.insert(db.zones).values({ providerAccountId: dnsAccount!.id, externalId: randomUUID(), nameAscii: "example.com", status: "active" }).returning();
+  const dns = new OperationsService({ db: f.d } as never, {} as never);
+  await expect(dns.createDnsOperation({ ownerUserId: f.actor.id, actorUserId: f.actor.id, source: "user", idempotencyKey: randomUUID(), providerAccountId: dnsAccount!.id, zoneId: zone!.id, zoneExternalId: zone!.externalId, action: "create", record: { type: "A", name: "host.example.com", content: f.address.address, ttl: 60, providerMetadata: {} } })).rejects.toMatchObject({ status: 409 });
+  expect(await f.d.select().from(db.operations).where(eq(db.operations.ownerUserId, f.actor.id))).toEqual([]);
 });
 
 it("deduplicates concurrent retries and lets the same slot supply another owned Pool", async () => {

@@ -24,7 +24,10 @@
     "@aws-sdk/client-lightsail": "^3.1131.0",
     "@aws-sdk/client-sts": "^3.1131.0",
     "@aws-sdk/credential-providers": "^3.1131.0",
-    "@masterdns/contracts": "workspace:*"
+    "@smithy/node-http-handler": "^4.12.1",
+    "@masterdns/contracts": "workspace:*",
+    "node-fetch": "^3.3.2",
+    "socks-proxy-agent": "^8.0.5"
   },
   "devDependencies": { "tsx": "^4.23.1" }
 }

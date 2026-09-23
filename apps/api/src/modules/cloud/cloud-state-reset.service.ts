@@ -7,6 +7,7 @@ import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, c
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { env } from "../../config/env.js";
+import { instanceLifecycleBlocksRotation } from "@masterdns/db";
 
 @Injectable()
 export class CloudStateResetService {
@@ -33,6 +34,7 @@ export class CloudStateResetService {
       const incidentIds = incidents.map(row => row.id);
       await tx.insert(rotationLeases).values({ physicalKey }).onConflictDoNothing();
       const [lease] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, physicalKey)).for("update");
+      if (await instanceLifecycleBlocksRotation(tx, physicalKey)) throw new ConflictException("实例正在启停、删除或保持停机状态，不能重置轮换状态");
       if (lease?.incidentId && !incidentIds.includes(lease.incidentId)) throw new ConflictException("Another cloud account owns this instance's operation");
       // Hold the normal cloud admission fences across inspection. New local
       // operations cannot replace the address between this read and commit.

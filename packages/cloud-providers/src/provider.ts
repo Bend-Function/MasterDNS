@@ -1,11 +1,11 @@
-import type { CloudProvider, CloudRef, CloudStep, SlotRef, MonthlyTraffic } from "@masterdns/contracts";
+import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudProvider, CloudRef, CloudStep, SlotRef, MonthlyTraffic } from "@masterdns/contracts";
 
 export type AwsCredentials =
-  | { kind: "access_key"; accessKeyId: string; secretAccessKey: string; sessionToken?: string }
-  | { kind: "role"; roleArn?: string; externalId?: string };
+  | { kind: "access_key"; accessKeyId: string; secretAccessKey: string; sessionToken?: string; proxyUrl?: string }
+  | { kind: "role"; roleArn?: string; externalId?: string; proxyUrl?: string };
 
-export type AzureCredentials = { kind: "azure_service_principal"; tenantId: string; subscriptionId: string; clientId: string; clientSecret: string };
-export type LinodeCredentials = { kind: "linode_token"; token: string };
+export type AzureCredentials = { kind: "azure_service_principal"; tenantId: string; subscriptionId: string; clientId: string; clientSecret: string; proxyUrl?: string };
+export type LinodeCredentials = { kind: "linode_token"; token: string; proxyUrl?: string };
 export type CloudCredentials = AwsCredentials | AzureCredentials | LinodeCredentials;
 export function credentialsMatchProvider(provider: CloudProvider, credentials: { kind: string }): boolean {
   return provider === "aws" ? credentials.kind === "access_key" || credentials.kind === "role"
@@ -82,6 +82,8 @@ export interface CloudAdapter {
   listScopes(): Promise<string[]>;
   discover(region: string, cursor?: string): Promise<CloudPage>;
   inspect(ref: CloudRef): Promise<CloudInventory>;
+  inspectLifecycle?(ref: CloudRef): Promise<CloudLifecycleSnapshot>;
+  mutateLifecycle?(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt>;
   monthlyTraffic?(ref: CloudRef, now?: Date): Promise<MonthlyTraffic>;
   listIdleStaticIps?(region: string): Promise<IdleStaticIp[]>;
   releaseIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;

@@ -158,6 +158,7 @@ describe("cloud authorization", () => {
       allowIpv4Rotation: true,
       allowIpv6Rotation: false,
       allowStopStart: false,
+      allowDelete: false,
       allowReleaseAddress: false,
     });
   });

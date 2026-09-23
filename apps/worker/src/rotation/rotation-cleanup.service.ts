@@ -132,6 +132,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     const { c, r, lease } = initial;
     try {
       const observing = initial.step && ["in_flight", "pending", "ambiguous"].includes(initial.step.status);
+      if (!observing && c.lifecycleBlocked) { await this.waitForLifecycle(r, c.slot.id); return; }
       const adapter = await this.runtime.adapter(c.account.id, c.instance.service, { observation: !!observing });
       if (observing) {
         if (!adapter.observeDetails) throw new Error("cleanup_observation_unavailable");
@@ -239,6 +240,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     } catch (e) {
       const code = e instanceof CloudError ? e.code : e instanceof Error ? e.message.slice(0, 80) : "cleanup_failed";
       if (code === "cleanup_grace_pending") return;
+      if (code === "instance_lifecycle_busy") { await this.waitForLifecycle(r, c.slot.id); return; }
       // P11c's durable scanner is the only notification/routing authority.
       await this.database.db.transaction(async (tx) => {
         await lockRotationContext(tx, c.slot.id);
@@ -263,6 +265,14 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     } finally {
       await this.database.db.transaction((tx) => releaseRotationLease(tx, lease));
     }
+  }
+  private async waitForLifecycle(resource: Resource, slotId: string) {
+    await this.database.db.transaction(async tx => {
+      const c = await lockRotationContext(tx, slotId);
+      const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, resource.incidentId)).for("update");
+      if (!c.lifecycleBlocked || !incident || incident.terminatedAt || incident.status === "complete") return;
+      await tx.update(rotationResources).set({ cleanupStatus: "pending", cleanupError: "instance_lifecycle_busy", cleanupDueAt: sql`greatest(coalesce(${rotationResources.cleanupDueAt}, clock_timestamp()), clock_timestamp() + interval '30 seconds')` }).where(and(eq(rotationResources.id, resource.id), inArray(rotationResources.cleanupStatus, ["pending", "failed"])));
+    });
   }
   private async eligible(tx: RotationTransaction, c: RotationContext, incident: typeof rotationIncidents.$inferSelect, r: Resource, now: Date) {
     const error = rotationAuthorizationError(c, incident.trigger);

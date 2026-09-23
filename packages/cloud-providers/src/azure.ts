@@ -1,10 +1,12 @@
 import { isIP } from 'node:net';
-import type { CloudRef, CloudStep, SlotRef } from '@masterdns/contracts';
+import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudPowerState, CloudRef, CloudStep, SlotRef } from '@masterdns/contracts';
 import { AzureHttp, COMPUTE_API, NETWORK_API, RESOURCE_API, equalArmId } from './azure-http.js';
 import { executeAzureStep, observeAzureStep } from './azure-rotation.js';
 import { CloudError } from './errors.js';
+import { assertLifecycleAction, assertLifecycleSnapshot, lifecycleNoWrite, sameLifecycleRef } from './lifecycle.js';
 import { monthPeriod, monthlyTrafficResult, sumTraffic } from './monthly-traffic.js';
 import type { AzureCredentials, Capability, CloudAdapter, CloudInventory, CloudObservation, CloudPage, CloudStepResult } from './provider.js';
+import { createCloudFetch } from './proxy.js';
 // Raw ARM objects are kept local. Only explicit support evidence enters persisted inventory.
 export type AzureResource = Record<string, any>;
 export type AzureSlotEvidence = {
@@ -72,7 +74,10 @@ export class AzureCloudAdapter implements CloudAdapter {
     readonly http: AzureHttp;
     constructor(readonly accountId: string, credentials: AzureCredentials, dependencies: {
         fetch?: typeof fetch;
-    } = {}) { this.http = new AzureHttp(credentials, dependencies.fetch); }
+    } = {}) {
+        const proxyFetch = createCloudFetch(credentials.proxyUrl);
+        this.http = new AzureHttp(credentials, dependencies.fetch ?? proxyFetch);
+    }
     async verifyIdentity(): Promise<{
         externalAccountId: string;
     }> {
@@ -138,6 +143,47 @@ export class AzureCloudAdapter implements CloudAdapter {
         }
     }
     async inspect(ref: CloudRef): Promise<CloudInventory> { return (await this.read(ref)).inventory; }
+    async inspectLifecycle(ref: CloudRef): Promise<CloudLifecycleSnapshot> {
+        if (ref.accountId !== this.accountId || ref.service !== 'azure_vm')
+            throw new CloudError('remote_identity_changed', false);
+        const vmId = this.http.resourceId(ref.instanceId, 'Microsoft.Compute', 'virtualMachines');
+        const response = await this.http.getResource(vmId, COMPUTE_API, true);
+        if (response.status === 404)
+            return { ref, identity: vmId, state: 'deleted' };
+        const vm = response.body;
+        if (!equalArmId(vm.id, vmId) || vm.location?.toLowerCase() !== ref.region)
+            throw new CloudError('remote_identity_changed', false);
+        const identity = vm.properties?.vmId;
+        if (typeof identity !== 'string' || !identity.trim() || identity.length > 256)
+            throw new CloudError('remote_identity_changed', false);
+        const view = (await this.http.getResource(`${vmId}/instanceView`, COMPUTE_API)).body;
+        const code = Array.isArray(view.statuses)
+            ? view.statuses.find((status: AzureResource) => typeof status.code === 'string' && status.code.startsWith('PowerState/'))?.code
+            : undefined;
+        const state = vm.properties?.provisioningState === 'Deleting' ? 'deleting' : azureLifecycleState(code);
+        return { ref, identity, state, ...(typeof vm.name === 'string' && vm.name ? { nativeName: vm.name } : {}) };
+    }
+    async mutateLifecycle(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt> {
+        assertLifecycleAction(action);
+        assertLifecycleSnapshot(snapshot, this.accountId, 'azure_vm');
+        if (snapshot.ref.accountId !== this.accountId || snapshot.ref.service !== 'azure_vm')
+            throw new CloudError('remote_identity_changed', false);
+        const vmId = this.http.resourceId(snapshot.ref.instanceId, 'Microsoft.Compute', 'virtualMachines');
+        const current = await this.inspectLifecycle(snapshot.ref);
+        if (!sameLifecycleRef(current.ref, snapshot.ref, true)
+            || (current.state !== 'deleted' && current.identity !== snapshot.identity)) throw new CloudError('remote_identity_changed', false);
+        const noWrite = lifecycleNoWrite(action, current.state);
+        if (noWrite !== undefined) return noWrite;
+        const path = action === 'start'
+            ? `${vmId}/start?api-version=${COMPUTE_API}`
+            : action === 'stop'
+                ? `${vmId}/deallocate?api-version=${COMPUTE_API}&hibernate=false`
+                : `${vmId}?api-version=${COMPUTE_API}&forceDeletion=false`;
+        const response = await this.http.request(path, action === 'delete' ? 'DELETE' : 'POST');
+        const operation = response.headers.get('azure-asyncoperation') ?? response.headers.get('location');
+        if (!operation) return response.status === 200 || response.status === 204 ? { completed: true } : {};
+        return { operationId: this.http.url(operation).href };
+    }
     async monthlyTraffic(ref: CloudRef, now = new Date()) {
         if (ref.accountId !== this.accountId || ref.service !== 'azure_vm') throw new CloudError('resource_ownership_ambiguous', false);
         const vmId = this.http.resourceId(ref.instanceId, 'Microsoft.Compute', 'virtualMachines');
@@ -216,4 +262,13 @@ export class AzureCloudAdapter implements CloudAdapter {
     async execute(step: CloudStep): Promise<CloudStepResult> { return executeAzureStep(this, step); }
     async observe(step: CloudStep) { return (await this.observeDetails(step)).status; }
     async observeDetails(step: CloudStep): Promise<CloudObservation> { return observeAzureStep(this, step); }
+}
+
+function azureLifecycleState(code: unknown): CloudPowerState {
+    if (code === 'PowerState/running') return 'running';
+    if (code === 'PowerState/stopped') return 'stopped_allocated';
+    if (code === 'PowerState/deallocated') return 'stopped';
+    if (code === 'PowerState/starting') return 'starting';
+    if (code === 'PowerState/stopping' || code === 'PowerState/deallocating') return 'stopping';
+    return 'unknown';
 }

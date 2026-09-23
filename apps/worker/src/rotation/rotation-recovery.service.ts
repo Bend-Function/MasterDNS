@@ -35,7 +35,7 @@ export class RotationRecoveryService implements OnModuleInit, OnModuleDestroy {
           });
           admitted++;
         } catch (error) {
-          if (!(error instanceof Error && ["confirmed_failure_required", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "external_health_required"].includes(error.message))) throw error;
+          if (!(error instanceof Error && ["confirmed_failure_required", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "external_health_required", "instance_lifecycle_busy"].includes(error.message))) throw error;
         }
         if (admitted === 200) break;
       }
