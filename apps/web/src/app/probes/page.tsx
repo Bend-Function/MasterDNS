@@ -1,7 +1,7 @@
 "use client";
 
 import { Ban, Copy, Plus, RadioTower, RefreshCw, UsersRound } from "lucide-react";
-import { isProbeOnline } from "@masterdns/contracts";
+import { isProbeOnline } from "@masterdns/contracts/probes";
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
 import { RelativeTime } from "../../components/relative-time";

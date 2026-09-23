@@ -14,6 +14,10 @@
       "types": "./dist/rotation.d.ts",
       "default": "./dist/rotation.js"
     },
+    "./probes": {
+      "types": "./dist/probes.d.ts",
+      "default": "./dist/probes.js"
+    },
     "./cloud": {
       "types": "./dist/cloud.d.ts",
       "default": "./dist/cloud.js"
