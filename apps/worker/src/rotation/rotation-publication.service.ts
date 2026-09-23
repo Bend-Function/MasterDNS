@@ -171,8 +171,6 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
     for (const slotId of new Set(missing.map((row) => row.slotId)))
       await this.database.db.transaction(async (tx) => {
         const c = await lockRotationContext(tx, slotId);
-        const [terminated] = await tx.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(eq(rotationIncidents.slotId, slotId), sql`${rotationIncidents.terminatedAt} is not null`, eq(rotationIncidents.addressVersion, c.addressVersion)));
-        if (terminated) return;
         if (c.slot.candidateAddressId || !c.slot.currentAddressId) return;
         const [active] = await tx
           .select({ id: rotationIncidents.id })

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
 import * as db from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
@@ -588,6 +588,54 @@ it("discovers a newly linked endpoint on an already published slot and requires 
   expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, endpoint!.id))).toMatchObject([
     { address: f.address.address, state: "current", source: "cloud" },
   ]);
+});
+
+it("restores a missing Pool address after a terminated rotation only with fresh health evidence", async () => {
+  const f = await fixture();
+  await f.service.publishSlot(f.slot.id);
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: true });
+  const [incident] = await f.d.insert(db.rotationIncidents).values({
+    ownerUserId: f.account.ownerUserId,
+    slotId: f.slot.id,
+    family: "4",
+    trigger: "manual",
+    phase: "cleanup",
+    currentSegmentId: randomUUID(),
+    physicalKey: JSON.stringify(["aws", f.account.externalAccountId, "ec2", "us-east-1", f.instance.externalId]),
+    sourceEventId: `manual-${randomUUID()}`,
+    authorizationRevision: 1,
+    policyRevision: 1,
+    addressVersion: 1,
+  }).returning();
+  await f.d.update(db.rotationPublications).set({ incidentId: incident!.id }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.d.transaction(tx => terminateRotationIncident(tx, incident!.id, f.account.ownerUserId));
+  await f.d.delete(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+
+  await f.service.recover();
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({
+    currentVersion: 1,
+    candidateVersion: 2,
+    candidateAddressId: f.address.id,
+  });
+  expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toHaveLength(0);
+  expect((await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id)))[0]).toMatchObject({ healthState: "unknown" });
+
+  await f.d.update(db.addressHealthStates).set({
+    addressVersion: 2,
+    healthState: "healthy",
+    latestDecision: "success",
+    consecutiveSuccesses: 3,
+    lastCheckedAt: new Date(),
+    evidenceExpiresAt: new Date(Date.now() + 60000),
+  }).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  await f.service.recover();
+  expect(await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id))).toMatchObject([
+    { address: f.address.address, state: "current", source: "cloud", healthState: "healthy" },
+  ]);
+  expect((await f.d.select().from(db.rotationPublications).where(and(eq(db.rotationPublications.slotId, f.slot.id), eq(db.rotationPublications.addressVersion, 2))))[0]).toMatchObject({ incidentId: null, addressId: f.address.id });
+  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident!.id)))[0]).toMatchObject({ errorCode: "manual_terminated" });
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident!.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+  expect((await f.d.select().from(db.rotationPolicies).where(eq(db.rotationPolicies.slotId, f.slot.id)))[0]).toMatchObject({ enabled: false });
 });
 
 it("blocks DNS dispatch while a physical-instance cloud step remains unresolved", async () => {
