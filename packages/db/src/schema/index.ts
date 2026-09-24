@@ -487,7 +487,7 @@ export const { probeObservationStats, addressHealthPolicies, addressHealthStates
   userId: () => users.id, endpointId: () => endpoints.id, endpointAddressId: () => endpointAddresses.id, configId: () => healthCheckConfigs.id, slotId: () => managedAddressSlots.id,
 });
 
-export const { rotationPolicies, rotationIncidents, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications } = defineRotationSchema({ userId: () => users.id, slotId: () => managedAddressSlots.id });
+export const { rotationPolicies, rotationIncidents, rotationSchedules, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications } = defineRotationSchema({ userId: () => users.id, slotId: () => managedAddressSlots.id });
 
 import { defineCloudRotationLimitSchema } from "./cloud-rotation-limits.js";
 export const { cloudRotationLimitPolicies, cloudRotationBuckets, cloudRotationReservations, cloudRotationLimitSwitches } = defineCloudRotationLimitSchema({ accountId: () => cloudAccounts.id, stepId: () => rotationSteps.id });

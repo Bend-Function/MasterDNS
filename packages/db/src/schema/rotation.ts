@@ -23,7 +23,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     family: addressFamilyEnum("family").notNull(),
     physicalKey: text("physical_key").notNull(),
     sourceEventId: varchar("source_event_id", { length: 255 }).notNull(),
-    trigger: varchar("trigger", { length: 16 }).$type<"health" | "manual">().notNull().default("health"),
+    trigger: varchar("trigger", { length: 16 }).$type<"health" | "manual" | "scheduled">().notNull().default("health"),
     releaseOldAddress: boolean("release_old_address").notNull().default(false),
     status: varchar("status", { length: 16 }).$type<"active" | "paused" | "exhausted" | "complete">().notNull().default("active"),
     phase: varchar("phase", { length: 16 }).$type<"cloud" | "candidate" | "publish" | "cleanup" | "complete">().notNull().default("cloud"),
@@ -54,7 +54,23 @@ export function defineRotationSchema(dependencies: Dependencies) {
     index("rotation_incidents_due_idx").on(t.nextRunAt).where(sql`${t.status} <> 'complete'`),
     index("rotation_incidents_owner_idx").on(t.ownerUserId, t.createdAt),
     check("rotation_incidents_status", sql`${t.status} in ('active','paused','exhausted','complete') and ${t.phase} in ('cloud','candidate','publish','cleanup','complete')`),
-    check("rotation_incidents_trigger_epoch", sql`(${t.trigger} = 'health' and ${t.healthPolicyId} is not null and ${t.healthPolicyRevision} is not null and ${t.configId} is not null and ${t.configRevision} is not null and ${t.groupId} is not null and ${t.groupRevision} is not null) or (${t.trigger} = 'manual' and ${t.healthPolicyId} is null and ${t.healthPolicyRevision} is null and ${t.configId} is null and ${t.configRevision} is null and ${t.groupId} is null and ${t.groupRevision} is null)`),
+    check("rotation_incidents_trigger_epoch", sql`(${t.trigger} in ('health','scheduled') and ${t.healthPolicyId} is not null and ${t.healthPolicyRevision} is not null and ${t.configId} is not null and ${t.configRevision} is not null and ${t.groupId} is not null and ${t.groupRevision} is not null) or (${t.trigger} = 'manual' and ${t.healthPolicyId} is null and ${t.healthPolicyRevision} is null and ${t.configId} is null and ${t.configRevision} is null and ${t.groupId} is null and ${t.groupRevision} is null)`),
+  ]);
+  const rotationSchedules = pgTable("rotation_schedules", {
+    slotId: uuid("slot_id").primaryKey().references(dependencies.slotId, { onDelete: "restrict" }),
+    enabled: boolean("enabled").notNull().default(false),
+    intervalMinutes: integer("interval_minutes").notNull().default(1440),
+    revision: integer("revision").notNull().default(1),
+    nextRunAt: time("next_run_at"),
+    activeIncidentId: uuid("active_incident_id").references(() => rotationIncidents.id, { onDelete: "restrict" }),
+    lastStartedAt: time("last_started_at"),
+    lastCompletedAt: time("last_completed_at"),
+    lastHandledIncidentId: uuid("last_handled_incident_id"),
+    pausedReason: varchar("paused_reason", { length: 80 }),
+    updatedAt: time("updated_at").notNull().defaultNow(),
+  }, t => [
+    index("rotation_schedules_due_idx").on(t.nextRunAt, t.slotId).where(sql`${t.enabled} = true and ${t.pausedReason} is null and ${t.nextRunAt} is not null`),
+    check("rotation_schedule_bounds", sql`${t.intervalMinutes} between 1 and 129600 and ${t.revision} > 0`),
   ]);
   const rotationBudgetSegments = pgTable("rotation_budget_segments", {
     id: uuid("id").primaryKey().defaultRandom(),
@@ -148,5 +164,5 @@ export function defineRotationSchema(dependencies: Dependencies) {
     createdAt: time("created_at").notNull().defaultNow(),
     updatedAt: time("updated_at").notNull().defaultNow(),
   }, t => [uniqueIndex("rotation_publication_version_unique").on(t.slotId, t.addressVersion)]);
-  return { rotationPolicies, rotationIncidents, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications };
+  return { rotationPolicies, rotationIncidents, rotationSchedules, rotationBudgetSegments, rotationAttempts, rotationSteps, rotationStepObservations, rotationLeases, rotationResources, rotationPublications };
 }

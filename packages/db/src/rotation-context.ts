@@ -32,7 +32,7 @@ export async function lockRotationContext(tx: RotationTransaction, slotId: strin
     addressVersion: slot.candidateAddressId ? slot.candidateVersion : slot.currentVersion };
 }
 export type RotationContext = Awaited<ReturnType<typeof lockRotationContext>>;
-export function rotationAuthorizationError(c: RotationContext, trigger: "health" | "manual" = "health"): string | undefined {
+export function rotationAuthorizationError(c: RotationContext, trigger: "health" | "manual" | "scheduled" = "health"): string | undefined {
   if (c.lifecycleBlocked) return "instance_lifecycle_busy";
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed) return "authorization_revoked";
   if ((trigger === "health" && !c.policy?.enabled) || !(c.slot.family === "4" ? c.authorization.allowIpv4Rotation : c.authorization.allowIpv6Rotation)) return "family_disabled";
