@@ -1,7 +1,7 @@
 import { rotationScheduleResumeSchema, rotationScheduleUpdateSchema, type RotationSchedule } from "@masterdns/contracts/rotation";
 import { ApiError, jsonBody } from "./api";
 import type { AddressSlot, CloudInstanceRow } from "./cloud-types";
-import { cloudErrorMessage } from "./cloud-ui";
+import { capabilityReason, cloudErrorMessage } from "./cloud-ui";
 import { rotationSlotBlock } from "./rotation-machines";
 import { createRequestGeneration } from "./session-state";
 
@@ -52,12 +52,12 @@ export function createRotationScheduleEditor(slotId: string, request: ScheduleRe
       if (generation.isCurrent(token)) { accept(schedule); update({ notice: resume ? "日程已恢复；已有任务需单独处理" : "定时设置已保存" }); }
     } catch (value) {
       if (!generation.isCurrent(token)) return;
-      if (value instanceof ApiError && value.status === 409) {
+      if (value instanceof ApiError && value.status === 409 && scheduleErrorReason(value) === "rotation_schedule_revision_conflict") {
         try {
           const latest = await request(path);
           if (generation.isCurrent(token)) { accept(latest); update({ error: "日程已被其他操作更新，已读取最新设置，请核对后重试" }); }
         } catch { if (generation.isCurrent(token)) update({ schedule: null, error: "最新日程读取失败，请重新读取后再保存" }); }
-      } else update({ error: cloudErrorMessage(value, "日程保存失败，已保留输入") });
+      } else update({ error: scheduleErrorMessage(value) });
     } finally { if (generation.isCurrent(token)) update({ pending: false }); }
   };
   return {
@@ -73,4 +73,22 @@ export function createRotationScheduleEditor(slotId: string, request: ScheduleRe
 
 export function rotationTriggerLabel(trigger: "health" | "manual" | "scheduled" | undefined): string {
   return trigger === "scheduled" ? "定时触发" : trigger === "manual" ? "手动换址" : "健康触发";
+}
+
+// Nest HTTP errors use a generic conflict code and preserve the domain reason in message.
+function scheduleErrorReason(value: ApiError): string {
+  return value.code === "conflict" ? value.message : value.code;
+}
+
+function scheduleErrorMessage(value: unknown): string {
+  if (value instanceof ApiError) {
+    const reason = scheduleErrorReason(value);
+    const explanation = ({
+      external_health_required: "请先配置有效的外部健康检查，再保存或恢复日程",
+      rotation_candidate_window_too_short: "候选复测窗口过短，请在换址策略中增加复测窗口后重试",
+      authorization_revoked: "管理授权已撤销，请检查实例授权后重试",
+    } as Record<string, string>)[reason] ?? capabilityReason(reason);
+    if (explanation !== reason) return explanation;
+  }
+  return cloudErrorMessage(value, "日程保存失败，已保留输入");
 }

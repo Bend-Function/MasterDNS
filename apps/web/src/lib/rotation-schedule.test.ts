@@ -50,6 +50,25 @@ describe("schedule editor async state", () => {
     await editor.load(); editor.edit({ enabled: true, interval: "60" }); await editor.save();
     expect(editor.getSnapshot()).toMatchObject({ schedule, draft: { enabled: true, interval: "60" }, error: "offline", pending: false });
   });
+  it.each([
+    ["save", "external_health_required", "请先配置有效的外部健康检查，再保存或恢复日程"],
+    ["save", "rotation_candidate_window_too_short", "候选复测窗口过短，请在换址策略中增加复测窗口后重试"],
+    ["save", "authorization_revoked", "管理授权已撤销，请检查实例授权后重试"],
+    ["resume", "external_health_required", "请先配置有效的外部健康检查，再保存或恢复日程"],
+    ["resume", "rotation_candidate_window_too_short", "候选复测窗口过短，请在换址策略中增加复测窗口后重试"],
+    ["resume", "authorization_revoked", "管理授权已撤销，请检查实例授权后重试"],
+  ] as const)("retains draft and surfaces %s prerequisite failure %s", async (action, reason, message) => {
+    let reads = 0;
+    const paused = { ...schedule, enabled: true, pausedReason: "manual_pause", activeIncidentId: "incident-1" };
+    const editor = createRotationScheduleEditor(schedule.slotId, async (_path, init) => {
+      if (init) throw new ApiError(409, "conflict", reason);
+      reads++; return paused;
+    });
+    await editor.load(); editor.edit({ enabled: true, interval: "60" });
+    await editor[action]();
+    expect(editor.getSnapshot()).toMatchObject({ schedule: paused, draft: { enabled: true, interval: "60" }, error: message, notice: null, pending: false });
+    expect(reads).toBe(1);
+  });
   it("submits only schedule fields and updates server confirmed minutes", async () => {
     const requests: Array<[string, RequestInit | undefined]> = [];
     const editor = createRotationScheduleEditor(schedule.slotId, async (path, init) => { requests.push([path, init]); return init ? { ...schedule, enabled: true, intervalMinutes: 30, revision: 1 } : schedule; });
@@ -79,14 +98,14 @@ describe("schedule editor async state", () => {
   });
   it("reloads conflicting configuration without retrying or hiding the conflict", async () => {
     let reads = 0;
-    const editor = createRotationScheduleEditor(schedule.slotId, async (_path, init) => { if (init) throw new ApiError(409, "conflict", "changed"); return ++reads === 1 ? schedule : { ...schedule, intervalMinutes: 90, revision: 3 }; });
+    const editor = createRotationScheduleEditor(schedule.slotId, async (_path, init) => { if (init) throw new ApiError(409, "conflict", "rotation_schedule_revision_conflict"); return ++reads === 1 ? schedule : { ...schedule, intervalMinutes: 90, revision: 3 }; });
     await editor.load(); editor.edit({ interval: "10" }); await editor.save();
     expect(editor.getSnapshot()).toMatchObject({ schedule: { revision: 3 }, draft: { interval: "90" }, pending: false });
     expect(editor.getSnapshot().error).toContain("最新");
   });
   it("ignores a conflict refresh after closing the old selection", async () => {
     const conflict = deferred<RotationSchedule>(); let reads = 0;
-    const editor = createRotationScheduleEditor(schedule.slotId, async (_path, init) => { if (init) throw new ApiError(409, "conflict", "changed"); return ++reads === 1 ? schedule : conflict.promise; });
+    const editor = createRotationScheduleEditor(schedule.slotId, async (_path, init) => { if (init) throw new ApiError(409, "conflict", "rotation_schedule_revision_conflict"); return ++reads === 1 ? schedule : conflict.promise; });
     await editor.load(); const saving = editor.save(); await Promise.resolve(); editor.cancel(); const snapshot = editor.getSnapshot();
     conflict.resolve({ ...schedule, enabled: true, revision: 9 }); await saving;
     expect(editor.getSnapshot()).toBe(snapshot);
