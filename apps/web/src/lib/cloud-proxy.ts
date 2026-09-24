@@ -11,6 +11,20 @@ export type CloudProxyCheckResult = {
   error: string | null;
 };
 
+export type CloudProxyProfile = {
+  id: string;
+  ownerUserId: string;
+  name: string;
+  endpoint: string;
+  assignedAccountIds: string[];
+  createdAt: string;
+  updatedAt: string;
+};
+
+export function proxiesForOwner<T extends { ownerUserId: string }>(profiles: T[], ownerUserId: string): T[] {
+  return profiles.filter(profile => profile.ownerUserId === ownerUserId);
+}
+
 export function parseProxyUrl(raw: string): { proxyUrl: string; sanitizedEndpoint: string } {
   const proxyUrl = raw.trim();
   let parsed: URL;

@@ -5,6 +5,7 @@ export type CloudAccount = {
   ownerUserId: string;
   provider: CloudProvider;
   name: string;
+  proxyProfileId?: string | null;
   credentialHint: string | null;
   enabled: boolean;
   regions: string[] | null;

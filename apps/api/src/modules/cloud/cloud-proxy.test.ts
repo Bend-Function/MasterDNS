@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { cloudProxyCheckSchema, cloudProxyUpdateSchema } from "./cloud-proxy.js";
+import { cloudProxyCheckSchema, cloudProxyUpdateSchema, cloudProxyProfileSchema, cloudProxySelectionSchema } from "./cloud-proxy.js";
 
 describe("cloud proxy request contracts", () => {
   it("accepts setting, clearing, draft checking, and saved checking", () => {
@@ -18,5 +18,14 @@ describe("cloud proxy request contracts", () => {
     { proxyUrl: null, extra: true },
   ])("rejects invalid update payload %#", payload => {
     expect(cloudProxyUpdateSchema.safeParse(payload).success).toBe(false);
+  });
+
+  it("validates reusable named profiles and account selection", () => {
+    const id = "41ec869f-4b09-49b8-b419-e7a9c6cf2f33";
+    expect(cloudProxyProfileSchema.parse({ name: "东京出口", proxyUrl: "socks5h://user:pass@proxy.example:1080" })).toMatchObject({ name: "东京出口" });
+    expect(cloudProxySelectionSchema.parse({ proxyId: id })).toEqual({ proxyId: id });
+    expect(cloudProxySelectionSchema.parse({ proxyId: null })).toEqual({ proxyId: null });
+    expect(cloudProxySelectionSchema.safeParse({ proxyUrl: "socks5h://proxy.example:1080" }).success).toBe(false);
+    expect(cloudProxyProfileSchema.safeParse({ name: " ", proxyUrl: "socks5h://proxy.example:1080" }).success).toBe(false);
   });
 });

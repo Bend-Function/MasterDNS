@@ -33,6 +33,7 @@ const timestamps = {
 type CloudSchemaDependencies = {
   userId: () => AnyPgColumn;
   endpointId: () => AnyPgColumn;
+  proxyId: () => AnyPgColumn;
 };
 
 export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
@@ -51,6 +52,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "cascade" }),
     provider: cloudProviderEnum("provider").notNull(),
     name: varchar("name", { length: 120 }).notNull(),
+    proxyProfileId: uuid("proxy_profile_id").references(dependencies.proxyId, { onDelete: "restrict" }),
     regions: jsonb("regions").$type<string[] | null>(),
     externalAccountId: text("external_account_id"),
     credentialCiphertext: text("credential_ciphertext").notNull(),

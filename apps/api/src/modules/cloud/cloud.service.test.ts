@@ -4,7 +4,7 @@ import { Redis } from "ioredis";
 import { withDnsZoneLock } from "@masterdns/automation";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users, zones } from "@masterdns/db";
+import { cloudAccounts, cloudProxyProfiles, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users, zones } from "@masterdns/db";
 import { decryptJson, encryptJson } from "@masterdns/crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 
@@ -71,6 +71,22 @@ async function fixture(managed = false) {
 }
 
 describe("cloud account and authorization API", () => {
+  it("uses a selected owned proxy during account creation and retains it through credential rotation", async () => {
+    const f = await fixture();
+    const key = Buffer.alloc(32, 1);
+    const encrypted = encryptJson({ proxyUrl: "socks5h://name:secret@proxy.example:1080" }, key);
+    const [profile] = await connection.db.insert(cloudProxyProfiles).values({ ownerUserId: f.actor.id, name: "Shared", credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag, credentialKeyVersion: encrypted.keyVersion }).returning();
+    const created = await create(f.actor, { name: "With proxy", provider: "aws", proxyProfileId: profile!.id, credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } });
+    expect(created.proxyProfileId).toBe(profile!.id);
+    const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, created.id));
+    expect(decryptJson<Record<string, unknown>>({ ciphertext: stored!.credentialCiphertext, iv: stored!.credentialIv, tag: stored!.credentialTag, keyVersion: stored!.credentialKeyVersion }, key)).toMatchObject({ proxyUrl: "socks5h://name:secret@proxy.example:1080" });
+    await service.rotateCredentials(f.actor, created.id, { credentials: { kind: "access_key", accessKeyId: "rotated-access-key", secretAccessKey: "rotated-secret-access-key" } });
+    const [rotated] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, created.id));
+    expect(rotated!.proxyProfileId).toBe(profile!.id);
+    expect(decryptJson<Record<string, unknown>>({ ciphertext: rotated!.credentialCiphertext, iv: rotated!.credentialIv, tag: rotated!.credentialTag, keyVersion: rotated!.credentialKeyVersion }, key)).toMatchObject({ proxyUrl: "socks5h://name:secret@proxy.example:1080" });
+    const other = await fixture();
+    await expect(create(other.actor, { name: "Wrong owner", provider: "aws", proxyProfileId: profile!.id, credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } })).rejects.toMatchObject({ status: 404 });
+  });
   it("rejects binding an explicitly absent address even at the current generation", async () => {
     const f = await fixture(true);
     await connection.db.update(cloudAddresses).set({ inventoryPresent: false }).where(eq(cloudAddresses.id, f.address.id));

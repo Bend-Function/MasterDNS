@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { getCloudRotationLimitStatus, getCloudTargetsForSlots, setCloudRotationLimitPolicy, wakeCloudRotationLimitWaits } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq, ne, or, sql } from "drizzle-orm";
-import { auditLogs, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationAttempts, rotationIncidents, rotationSteps, users } from "@masterdns/db";
+import { auditLogs, cloudAccounts, cloudProxyProfiles, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationAttempts, rotationIncidents, rotationSteps, users } from "@masterdns/db";
 import { CloudError, createCloudAdapter, evaluateCapabilities, credentialsMatchProvider, type CloudCredentials, type CloudInventory } from "@masterdns/cloud-providers";
 import { cloudProviderServices, cloudRotationLimitPolicySchema, validCloudRegion, type CloudProvider, type CloudService as CloudServiceName, type SlotRef, type MonthlyTrafficResponse } from "@masterdns/contracts";
 import { decryptJson, encryptJson, parseEncryptionKey } from "@masterdns/crypto";
@@ -15,7 +15,7 @@ import type { CloudAuthorizationInput, CloudCredentialsUpdateInput, CreateCloudA
 
 type Account = typeof cloudAccounts.$inferSelect;
 export function publicCloudAccount(account: Account) {
-  return { id: account.id, ownerUserId: account.ownerUserId, provider: account.provider, name: account.name, credentialHint: account.credentialHint, enabled: account.enabled, regions: account.regions, externalAccountId: account.externalAccountId, createdAt: account.createdAt, updatedAt: account.updatedAt };
+  return { id: account.id, ownerUserId: account.ownerUserId, provider: account.provider, name: account.name, proxyProfileId: account.proxyProfileId, credentialHint: account.credentialHint, enabled: account.enabled, regions: account.regions, externalAccountId: account.externalAccountId, createdAt: account.createdAt, updatedAt: account.updatedAt };
 }
 
 @Injectable()
@@ -80,8 +80,12 @@ export class CloudService {
         request: { ...input, ownerUserId, regions: input.regions ? [...input.regions].sort() : null },
       }, async () => {
         const id = randomUUID();
-        const { externalAccountId } = await createCloudAdapter({ accountId: id, provider: input.provider, service: cloudProviderServices[input.provider][0]!, credentials: input.credentials as CloudCredentials }).verifyIdentity();
-        const [account] = await tx.insert(cloudAccounts).values({ id, ownerUserId, externalAccountId, name: input.name, provider: input.provider, regions: input.regions ?? null, ...this.encryptedCredentials(input.credentials) }).returning();
+        const [profile] = input.proxyProfileId ? await tx.select().from(cloudProxyProfiles).where(and(eq(cloudProxyProfiles.id, input.proxyProfileId), eq(cloudProxyProfiles.ownerUserId, ownerUserId))).for("share") : [];
+        if (input.proxyProfileId && !profile) throw new NotFoundException("Proxy profile not found");
+        const proxyUrl = profile ? decryptJson<{ proxyUrl: string }>({ ciphertext: profile.credentialCiphertext, iv: profile.credentialIv, tag: profile.credentialTag, keyVersion: profile.credentialKeyVersion }, this.encryptionKey).proxyUrl : undefined;
+        const credentials = { ...input.credentials, ...(proxyUrl ? { proxyUrl } : {}) } as CloudCredentials;
+        const { externalAccountId } = await createCloudAdapter({ accountId: id, provider: input.provider, service: cloudProviderServices[input.provider][0]!, credentials }).verifyIdentity();
+        const [account] = await tx.insert(cloudAccounts).values({ id, ownerUserId, externalAccountId, name: input.name, provider: input.provider, regions: input.regions ?? null, proxyProfileId: profile?.id ?? null, ...this.encryptedCredentials(credentials) }).returning();
         if (!account) throw new Error("Cloud account insert returned no row");
         await tx.insert(auditLogs).values({ ownerUserId, actorUserId: actor.id, source: "user", action: "cloud_account.create", resourceType: "cloud_account", resourceId: account.id, afterSnapshot: publicCloudAccount(account) });
         return publicCloudAccount(account);

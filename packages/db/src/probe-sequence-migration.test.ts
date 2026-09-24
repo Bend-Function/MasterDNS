@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { sql } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { expect, it } from "vitest";
-import { createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeRoundSequences, cloudAccounts, cloudInstances, cloudInterfaces, managedAddressSlots } from "./index.js";
+import { createDatabase, users, endpointPools, endpoints, endpointAddresses, healthCheckConfigs, probeRounds, probeRoundSequences, cloudInstances, cloudInterfaces, managedAddressSlots } from "./index.js";
 
 it("backfills retained endpoint/family and slot sequence maxima when upgrading P5", async () => {
   const root = process.env.MASTERDNS_TEST_DATABASE_URL;
@@ -33,7 +33,7 @@ it("backfills retained endpoint/family and slot sequence maxima when upgrading P
     const [v6] = await db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: "6", address: "2001:db8::1", state: "current", source: "static" }).returning();
     const config = { type: "tcp" as const, port: 443, timeoutMs: 3000 };
     const [check] = await db.insert(healthCheckConfigs).values({ endpointId: endpoint!.id, checkerType: "tcp", config }).returning();
-    const [account] = await db.insert(cloudAccounts).values({ ownerUserId: user!.id, name: "AWS", provider: "aws", credentialCiphertext: "cipher", credentialIv: "iv", credentialTag: "tag" }).returning();
+    const [account] = await connection.client`insert into cloud_accounts(owner_user_id,name,provider,credential_ciphertext,credential_iv,credential_tag) values (${user!.id},'AWS','aws','cipher','iv','tag') returning id`;
     const [instance] = await db.insert(cloudInstances).values({ accountId: account!.id, service: "ec2", region: "us-east-1", externalId: "i-test", scanGeneration: 1 }).returning();
     const [iface] = await db.insert(cloudInterfaces).values({ instanceId: instance!.id, externalId: "eni-test", scanGeneration: 1 }).returning();
     const [slot] = await db.insert(managedAddressSlots).values({ interfaceId: iface!.id, name: "public", family: "4" }).returning();

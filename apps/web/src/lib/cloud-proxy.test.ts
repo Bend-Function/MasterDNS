@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { parseProxyUrl, proxyErrorMessage } from "./cloud-proxy";
+import { parseProxyUrl, proxyErrorMessage, proxiesForOwner } from "./cloud-proxy";
 
 describe("cloud account SOCKS proxy", () => {
+  it("only offers proxies owned by the selected cloud account owner", () => {
+    const proxies = [{ id: "one", ownerUserId: "alice" }, { id: "two", ownerUserId: "bob" }];
+    expect(proxiesForOwner(proxies, "alice")).toEqual([proxies[0]]);
+  });
   it("accepts socks5 and socks5h URLs with a hostname and port", () => {
     expect(parseProxyUrl("socks5h://user:secret@proxy.example.com:1080")).toEqual({
       proxyUrl: "socks5h://user:secret@proxy.example.com:1080",

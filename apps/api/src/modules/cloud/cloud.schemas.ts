@@ -11,7 +11,7 @@ export const cloudCredentialsSchema = z.discriminatedUnion("kind", [
 export const cloudRegionsSchema = z.array(z.string().regex(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/).max(80)).min(1).max(100).refine((regions) => new Set(regions).size === regions.length, "Regions must be unique").nullable();
 export const cloudRegionsUpdateSchema = z.object({ regions: cloudRegionsSchema }).strict();
 export const createCloudAccountSchema = z.object({
-  name: z.string().trim().min(1).max(120), regions: cloudRegionsSchema.optional(), provider: z.enum(["aws", "azure", "linode"]), ownerUserId: z.string().uuid().optional(), credentials: cloudCredentialsSchema,
+  name: z.string().trim().min(1).max(120), regions: cloudRegionsSchema.optional(), provider: z.enum(["aws", "azure", "linode"]), ownerUserId: z.string().uuid().optional(), proxyProfileId: z.string().uuid().nullable().optional(), credentials: cloudCredentialsSchema,
 }).strict().superRefine((input, context) => {
   if (!credentialsMatchProvider(input.provider, input.credentials)) context.addIssue({ code: "custom", path: ["credentials"], message: "Credentials do not match provider" });
   if (input.regions?.some(region => !validCloudRegion(input.provider, region))) context.addIssue({ code: "custom", path: ["regions"], message: "Invalid provider region" });

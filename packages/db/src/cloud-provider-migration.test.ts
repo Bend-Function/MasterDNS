@@ -31,7 +31,7 @@ it("upgrades populated AWS schema without changing rows and stores complete Azur
     const [iface] = await sql`insert into cloud_interfaces (instance_id, external_id, scan_generation) values (${instance!.id}, 'eni-retained', 7) returning *`;
     const [address] = await sql`insert into cloud_addresses (interface_id, kind, family, address, remote_allocation_id, origin, scan_generation) values (${iface!.id}, 'host', '4', '192.0.2.1', 'eipalloc-retained', 'user', 7) returning *`;
     await migrate(connection.db, { migrationsFolder: migrations });
-    expect((await sql`select * from cloud_accounts where id=${account!.id}`)[0]).toEqual(account);
+    expect((await sql`select * from cloud_accounts where id=${account!.id}`)[0]).toEqual({ ...account, proxy_profile_id: null });
     expect((await sql`select * from cloud_instances where id=${instance!.id}`)[0]).toEqual(instance);
     expect((await sql`select * from cloud_interfaces where id=${iface!.id}`)[0]).toEqual(iface);
     expect((await sql`select * from cloud_addresses where id=${address!.id}`)[0]).toEqual({ ...address, metadata: {}, inventory_present: true });

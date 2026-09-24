@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { auditLogs, cloudAccounts, createDatabase, users } from "@masterdns/db";
+import { auditLogs, cloudAccounts, cloudProxyProfiles, createDatabase, users } from "@masterdns/db";
 import { decryptJson, encryptJson } from "@masterdns/crypto";
 import type { AuthUser } from "../../auth/auth.types.js";
 
@@ -72,6 +72,69 @@ async function fixture() {
 }
 
 describe("cloud proxy configuration", () => {
+  it("stores reusable encrypted profiles and assigns one to multiple owned accounts", async () => {
+    const first = await fixture();
+    const [second] = await connection.db.insert(cloudAccounts).values({ ...first.account, id: randomUUID(), name: "Second" }).returning();
+    const profile = await service.createProfile(first.owner, { name: "出口 A", proxyUrl: "socks5h://alice:secret@proxy.example:1080" });
+    expect(JSON.stringify(profile)).not.toContain("secret");
+    expect(await service.selectProfile(first.owner, first.account.id, profile.id)).toMatchObject({ proxyProfileId: profile.id });
+    expect(await service.selectProfile(first.owner, second!.id, profile.id)).toMatchObject({ proxyProfileId: profile.id });
+    expect((await service.listProfiles(first.owner))[0]).toMatchObject({ id: profile.id, assignedAccountIds: expect.arrayContaining([first.account.id, second!.id]) });
+    await service.updateProfile(first.owner, profile.id, { name: "出口 A2", proxyUrl: "socks5h://alice:new-secret@new.example:1080" });
+    const accounts = await connection.db.select().from(cloudAccounts);
+    for (const account of accounts.filter(item => [first.account.id, second!.id].includes(item.id))) {
+      expect(decryptJson<Record<string, unknown>>({ ciphertext: account.credentialCiphertext, iv: account.credentialIv, tag: account.credentialTag, keyVersion: account.credentialKeyVersion }, key)).toMatchObject({ proxyUrl: "socks5h://alice:new-secret@new.example:1080" });
+    }
+    await expect(service.deleteProfile(first.owner, profile.id)).rejects.toMatchObject({ status: 409 });
+    await service.selectProfile(first.owner, first.account.id, null);
+    await service.selectProfile(first.owner, second!.id, null);
+    await service.deleteProfile(first.owner, profile.id);
+    expect(await connection.db.select().from(cloudProxyProfiles).where(eq(cloudProxyProfiles.id, profile.id))).toEqual([]);
+  });
+
+  it("rejects cross-owner selection and a mismatched routed identity without changing credentials", async () => {
+    const first = await fixture(); const second = await fixture();
+    const profile = await service.createProfile(first.owner, { name: "Private", proxyUrl: "socks5://proxy.example:1080" });
+    await expect(service.selectProfile(second.owner, second.account.id, profile.id)).rejects.toMatchObject({ status: 404 });
+    await expect(service.selectProfile(first.admin, second.account.id, profile.id)).rejects.toMatchObject({ status: 404 });
+    mocks.identity = "999999999999";
+    await expect(service.selectProfile(first.owner, first.account.id, profile.id)).rejects.toMatchObject({ status: 409 });
+    const [stored] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, first.account.id));
+    expect(stored!.credentialCiphertext).toBe(first.account.credentialCiphertext);
+  });
+
+  it("rolls back a shared profile edit if an assigned account rejects the new route", async () => {
+    const f = await fixture();
+    const profile = await service.createProfile(f.owner, { name: "Shared", proxyUrl: "socks5h://old.example:1080" });
+    await service.selectProfile(f.owner, f.account.id, profile.id);
+    const [before] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+    mocks.identity = "999999999999";
+    await expect(service.updateProfile(f.owner, profile.id, { name: "Updated", proxyUrl: "socks5h://new.example:1080" })).rejects.toMatchObject({ status: 409 });
+    const [after] = await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+    expect(after!.credentialCiphertext).toBe(before!.credentialCiphertext);
+    expect((await service.listProfiles(f.owner)).find(item => item.id === profile.id)).toMatchObject({ name: "Shared", endpoint: "socks5h://old.example:1080" });
+  });
+
+  it("imports existing per-account proxies as private reusable profiles", async () => {
+    const f = await fixture();
+    await service.set(f.owner, f.account.id, "socks5h://alice:secret@proxy.example:1080");
+    const profiles = await service.listProfiles(f.owner);
+    expect(profiles).toHaveLength(1);
+    expect(profiles[0]).toMatchObject({ endpoint: "socks5h://proxy.example:1080", assignedAccountIds: [f.account.id] });
+    expect(JSON.stringify(profiles)).not.toContain("secret");
+    expect(await service.listProfiles(f.owner)).toHaveLength(1);
+  });
+
+  it("checks a draft or saved profile without a cloud account and never returns its password", async () => {
+    const f = await fixture();
+    const profile = await service.createProfile(f.owner, { name: "Draft", proxyUrl: "socks5h://user:secret@proxy.example:1080" });
+    expect(await service.checkDraft(f.owner, { proxyUrl: "socks5h://proxy2.example:1080" })).toMatchObject({ ok: true, ip: "203.0.113.9" });
+    expect(await service.checkProfile(f.owner, profile.id)).toMatchObject({ ok: true, ip: "203.0.113.9" });
+    expect(mocks.fetchCalls.map(call => call.url)).toEqual(["https://api64.ipify.org/?format=json", "https://api64.ipify.org/?format=json"]);
+    expect(JSON.stringify(await connection.db.select().from(auditLogs).where(eq(auditLogs.resourceId, profile.id)))).not.toContain("secret");
+    await expect(service.checkProfile(f.other, profile.id)).rejects.toMatchObject({ status: 404 });
+  });
+
   it("encrypts the URL with credentials and only returns a sanitized endpoint", async () => {
     const f = await fixture();
     const result = await service.set(f.owner, f.account.id, "socks5h://alice:secret@proxy.example:1080");

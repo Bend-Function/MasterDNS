@@ -2,7 +2,7 @@ import { demoNow, demoUser } from "./demo";
 import type { CloudInstanceControlView } from "@masterdns/contracts/cloud-lifecycle";
 import type { AddressSlot, CloudAccount, CloudInstanceDetail, CloudInstanceRow, CloudScope, CloudTargetSummary } from "./cloud-types";
 
-export const demoCloudAccounts: CloudAccount[] = [{ id: "cloud-account-1", ownerUserId: demoUser.id, provider: "aws", name: "AWS Production", credentialHint: "AccessKey ...2K9Q", enabled: true, regions: ["ap-southeast-2", "us-west-2"], externalAccountId: "123456789012", createdAt: demoNow, updatedAt: demoNow }];
+export const demoCloudAccounts: CloudAccount[] = [{ id: "cloud-account-1", ownerUserId: demoUser.id, provider: "aws", name: "AWS Production", proxyProfileId: "demo-proxy-1", credentialHint: "AccessKey ...2K9Q", enabled: true, regions: ["ap-southeast-2", "us-west-2"], externalAccountId: "123456789012", createdAt: demoNow, updatedAt: demoNow }];
 export const demoCloudScopes: CloudScope[] = [
   { id: "scope-1", accountId: "cloud-account-1", service: "ec2", region: "ap-southeast-2", generation: 4, lastStartedAt: demoNow, lastCompletedAt: demoNow, lastError: null, createdAt: demoNow, updatedAt: demoNow },
   { id: "scope-2", accountId: "cloud-account-1", service: "lightsail", region: "us-west-2", generation: 3, lastStartedAt: demoNow, lastCompletedAt: demoNow, lastError: "AccessDenied: lightsail:GetInstances", createdAt: demoNow, updatedAt: demoNow },

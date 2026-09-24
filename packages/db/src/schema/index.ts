@@ -155,6 +155,17 @@ export const endpoints = pgTable("endpoints", {
   index("endpoints_pool_idx").on(table.poolId),
 ]);
 
+export const cloudProxyProfiles = pgTable("cloud_proxy_profiles", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  ownerUserId: uuid("owner_user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  name: varchar("name", { length: 120 }).notNull(),
+  credentialCiphertext: text("credential_ciphertext").notNull(),
+  credentialIv: varchar("credential_iv", { length: 64 }).notNull(),
+  credentialTag: varchar("credential_tag", { length: 64 }).notNull(),
+  credentialKeyVersion: integer("credential_key_version").notNull().default(1),
+  ...timestamps,
+}, (table) => [index("cloud_proxy_profiles_owner_idx").on(table.ownerUserId)]);
+
 export const {
   cloudApiRequests,
   cloudAccounts,
@@ -169,6 +180,7 @@ export const {
 } = defineCloudSchema({
   userId: () => users.id,
   endpointId: () => endpoints.id,
+  proxyId: () => cloudProxyProfiles.id,
 });
 
 export const endpointAddresses = pgTable("endpoint_addresses", {

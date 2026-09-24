@@ -10,6 +10,7 @@ import { CloudLifecycleController } from "./cloud-lifecycle.controller.js";
 import { CloudLifecycleService } from "./cloud-lifecycle.service.js";
 import { CloudProxyController } from "./cloud-proxy.controller.js";
 import { CloudProxyService } from "./cloud-proxy.service.js";
+import { CloudProfilesController, CloudProxySelectionController } from "./cloud-profiles.controller.js";
 
-@Module({ controllers: [CloudController, CloudIdleIpsController, CloudStateResetController, CloudLifecycleController, CloudProxyController], providers: [CloudService, CloudBindingsService, CloudIdleIpsService, CloudStateResetService, CloudLifecycleService, CloudProxyService], exports: [CloudService, CloudBindingsService] })
+@Module({ controllers: [CloudController, CloudIdleIpsController, CloudStateResetController, CloudLifecycleController, CloudProxyController, CloudProfilesController, CloudProxySelectionController], providers: [CloudService, CloudBindingsService, CloudIdleIpsService, CloudStateResetService, CloudLifecycleService, CloudProxyService], exports: [CloudService, CloudBindingsService] })
 export class CloudModule {}

@@ -297,7 +297,7 @@ tbody tr:hover { background: #fafcfb; }
 .rotation-machine-expanded > td { background: var(--surface-muted); }
 .rotation-machine-pagination, .rotation-history-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; }
 .rotation-list-note { margin-bottom: 14px; }
-.proxy-table th:nth-child(3), .proxy-table td:nth-child(3) { min-width: 210px; }
+.proxy-table th:nth-child(2), .proxy-table td:nth-child(2) { min-width: 210px; }
 #cloud-proxy-form > .field { grid-column: 1 / -1; }
 .address-ledger { margin-bottom: 18px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
 .address-ledger > div { min-width: 0; min-height: 92px; padding: 15px; display: grid; align-content: center; gap: 5px; border-right: 1px solid var(--border); }
