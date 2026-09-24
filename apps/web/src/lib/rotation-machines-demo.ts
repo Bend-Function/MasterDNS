@@ -24,5 +24,21 @@ export function previewRotationMachines(): RotationMachine[] {
   empty.account = { ...base.account!, id: "azure-preview", name: "Azure Development", provider: "azure", enabled: false };
   empty.slots = []; empty.addresses = [];
   first.slots = first.slots.map(slot => ({ ...slot, blockedRotation: { incidentId: "rotation-01", reason: "rotation_in_progress" }, capability: slot.capability ? { ...slot.capability, available: false, reason: "rotation_in_progress" } : null }));
-  return [first, unauthorized, multi, empty];
+  const provider = (id: string, service: "azure_vm" | "linode", name: string, region: string): RotationMachine => {
+    const row = clone(id, name, region);
+    row.instance = { ...row.instance, accountId: id + "-account", service, externalId: id + "-vm" };
+    row.account = { ...base.account!, id: row.instance.accountId, name: service === "linode" ? "Linode Production" : "Azure Production", provider: service === "linode" ? "linode" : "azure" };
+    row.authorization = { ...row.authorization!, allowStopStart: true };
+    row.slots = row.slots.filter(entry => entry.slot.family === "4").map(entry => ({ ...entry,
+      ref: { ...entry.ref!, service, accountId: row.instance.accountId, instanceId: row.instance.externalId },
+      capability: { ...entry.capability!, requiresStop: service === "linode" },
+      cloudTarget: { ...entry.cloudTarget!, account: { id: row.account!.id, name: row.account!.name, provider: row.account!.provider }, instance: row.instance },
+    }));
+    row.addresses = (row.addresses ?? []).filter(address => address.family === "4");
+    return row;
+  };
+  const azure = provider("azure", "azure_vm", "edge-azure-05", "australiaeast");
+  const linode = provider("linode", "linode", "edge-linode-06", "ap-south");
+  linode.slots = linode.slots.map(entry => ({ ...entry, blockedRotation: { incidentId: "rotation-paused", reason: "rotation_in_progress" }, capability: { ...entry.capability!, available: false, reason: "rotation_in_progress" } }));
+  return [first, azure, linode, unauthorized, multi, empty];
 }
