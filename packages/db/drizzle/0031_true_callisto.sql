@@ -1,0 +1,1 @@
+ALTER TABLE "rotation_schedules" ADD COLUMN "last_handled_incident_updated_at" timestamp with time zone;

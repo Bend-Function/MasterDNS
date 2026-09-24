@@ -213,7 +213,14 @@ export class RotationStore {
         if (run.attempt) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
         await rotationAudit(tx, incident, "rotation.current_recovered");
       } else if (action.kind === "pause") await this.pauseIn(tx, incident, action.reason, run.h.now);
-      else await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode, nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
+      else {
+        // Queue retries of the same paused observation must not look like a new
+        // failure to the schedule reconciler after an explicit schedule resume.
+        const unchangedPause = action.kind === "wait" && (incident.status === "paused" || incident.status === "exhausted");
+        await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode,
+          nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000),
+          updatedAt: unchangedPause ? sql`${rotationIncidents.updatedAt}` : run.h.now }).where(eq(rotationIncidents.id, id));
+      }
     });
   }
   async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '30 seconds')` }).where(eq(rotationIncidents.id, id)); }
@@ -221,7 +228,10 @@ export class RotationStore {
   private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
     if (incident.terminatedAt) return;
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
-    await tx.update(rotationIncidents).set({ status: code === "attempts_exhausted" ? "exhausted" : "paused", errorCode: code, nextRunAt: new Date(now.getTime() + 15000), updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
+    const status = code === "attempts_exhausted" ? "exhausted" : "paused";
+    const unchangedPause = incident.status === status && incident.errorCode === code;
+    await tx.update(rotationIncidents).set({ status, errorCode: code, nextRunAt: new Date(now.getTime() + 15000),
+      updatedAt: unchangedPause ? sql`${rotationIncidents.updatedAt}` : now }).where(eq(rotationIncidents.id, incident.id));
     if (incident.errorCode !== code) await rotationAudit(tx, incident, "rotation.paused", undefined, { code });
   }
   private async installCandidate(tx: RotationTransaction, c: RotationContext, incident: Incident, steps: Step[], now: Date) {

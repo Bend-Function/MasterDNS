@@ -24,7 +24,7 @@
 
 ## 最小接入范围
 
-新增 `rotation_schedules`，以 slotId 为主键：enabled、intervalMinutes、revision、nextRunAt、activeIncidentId、lastStartedAt、lastCompletedAt、lastHandledIncidentId、pausedReason、updatedAt。revision 仅在用户配置变更时递增；lastHandledIncidentId 防止扫描反复用同一个历史完成事件重置计时。启用和修改配置时记录当前已知的最新完成事件作为基线。
+新增 `rotation_schedules`，以 slotId 为主键：enabled、intervalMinutes、revision、nextRunAt、activeIncidentId、lastStartedAt、lastCompletedAt、lastHandledIncidentId、lastHandledIncidentUpdatedAt（内部字段）、pausedReason、updatedAt。revision 仅在用户配置变更时递增；lastHandledIncidentId 防止扫描反复用同一个历史完成事件重置计时。启用和修改配置时记录当前已知的最新完成事件作为基线。内部 lastHandledIncidentUpdatedAt 与任务 ID 一起记录已处理的暂停观察，明确恢复日程也消费该观察；同一任务在两次扫描之间恢复后再次暂停或终止仍会被识别，后续成功完成仍推进日程。普通队列唤醒仅推迟同一暂停／耗尽状态的 nextRunAt 时保留任务 updatedAt，避免把无状态变化的重试当作新暂停；真实状态、错误或执行结果变化仍更新时间。该时间戳不加入公开 API 响应；旧行的空标记在首次扫描时按未处理观察收敛。
 
 新增 `GET/PATCH /v1/rotation-schedules/:slotId`，PATCH 接收 `{ revision, enabled, intervalMinutes }`；另以 `POST /v1/rotation-schedules/:slotId/resume` 接收 `{ revision }` 明确恢复已暂停日程，使用修订号避免重试重复重置倒计时。所有写入在事务内做归属和版本校验并记录审计。
 

@@ -66,6 +66,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     lastStartedAt: time("last_started_at"),
     lastCompletedAt: time("last_completed_at"),
     lastHandledIncidentId: uuid("last_handled_incident_id"),
+    lastHandledIncidentUpdatedAt: time("last_handled_incident_updated_at"),
     pausedReason: varchar("paused_reason", { length: 80 }),
     updatedAt: time("updated_at").notNull().defaultNow(),
   }, t => [

@@ -2,6 +2,7 @@ import { RotationPublicationService } from "./rotation/rotation-publication.serv
 import { RotationCleanupService } from "./rotation/rotation-cleanup.service.js";
 import { RotationProcessor } from "./rotation/rotation.processor.js";
 import { RotationRecoveryService } from "./rotation/rotation-recovery.service.js";
+import { RotationSchedulerService } from "./rotation/rotation-scheduler.service.js";
 import { RotationStore } from "./rotation/rotation-store.js";
 import { HealthResultService } from "./health/health-result.service.js";
 import { ProbeSchedulerService } from "./probes/probe-scheduler.service.js";
@@ -27,7 +28,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
 
 @Module({
   providers: [
-    RotationProcessor, RotationRecoveryService, RotationStore, RotationPublicationService, RotationCleanupService,
+    RotationProcessor, RotationRecoveryService, RotationSchedulerService, RotationStore, RotationPublicationService, RotationCleanupService,
     DatabaseService,
     CloudRuntimeService,
     CloudSyncService,
