@@ -8,14 +8,14 @@ import { parseRotationPolicyInput } from "../lib/rotation-policy";
 import type { RotationPolicy } from "../lib/rotation-types";
 import { Field, Switch } from "./ui";
 
-export function RotationPolicyForm({ formId, slot, authorization, policy, onSubmit }: { formId: string; slot: AddressSlot; authorization: CloudAuthorization | null; policy: RotationPolicy; onSubmit: (input: RotationPolicyInput) => Promise<void> }) {
+export function RotationPolicyForm({ formId, slot, authorization, policy, blockReason, onSubmit }: { formId: string; slot: AddressSlot; authorization: CloudAuthorization | null; policy: RotationPolicy; blockReason?: string | null; onSubmit: (input: RotationPolicyInput) => Promise<void> }) {
   const [enabled, setEnabled] = useState(policy.enabled);
   const [maxAttempts, setMaxAttempts] = useState(policy.maxAttempts);
   const [minIntervalSeconds, setMinIntervalSeconds] = useState(policy.minIntervalSeconds);
   const [cloudWaitSeconds, setCloudWaitSeconds] = useState(policy.cloudWaitSeconds);
   const [candidateWindowSeconds, setCandidateWindowSeconds] = useState(policy.candidateWindowSeconds);
   const [error, setError] = useState<string | null>(null);
-  const block = cloudRotationBlock(slot, authorization);
+  const block = blockReason ?? cloudRotationBlock(slot, authorization);
   const downtime = rotationDowntimeNotice(slot, true);
 
   const submit = async (event: FormEvent) => {

@@ -283,6 +283,20 @@ tbody tr:hover { background: #fafcfb; }
 .proxy-check-result .status { width: fit-content; }
 .proxy-check-result small { color: var(--muted); font-size: 10px; line-height: 1.4; }
 .proxy-table { min-width: 760px; }
+.rotation-machines-table { min-width: 940px; table-layout: fixed; }
+.rotation-machines-table .table-primary { min-width: 0; }
+.rotation-machines-table td, .rotation-machines-table th { padding-left: 10px; padding-right: 10px; }
+.rotation-machines-table td { vertical-align: top; }
+.rotation-machine-addresses { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+.rotation-machine-status { display: grid; gap: 7px; min-width: 0; overflow-wrap: anywhere; }
+.rotation-slot-control { display: grid; gap: 5px; min-width: 0; max-width: 270px; }
+.rotation-slot-switch { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+.rotation-slot-switch .icon-button { width: 26px; height: 28px; flex-shrink: 0; }
+.rotation-slot-list { display: grid; gap: 12px; padding: 6px 4px; }
+.rotation-slot-row { display: grid; grid-template-columns: minmax(230px, 1fr) minmax(240px, 1fr) minmax(250px, 1fr); align-items: start; gap: 20px; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.rotation-machine-expanded > td { background: var(--surface-muted); }
+.rotation-machine-pagination, .rotation-history-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 0; }
+.rotation-list-note { margin-bottom: 14px; }
 .proxy-table th:nth-child(3), .proxy-table td:nth-child(3) { min-width: 210px; }
 #cloud-proxy-form > .field { grid-column: 1 / -1; }
 .address-ledger { margin-bottom: 18px; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
