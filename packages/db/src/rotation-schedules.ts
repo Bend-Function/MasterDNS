@@ -48,7 +48,7 @@ export async function updateRotationScheduleConfiguration(
     enabled: input.enabled,
     intervalMinutes: input.intervalMinutes,
     revision: revision + 1,
-    nextRunAt: input.enabled && !activeIncidentId ? rotationScheduleDeadline(now, input.intervalMinutes) : null,
+    nextRunAt: input.enabled ? rotationScheduleDeadline(now, input.intervalMinutes) : null,
     lastHandledIncidentId: activeIncidentId
       ? before?.lastHandledIncidentId ?? null
       : latestCompletion?.id ?? before?.lastHandledIncidentId ?? null,

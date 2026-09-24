@@ -199,7 +199,7 @@ it("validates enabled targets while allowing a disabled schedule to remain edita
   await expect(service.update(f.actor, f.slot.id, { revision: 2, enabled: true, intervalMinutes: 90 })).rejects.toMatchObject({ status: 409 });
 });
 
-it("keeps active execution state when configuration changes", async () => {
+it("keeps active execution state and rebases the deadline when the interval changes", async () => {
   const f = await fixture();
   await service.update(f.actor, f.slot.id, { revision: 0, enabled: true, intervalMinutes: 60 });
   await connection.db.update(rotationSchedules).set({ nextRunAt: new Date(0) }).where(eq(rotationSchedules.slotId, f.slot.id));
@@ -207,10 +207,33 @@ it("keeps active execution state when configuration changes", async () => {
   const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.2", origin: "system", scanGeneration: 1 }).returning();
   await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
   await connection.db.update(rotationSchedules).set({ pausedReason: "attempts_exhausted" }).where(eq(rotationSchedules.slotId, f.slot.id));
+  const before = await dbNow();
 
   const updated = await service.update(f.actor, f.slot.id, { revision: 1, enabled: true, intervalMinutes: 120 });
 
-  expect(updated).toMatchObject({ activeIncidentId: incident.id, pausedReason: "attempts_exhausted", nextRunAt: null, intervalMinutes: 120, revision: 2 });
+  const after = await dbNow();
+  expect(updated).toMatchObject({ activeIncidentId: incident.id, pausedReason: "attempts_exhausted", intervalMinutes: 120, revision: 2 });
+  expect(new Date(updated.nextRunAt!).getTime()).toBeGreaterThanOrEqual(before.getTime() + 120 * 60_000);
+  expect(new Date(updated.nextRunAt!).getTime()).toBeLessThanOrEqual(after.getTime() + 120 * 60_000);
+});
+
+it("keeps an active incident associated and rebases the deadline when re-enabled", async () => {
+  const f = await fixture();
+  await service.update(f.actor, f.slot.id, { revision: 0, enabled: true, intervalMinutes: 75 });
+  await connection.db.update(rotationSchedules).set({ nextRunAt: new Date(0) }).where(eq(rotationSchedules.slotId, f.slot.id));
+  const incident = await connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)));
+  const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.4", origin: "system", scanGeneration: 1 }).returning();
+  await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
+  const disabled = await service.update(f.actor, f.slot.id, { revision: 1, enabled: false, intervalMinutes: 75 });
+  const before = await dbNow();
+
+  const reenabled = await service.update(f.actor, f.slot.id, { revision: 2, enabled: true, intervalMinutes: 75 });
+
+  const after = await dbNow();
+  expect(disabled).toMatchObject({ enabled: false, activeIncidentId: incident.id, nextRunAt: null, revision: 2 });
+  expect(reenabled).toMatchObject({ enabled: true, activeIncidentId: incident.id, intervalMinutes: 75, revision: 3 });
+  expect(new Date(reenabled.nextRunAt!).getTime()).toBeGreaterThanOrEqual(before.getTime() + 75 * 60_000);
+  expect(new Date(reenabled.nextRunAt!).getTime()).toBeLessThanOrEqual(after.getTime() + 75 * 60_000);
 });
 
 it("resumes only the schedule, consumes the revision, and marks the old incident observation handled", async () => {
