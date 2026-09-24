@@ -32,7 +32,7 @@ it("serializes concurrent physical-instance claims and fences a stale holder aft
 
 import { vi } from "vitest";
 import { CloudError, Ec2CloudAdapter, LightsailCloudAdapter, type CloudAdapter, type CloudInventory, type CloudStepResult } from "@masterdns/cloud-providers";
-import { auditLogs, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
+import { auditLogs, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, createScheduledRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSchedules, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { RotationStore } from "./rotation-store.js";
 import { RotationProcessor } from "./rotation.processor.js";
@@ -40,7 +40,7 @@ import { RotationRecoveryService } from "./rotation-recovery.service.js";
 import { RotationPublicationService } from "./rotation-publication.service.js";
 import { terminateRotationIncident } from "@masterdns/db";
 
-async function fixture(family: "4" | "6" = "4") {
+async function fixture(family: "4" | "6" = "4", trigger: "health" | "scheduled" = "health") {
   const [owner] = await connection.db.insert(users).values({ username: randomUUID(), passwordHash: "test" }).returning();
   const [account] = await connection.db.insert(cloudAccounts).values({ ownerUserId: owner!.id, provider: "aws", name: "AWS", externalAccountId: testExternalAccountId, credentialCiphertext: "encrypted-secret", credentialIv: "iv", credentialTag: "tag" }).returning();
   await connection.db.insert(cloudScanScopes).values({ accountId: account!.id, service: "ec2", region: "us-east-1", generation: 1 });
@@ -52,10 +52,13 @@ async function fixture(family: "4" | "6" = "4") {
   const [config] = await connection.db.insert(healthCheckConfigs).values({ slotId: slot!.id, checkerType: "tcp", config: { port: 443 } }).returning();
   const [group] = await connection.db.insert(probeGroups).values({ ownerUserId: owner!.id, name: "external" }).returning();
   const [healthPolicy] = await connection.db.insert(addressHealthPolicies).values({ slotId: slot!.id, family, configId: config!.id, groupId: group!.id }).returning();
-  await connection.db.insert(rotationPolicies).values({ slotId: slot!.id, enabled: true });
-  const [health] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family, addressId: address!.id, addressVersion: 1, configId: config!.id, configVersion: 1, policyId: healthPolicy!.id, policyRevision: 1, groupRevision: 1, healthState: "unhealthy", latestDecision: "failure", consecutiveFailures: 3, lastRoundId: randomUUID(), lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).returning();
+  await connection.db.insert(rotationPolicies).values({ slotId: slot!.id, enabled: trigger === "health" });
+  const [health] = await connection.db.insert(addressHealthStates).values({ slotId: slot!.id, family, addressId: address!.id, addressVersion: 1, configId: config!.id, configVersion: 1, policyId: healthPolicy!.id, policyRevision: 1, groupRevision: 1, healthState: trigger === "health" ? "unhealthy" : "healthy", latestDecision: trigger === "health" ? "failure" : "success", consecutiveFailures: trigger === "health" ? 3 : 0, consecutiveSuccesses: trigger === "scheduled" ? 3 : 0, lastRoundId: randomUUID(), lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).returning();
   const db = connection.db;
-  const incident = await db.transaction(async tx => createRotationIncident(tx, await lockRotationContext(tx, slot!.id), `health-${health!.lastRoundId}-1`));
+  if (trigger === "scheduled") await db.insert(rotationSchedules).values({ slotId: slot!.id, enabled: true, nextRunAt: new Date(0) });
+  const incident = await db.transaction(async tx => trigger === "health"
+    ? createRotationIncident(tx, await lockRotationContext(tx, slot!.id), `health-${health!.lastRoundId}-1`)
+    : createScheduledRotationIncident(tx, await lockRotationContext(tx, slot!.id)));
   const state = { writes: [] as string[], observations: [] as string[], effect: undefined as CloudStepResult | undefined, error: undefined as CloudError | undefined, repeated: false, lostResponse: false, count: 0, observationStatus: "applied" as "applied" | "pending" | "ambiguous" };
   const inventory: CloudInventory = { ref: { accountId: account!.id, service: "ec2", region: "us-east-1", instanceId: instance!.externalId }, name: "test", state: "running", interfaces: [{ id: iface!.externalId, deviceIndex: 0, addresses: [{ address: address!.address, family: Number(family) as 4 | 6, primary: family === "4", ...(family === "4" ? { allocationId: "eipalloc-old", privateAddress: "10.0.0.1" } : {}) }] }] };
   const adapter: CloudAdapter = {
@@ -79,6 +82,23 @@ async function fixture(family: "4" | "6" = "4") {
   return { owner: owner!, account: account!, instance: instance!, iface: iface!, address: address!, slot: slot!, config: config!, group: group!, healthPolicy: healthPolicy!, health: health!, incident, state, inventory, adapter, store, runtime, processor };
 }
 async function drive(f: Awaited<ReturnType<typeof fixture>>, turns = 5) { for (let n = 0; n < turns; n++) await f.processor.run(f.incident.id); }
+it("uses the same AWS cloud plan and policy budget for scheduled and health triggers", async () => {
+  const health = await fixture("4", "health");
+  const scheduled = await fixture("4", "scheduled");
+
+  await drive(health, 1);
+  await drive(scheduled, 1);
+
+  const healthAttempts = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, health.incident.id));
+  const scheduledAttempts = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, scheduled.incident.id));
+  const healthSteps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, healthAttempts[0]!.id));
+  const scheduledSteps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, scheduledAttempts[0]!.id));
+  expect(scheduledSteps.map(step => step.plan.action)).toEqual(healthSteps.map(step => step.plan.action));
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, scheduled.incident.id)))[0]!.maxAttempts).toBe(
+    (await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, health.incident.id)))[0]!.maxAttempts,
+  );
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, scheduled.incident.id)))[0]).toMatchObject({ trigger: "scheduled", status: "active", phase: "cloud" });
+});
 it("makes a reused historical address probeable when a new cloud candidate is installed", async () => {
   const f = await fixture();
   const [historical] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.iface.id, kind: "host", family: "4", address: "198.51.100.1", origin: "user", scanGeneration: 1, inventoryPresent: false }).returning();

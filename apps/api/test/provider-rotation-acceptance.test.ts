@@ -24,7 +24,7 @@ beforeAll(async () => { redis = new Redis(process.env.MASTERDNS_TEST_REDIS_URL!,
 afterAll(async () => { vi.unstubAllGlobals(); await redis?.quit(); });
 
 type HttpCloud = { credentials: CloudCredentials; externalAccountId: string; service: "azure_vm" | "linode"; region: string; instanceId: string; interfaceId: string; oldAddress: string; candidateAddress: string; fetch: typeof fetch; writes: string[]; mutateOwner(): void; advanceCandidate(): void };
-async function setup(remote: HttpCloud) {
+async function setup(remote: HttpCloud, trigger: "health" | "scheduled" = "health") {
   const f = await fixture();
   const encrypted = encryptJson(remote.credentials, Buffer.alloc(32, 1));
   await f.d.update(db.cloudAccounts).set({ provider: remote.service === "azure_vm" ? "azure" : "linode", externalAccountId: remote.externalAccountId, credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag }).where(eq(db.cloudAccounts.id, f.account.id));
@@ -34,7 +34,7 @@ async function setup(remote: HttpCloud) {
   await f.d.update(db.cloudAddresses).set({ address: remote.oldAddress }).where(eq(db.cloudAddresses.id, f.address.id));
   await f.d.update(db.endpointAddresses).set({ address: remote.oldAddress }).where(eq(db.endpointAddresses.address, f.address.address));
   await f.d.update(db.instanceAuthorizations).set({ allowIpv4Rotation: true, allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
-  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: true });
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: trigger === "health" });
   vi.stubGlobal("fetch", remote.fetch);
   const runtime = new CloudRuntimeService({ db: f.d } as never);
   const adapter = await runtime.adapter(f.account.id, remote.service);
@@ -72,8 +72,11 @@ async function setup(remote: HttpCloud) {
     const [slot] = await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id));
     await f.d.update(db.addressHealthStates).set({ addressId: slot!.candidateAddressId ?? slot!.currentAddressId, addressVersion: slot!.candidateAddressId ? slot!.candidateVersion : slot!.currentVersion, healthState: decision === "success" ? "healthy" : "unhealthy", latestDecision: decision, consecutiveSuccesses: decision === "success" ? 3 : 0, consecutiveFailures: decision === "failure" ? 3 : 0, lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).where(eq(db.addressHealthStates.slotId, f.slot.id));
   };
-  await setHealth("failure");
-  const incident = await f.d.transaction(async tx => db.createRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), randomUUID()));
+  await setHealth(trigger === "health" ? "failure" : "success");
+  if (trigger === "scheduled") await f.d.insert(db.rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
+  const incident = await f.d.transaction(async tx => trigger === "health"
+    ? db.createRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), randomUUID())
+    : db.createScheduledRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id)));
   const drive = async (turns = 1) => { for (let n = 0; n < turns; n++) await processor.run(incident.id); };
   return { ...f, runtime, inventory, incident, processor, publication, cleanup, drive, setHealth, reconcilePending, dnsWrites };
 }
@@ -160,6 +163,21 @@ it.each(["azure", "linode"] as const)("rotates %s through the real runtime and p
   expect(f.dnsWrites).toEqual([remote.oldAddress, remote.candidateAddress]);
   expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, publication!.id)))[0]!.status).toBe("applied");
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
+});
+it.each(["azure", "linode"] as const)("rotates scheduled %s with the existing cloud steps, budget and publication verification", async provider => {
+  const remote = provider === "azure" ? azureCloud() : linodeCloud();
+  const f = await setup(remote, "scheduled");
+  expect(f.incident.trigger).toBe("scheduled");
+  expect(f.dnsWrites).toEqual([remote.oldAddress]);
+  await f.drive(5);
+  expect(remote.writes).toHaveLength(2);
+  expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id)))[0]).toMatchObject({ attemptsUsed: 1, maxAttempts: 3 });
+  await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, f.incident.id));
+  await f.publication.observe(publication!.id);
+  expect(f.dnsWrites).toEqual([remote.oldAddress, remote.candidateAddress]);
+  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, publication!.id)))[0]!.status).toBe("applied");
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup", status: "active" });
 });
 it.each(["azure", "linode"] as const)("blocks a foreign %s resource before any new cloud effect", async provider => {
   const remote = provider === "azure" ? azureCloud() : linodeCloud();

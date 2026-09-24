@@ -44,7 +44,7 @@ export class RotationStore {
     const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, incident.addressVersion)));
     const snapshot: RotationSnapshot = {
       phase: incident.phase,
-      authorization: { lifecycleBlocked: c.lifecycleBlocked, managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
+      authorization: { lifecycleBlocked: c.lifecycleBlocked, managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger !== "health" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
         regionAllowed: !!c.scope && (c.account.regions === null || c.account.regions.includes(c.instance.region)), conflictingManager: c.conflictingManager },
       revisions: { authorization: c.authorization?.revision ?? 0, policy: c.policy?.revision ?? 0, address: c.addressVersion },
       expectedRevisions: { authorization: incident.authorizationRevision, policy: incident.policyRevision, address: incident.addressVersion },
@@ -72,7 +72,7 @@ export class RotationStore {
       else if (incident.trigger !== "manual" && !healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
       else if (c.physicalKey !== incident.physicalKey) action = { kind: "pause", reason: "remote_identity_changed" };
     }
-    if (incident.trigger !== "manual" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
+    if (incident.trigger === "health" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
       action = c.slot.candidateAddressId ? { kind: "publish", mode: "dispatch", addressVersion: c.slot.candidateVersion } : { kind: "complete" };
     }
     if (action.kind === "execute" && incident.errorCode === "rotation_rate_limited" && incident.nextRunAt > h.now) {

@@ -83,6 +83,7 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
   const [incident] = publication?.incidentId
     ? await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, publication.incidentId)).for("update") : [];
   const manual = incident?.trigger === "manual";
+  const trigger = incident?.trigger ?? "health";
   if (incident?.terminatedAt) throw new Error("manual_terminated");
   if (!manual && !h.success) throw new Error("fresh_external_success_required");
   if (publication && (publication.addressId !== c.address?.id || publication.addressVersion !== c.addressVersion))
@@ -95,7 +96,7 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
       (manual ? publication.context.manualIncidentId !== incident.id : !healthRevisionMatches(publication.context as never, h))))
     throw new Error("publication_authorization_changed");
   if (publication?.incidentId) {
-    const rotationError = rotationAuthorizationError(c, manual ? "manual" : "health");
+    const rotationError = rotationAuthorizationError(c, trigger);
     if (rotationError) throw new Error(rotationError);
     const completedManual = manual && incident.status === "complete" && publication.status === "applied";
     if (!incident || incident.slotId !== c.slot.id || incident.physicalKey !== c.physicalKey || incident.pausedByUserId ||
