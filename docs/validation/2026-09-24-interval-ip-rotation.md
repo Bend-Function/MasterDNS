@@ -27,6 +27,8 @@ AWS 使用 `Ec2CloudAdapter` 和假 SDK responder；Azure/Linode 使用真实适
 
 ## 验证命令与计数
 
+以下全量结果对应修复前基线 `17a08da`；最终审查修复后的定向复验记录见下文。本次最终修复未重新运行根测试、全量构建、lint、coverage 或 33 个 provider 验收用例。
+
 环境：Node.js 22.22.3、pnpm 11.25.0、Vitest 4.0.18，隔离 PostgreSQL 18 / Redis 8。仓库声明 pnpm 11.9.0；此工作区沿用已配置的 11.25.0，没有修改 lockfile 或 packageManager。
 
 测试命令均先加载隔离测试环境：`source .superpowers/sdd/2026-09-24-interval-ip-rotation/test-env.sh`。该工作文件不提交；其他环境可设置 `MASTERDNS_TEST_DATABASE_URL` / `MASTERDNS_TEST_REDIS_URL` 和应用所需的本地测试环境后复跑。
@@ -56,7 +58,7 @@ AWS 使用 `Ec2CloudAdapter` 和假 SDK responder；Azure/Linode 使用真实适
 
 1. scheduler 注册在仓库实际使用的 `worker.module.ts`，每 10 秒仅查询数据库，分页大小 200。队列负责唤醒，持久 incident 由既有恢复扫描兜底。
 2. 无轮换策略行时，首次启用日程在同一事务建立既有的 **disabled** 默认策略。用户无需先开启故障触发；不会因此改变故障轮换开关。
-3. 显式恢复日程消费已知的暂停观察，但保留 `activeIncidentId` 表示旧任务冲突。关联任务的后续成功仍独立推进日程。改变间隔或重新启用即使有 active incident，也按数据库当前时间重排展示的截止时间，active 关联仍阻止接纳。
+3. 显式恢复日程消费已知的暂停观察；未完成任务保留 `activeIncidentId` 表示冲突。改变间隔、重新启用或恢复按数据库当前时间重排截止时间；操作之前已成功完成的关联任务解除关联，并消费地址槽最新完成事件作为基线。操作之后才成功完成的任务仍按完成时间和当前间隔推进日程。PATCH 不消费尚未处理的关联终止观察，仍由扫描暂停；显式恢复可以消费该观察。
 4. 仅用 incident ID 不能区分同一任务在两次扫描之间恢复后再次暂停；schedule.updatedAt 又会被无关 PATCH 改变。因此内部保存 `lastHandledIncidentUpdatedAt`，与 incident ID 一起识别被消费的观察，并保留数据库时间戳精度。它不进入公开 API 响应。迁移前的空标记首次扫描按未处理观察收敛。
 5. paused/exhausted 的无状态变化唤醒、相同 status/error 的重复暂停仅推迟 nextRunAt，保持 incident.updatedAt；真实状态、错误或执行效果变化仍刷新时间。否则普通恢复扫描会被误判为新暂停，撤销用户刚恢复的日程。测试包含微秒精度、两次扫描间再次暂停/终止、无关 PATCH、真实 store/processor 的重复唤醒。
 6. 部署需先应用两条新增迁移：`0030_first_the_watchers.sql` 新建 `rotation_schedules`、外键与到期索引，并允许 scheduled 携带完整健康 epoch；`0031_true_callisto.sql` 增加内部 nullable 观察时间戳。随后部署兼容的 API/worker/Web。没有新增必须配置的环境变量，已有槽默认无日程且关闭。
@@ -66,3 +68,23 @@ AWS 使用 `Ec2CloudAdapter` 和假 SDK responder；Azure/Linode 使用真实适
 这是 fake-provider 集成验收，不代表真实云 API 或实际 DNS 传播验收。API 配置通过 controller/service 直接调用，覆盖真实归属、事务与审计，不启动完整 HTTP 认证链；请求契约与路由元数据有独立测试。队列唤醒被记录后直接驱动处理器；健康结果和到期/TTL 时间通过测试数据库推进，未等待真实分钟数或运行外部 Probe Agent。
 
 AWS 本轮完整 scheduled 清理轨迹采用 EC2 EIP；Lightsail 和其它既有拓扑由原适配器/worker 回归覆盖，没有宣称逐拓扑都完成了相同日程端到端流程。Web 单元测试和生产构建已验证；Azure 修复后的浏览器操作由控制任务在提交后单独复核。本记录不把 preview 操作视为真实云验收。
+
+
+## 最终审查修复：完成先于配置／恢复的竞态
+
+发现关联任务已经完成、scanner 尚未清除 `activeIncidentId` 时，PATCH／恢复虽然返回数据库当前时间加间隔，下一轮扫描却以更早的完成时间覆盖该倒计时，停机后甚至立即接纳下一任务。本轮仅修改 `packages/db/src/rotation-schedules.ts` 的配置／恢复观察：依次持有 context → schedule → incident 锁，解除已知成功完成的关联；显式恢复也消费已完成的终止观察。基线始终查询该槽最新完成事件，不能只采用缓存关联的旧任务。观察时间继续在 PostgreSQL 内复制，保留微秒精度；no-op PATCH 的提前返回保持不变。
+
+真实 PostgreSQL 回归先 RED 后 GREEN：新增 12 个用例后，旧实现 8 失败／28 通过；失败包含完成 → 修改间隔／重新启用／恢复 → 两次扫描，以及缓存关联旧于最新完成事件。修复后 scheduler 36／36 通过。新增用例还覆盖未变化 PATCH、关闭／人工暂停状态保留、active／paused 未完成任务到期仍冲突、重新启用先于完成的反向顺序。原有修改先于完成、恢复先于完成、新暂停／终止观察与精确时间戳测试继续通过。
+
+最终定向复验（均先加载上述隔离测试环境）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `pnpm --filter @masterdns/db build` | 通过，API／worker 使用刷新后的 DB 产物 |
+| `pnpm --filter @masterdns/db test` | 14 文件、51 测试通过 |
+| `pnpm --filter @masterdns/api exec vitest run src/modules/rotation/rotation-schedules.service.test.ts` | 1 文件、12 测试通过 |
+| `pnpm --filter @masterdns/worker exec vitest run src/rotation/rotation-scheduler.service.test.ts` | 1 文件、36 测试通过 |
+| `pnpm --filter @masterdns/db --filter @masterdns/api --filter @masterdns/worker typecheck` | 三个 workspace 通过 |
+| `git diff --check` | 通过 |
+
+本轮最终定向测试合计 16 文件、99 测试通过。首次类型检查发现新增测试中可能为空的结果访问，收窄后重新运行 scheduler 与三个 workspace 类型检查通过。迁移测试仍输出已有 PostgreSQL identifier 截断／已存在对象 NOTICE，没有失败。本轮没有迁移、配置或公开 API 结构变更，也没有启动开发服务或访问真实云资源。

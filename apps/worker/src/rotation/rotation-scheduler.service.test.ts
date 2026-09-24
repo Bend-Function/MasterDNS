@@ -174,6 +174,76 @@ it("uses the current interval on completion without re-enabling disabled or unpa
     expect(await schedule(f.slot.id)).toMatchObject({ enabled: state !== "disabled", pausedReason: state === "paused" ? "user_pause" : null, activeIncidentId: null, lastCompletedAt: at, intervalMinutes: 120, revision: 2, nextRunAt: state === "changed" ? new Date(at.getTime() + 7200000) : null });
   }
 });
+it.each([
+  ["interval", false], ["re-enable", false], ["resume", false],
+  ["interval", true], ["re-enable", true], ["resume", true],
+] as const)("preserves the fresh %s deadline when completion precedes the change (newer completion: %s)", async (operation, newerCompletion) => {
+  const f = await fixture(); const linked = await admitted(f.slot.id);
+  if (operation === "re-enable") await configure(f.slot.id, false);
+  if (operation === "resume") await connection.db.update(rotationSchedules).set({ pausedReason: "manual_pause" }).where(eq(rotationSchedules.slotId, f.slot.id));
+  const completedAt = new Date(Date.now() - 86400000);
+  await finish(linked.id, completedAt);
+  let latest = linked;
+  let latestAt = completedAt;
+  if (newerCompletion) {
+    latest = await connection.db.transaction(async tx => createManualRotationIncident(tx, await lockRotationContext(tx, f.slot.id), randomUUID(), f.actor.id));
+    latestAt = new Date(completedAt.getTime() + 3600000);
+    await finish(latest.id, latestAt);
+  }
+  await connection.db.update(rotationIncidents).set({ updatedAt: sql`'2026-09-24T00:00:00.123456Z'::timestamptz` }).where(eq(rotationIncidents.id, latest.id));
+  const before = await connection.db.transaction(tx => databaseNow(tx));
+  const result = operation === "resume" ? await resume(f.slot.id) : await configure(f.slot.id, true, operation === "interval" ? 120 : 60);
+  const after = await connection.db.transaction(tx => databaseNow(tx));
+  const saved = result.schedule!;
+  const intervalMs = operation === "interval" ? 7200000 : 3600000;
+  expect(saved.nextRunAt!.getTime()).toBeGreaterThanOrEqual(before.getTime() + intervalMs);
+  expect(saved.nextRunAt!.getTime()).toBeLessThanOrEqual(after.getTime() + intervalMs);
+  await scheduler().scan(); await scheduler().scan();
+  expect(await schedule(f.slot.id)).toEqual(saved);
+  expect(saved).toMatchObject({ activeIncidentId: null, lastHandledIncidentId: latest.id, lastCompletedAt: latestAt, revision: operation === "re-enable" ? 3 : 2, pausedReason: null });
+  expect(await incidents(f.slot.id)).toHaveLength(newerCompletion ? 2 : 1);
+  const [marker] = await connection.client`select last_handled_incident_updated_at = '2026-09-24T00:00:00.123456Z'::timestamptz as exact from rotation_schedules where slot_id = ${f.slot.id}`;
+  expect(marker!.exact).toBe(true);
+});
+it("leaves an identical PATCH unchanged so an unseen linked completion still advances the schedule", async () => {
+  const f = await fixture(); const linked = await admitted(f.slot.id);
+  const completedAt = new Date(); await finish(linked.id, completedAt);
+  const before = await schedule(f.slot.id);
+  const result = await configure(f.slot.id, true);
+  expect(result.changed).toBe(false);
+  expect(result.schedule).toEqual(before);
+  await scheduler().scan();
+  expect(await schedule(f.slot.id)).toMatchObject({ activeIncidentId: null, lastHandledIncidentId: linked.id, revision: 1, nextRunAt: new Date(completedAt.getTime() + 3600000) });
+});
+it.each(["disabled", "paused"] as const)("keeps %s configuration after consuming an already completed association", async state => {
+  const f = await fixture(); const linked = await admitted(f.slot.id);
+  await finish(linked.id, new Date(Date.now() - 86400000));
+  if (state === "paused") await connection.db.update(rotationSchedules).set({ pausedReason: "user_pause" }).where(eq(rotationSchedules.slotId, f.slot.id));
+  const result = await configure(f.slot.id, state !== "disabled", 120);
+  await scheduler().scan(); await scheduler().scan();
+  expect(await schedule(f.slot.id)).toEqual(result.schedule);
+  expect(result.schedule).toMatchObject({ enabled: state !== "disabled", pausedReason: state === "paused" ? "user_pause" : null, activeIncidentId: null, revision: 2 });
+  expect(await incidents(f.slot.id)).toHaveLength(1);
+});
+it.each(["active", "paused"] as const)("retains an unfinished %s association and blocks overdue admission after PATCH", async status => {
+  const f = await fixture(); const linked = await admitted(f.slot.id);
+  if (status === "paused") {
+    await connection.db.update(rotationIncidents).set({ status, errorCode: "manual_pause", updatedAt: sql`clock_timestamp()` }).where(eq(rotationIncidents.id, linked.id));
+    await scheduler().scan(); await resume(f.slot.id);
+  }
+  await configure(f.slot.id, true, 120);
+  await connection.db.update(rotationSchedules).set({ nextRunAt: new Date(0) }).where(eq(rotationSchedules.slotId, f.slot.id));
+  await scheduler().scan();
+  expect(await schedule(f.slot.id)).toMatchObject({ activeIncidentId: linked.id, pausedReason: null });
+  expect(await incidents(f.slot.id)).toHaveLength(1);
+});
+it("rebases from later completion when re-enable precedes completion", async () => {
+  const f = await fixture(); const linked = await admitted(f.slot.id);
+  await configure(f.slot.id, false); await configure(f.slot.id, true);
+  const completedAt = new Date(); await finish(linked.id, completedAt);
+  await scheduler().scan();
+  expect(await schedule(f.slot.id)).toMatchObject({ activeIncidentId: null, revision: 3, enabled: true, lastCompletedAt: completedAt, nextRunAt: new Date(completedAt.getTime() + 3600000) });
+});
 it.each(["paused", "exhausted", "terminated"] as const)("pauses the schedule on %s outcomes", async state => {
   const f = await fixture(); const incident = await admitted(f.slot.id);
   if (state === "terminated") await connection.db.transaction(tx => terminateRotationIncident(tx, incident.id, f.actor.id));

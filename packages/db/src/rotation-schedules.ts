@@ -32,22 +32,18 @@ export async function updateRotationScheduleConfiguration(
     || (before?.intervalMinutes ?? 1440) !== input.intervalMinutes;
   if (!changed) return { before, schedule: before, changed: false as const };
 
-  const [latestCompletion] = await tx.select({ id: rotationIncidents.id, completedAt: rotationIncidents.completedAt })
-    .from(rotationIncidents)
-    .where(and(
-      eq(rotationIncidents.slotId, slotId),
-      eq(rotationIncidents.status, "complete"),
-      isNotNull(rotationIncidents.completedAt),
-    ))
-    .orderBy(desc(rotationIncidents.completedAt), desc(rotationIncidents.createdAt), desc(rotationIncidents.id))
-    .limit(1)
-    .for("share");
+  const activeIncident = await lockScheduleIncident(tx, before);
+  const latestCompletion = await latestScheduleCompletion(tx, slotId);
   const now = await databaseNow(tx);
-  const activeIncidentId = before?.activeIncidentId ?? null;
+  // A success already visible to PATCH belongs to the configuration baseline.
+  // Keep unacknowledged termination associated so reconciliation still pauses.
+  const activeIncidentId = activeIncident?.status === "complete" && !activeIncident.terminatedAt
+    ? null : before?.activeIncidentId ?? null;
   const values = {
     enabled: input.enabled,
     intervalMinutes: input.intervalMinutes,
     revision: revision + 1,
+    activeIncidentId,
     nextRunAt: input.enabled ? rotationScheduleDeadline(now, input.intervalMinutes) : null,
     lastHandledIncidentId: activeIncidentId
       ? before?.lastHandledIncidentId ?? null
@@ -72,19 +68,45 @@ export async function resumeRotationSchedule(tx: RotationTransaction, slotId: st
   if (!before.pausedReason) throw new Error("rotation_schedule_not_paused");
 
   // Context and schedule are already locked; consume the exact incident observation.
-  if (before.activeIncidentId) await tx.select({ id: rotationIncidents.id }).from(rotationIncidents)
-    .where(eq(rotationIncidents.id, before.activeIncidentId)).for("update");
+  const activeIncident = await lockScheduleIncident(tx, before);
+  const latestCompletion = await latestScheduleCompletion(tx, slotId);
+  const activeIncidentId = activeIncident?.status === "complete" ? null : before.activeIncidentId;
+  const observationId = activeIncidentId ?? latestCompletion?.id;
   const now = await databaseNow(tx);
   const [schedule] = await tx.update(rotationSchedules).set({
     revision: before.revision + 1,
+    activeIncidentId,
     nextRunAt: rotationScheduleDeadline(now, before.intervalMinutes),
-    lastHandledIncidentId: before.activeIncidentId ?? before.lastHandledIncidentId,
-    lastHandledIncidentUpdatedAt: before.activeIncidentId
-      ? incidentObservationTime(before.activeIncidentId) : sql`${rotationSchedules.lastHandledIncidentUpdatedAt}`,
+    lastCompletedAt: latestCompletion?.completedAt ?? before.lastCompletedAt,
+    lastHandledIncidentId: observationId ?? before.lastHandledIncidentId,
+    lastHandledIncidentUpdatedAt: observationId
+      ? incidentObservationTime(observationId) : sql`${rotationSchedules.lastHandledIncidentUpdatedAt}`,
     pausedReason: null,
     updatedAt: now,
   }).where(eq(rotationSchedules.slotId, slotId)).returning();
   return { before, schedule: schedule! };
+}
+
+// Callers hold context and schedule locks before inspecting incident state.
+async function lockScheduleIncident(tx: RotationTransaction, schedule: PersistedRotationSchedule | undefined) {
+  if (!schedule?.activeIncidentId) return undefined;
+  const [incident] = await tx.select({ status: rotationIncidents.status, terminatedAt: rotationIncidents.terminatedAt })
+    .from(rotationIncidents).where(eq(rotationIncidents.id, schedule.activeIncidentId)).for("update");
+  return incident;
+}
+
+async function latestScheduleCompletion(tx: RotationTransaction, slotId: string) {
+  const [incident] = await tx.select({ id: rotationIncidents.id, completedAt: rotationIncidents.completedAt })
+    .from(rotationIncidents)
+    .where(and(
+      eq(rotationIncidents.slotId, slotId),
+      eq(rotationIncidents.status, "complete"),
+      isNotNull(rotationIncidents.completedAt),
+    ))
+    .orderBy(desc(rotationIncidents.completedAt), desc(rotationIncidents.createdAt), desc(rotationIncidents.id))
+    .limit(1)
+    .for("share");
+  return incident;
 }
 
 // Keep PostgreSQL timestamp precision: passing these through Date would discard
