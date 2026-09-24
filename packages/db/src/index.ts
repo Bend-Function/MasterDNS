@@ -54,6 +54,7 @@ function requiredValue(name: string, value: string | undefined): string {
 
 export * from "./rotation-context.js";
 export * from "./rotation-incidents.js";
+export * from "./rotation-schedules.js";
 export * from "./probe-rounds.js";
 export * from "./address-health.js";
 export * from "./cloud-policy.js";
