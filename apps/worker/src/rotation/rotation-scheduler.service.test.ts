@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Logger } from "@nestjs/common";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
@@ -118,7 +119,12 @@ it("rolls back failed admission and lets later scans retry", async () => {
   const f = await fixture();
   await connection.client.unsafe(`create function fail_scheduled_audit() returns trigger language plpgsql as $$ begin if new.action = 'rotation.scheduled' then raise exception 'injected_admission_failure'; end if; return new; end $$`);
   await connection.client.unsafe(`create trigger fail_scheduled_audit before insert on audit_logs for each row execute function fail_scheduled_audit()`);
-  try { await scheduler().scan(); } finally { await connection.client.unsafe(`drop trigger fail_scheduled_audit on audit_logs`); await connection.client.unsafe(`drop function fail_scheduled_audit()`); }
+  const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+  try {
+    await scheduler().scan();
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(errors.mock.calls[0]![0]).toContain(`Schedule ${f.slot.id}: Failed query: insert into "audit_logs"`);
+  } finally { errors.mockRestore(); await connection.client.unsafe(`drop trigger fail_scheduled_audit on audit_logs`); await connection.client.unsafe(`drop function fail_scheduled_audit()`); }
   expect(await incidents(f.slot.id)).toEqual([]);
   expect(await schedule(f.slot.id)).toMatchObject({ activeIncidentId: null, nextRunAt: new Date(0) });
   await scheduler().scan();
@@ -126,7 +132,11 @@ it("rolls back failed admission and lets later scans retry", async () => {
 });
 it("recovers a lost post-commit queue wakeup without creating another incident", async () => {
   const f = await fixture();
-  await scheduler(async () => { throw new Error("redis_unavailable"); }).scan();
+  const errors = vi.spyOn(Logger.prototype, "error").mockImplementation(() => undefined);
+  try {
+    await scheduler(async () => { throw new Error("redis_unavailable"); }).scan();
+    expect(errors).toHaveBeenCalledExactlyOnceWith(`Schedule ${f.slot.id}: redis_unavailable`);
+  } finally { errors.mockRestore(); }
   const [incident] = await incidents(f.slot.id);
   expect(incident).toBeDefined();
   const jobs: string[] = [];

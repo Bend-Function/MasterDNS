@@ -29,11 +29,16 @@ export function previewRotationMachines(): RotationMachine[] {
     row.instance = { ...row.instance, accountId: id + "-account", service, externalId: id + "-vm" };
     row.account = { ...base.account!, id: row.instance.accountId, name: service === "linode" ? "Linode Production" : "Azure Production", provider: service === "linode" ? "linode" : "azure" };
     row.authorization = { ...row.authorization!, allowStopStart: true };
-    row.slots = row.slots.filter(entry => entry.slot.family === "4").map(entry => ({ ...entry,
-      ref: { ...entry.ref!, service, accountId: row.instance.accountId, instanceId: row.instance.externalId },
-      capability: { ...entry.capability!, requiresStop: service === "linode" },
-      cloudTarget: { ...entry.cloudTarget!, account: { id: row.account!.id, name: row.account!.name, provider: row.account!.provider }, instance: row.instance },
-    }));
+    row.slots = row.slots.filter(entry => entry.slot.family === "4").map(entry => {
+      const capability = { ...entry.capability!, available: true, requiresStop: service === "linode" };
+      delete capability.reason;
+      return { ...entry,
+        ref: { ...entry.ref!, service, accountId: row.instance.accountId, instanceId: row.instance.externalId },
+        blockedRotation: null,
+        capability,
+        cloudTarget: { ...entry.cloudTarget!, account: { id: row.account!.id, name: row.account!.name, provider: row.account!.provider }, instance: row.instance },
+      };
+    });
     row.addresses = (row.addresses ?? []).filter(address => address.family === "4");
     return row;
   };

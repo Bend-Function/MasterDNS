@@ -122,6 +122,7 @@ export class RotationSchedulesService {
     try {
       return await this.database.db.transaction(action);
     } catch (error) {
+      if (error instanceof Error && error.message === "rotation_not_found") throw new NotFoundException("Address slot not found");
       if (error instanceof Error && /^(rotation_|external_health_required|authorization_revoked|family_disabled|region_excluded|resource_not_found|conflicting_manager|instance_lifecycle_busy)/.test(error.message)) {
         throw new ConflictException(error.message);
       }

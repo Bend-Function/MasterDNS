@@ -42,6 +42,9 @@ describe("rotation schedule contracts", () => {
     for (const input of [{ revision: -1 }, { revision: 1.5 }, {}, { revision: 1, enabled: true }]) {
       expect(rotationScheduleResumeSchema.safeParse(input).success).toBe(false);
     }
+    for (const revision of [-1, 1.5]) {
+      expect(rotationScheduleUpdateSchema.safeParse({ revision, enabled: true, intervalMinutes: 60 }).success).toBe(false);
+    }
     expect(rotationScheduleUpdateSchema.safeParse({ revision: 0, enabled: false, intervalMinutes: 1440, extra: true }).success).toBe(false);
   });
 });

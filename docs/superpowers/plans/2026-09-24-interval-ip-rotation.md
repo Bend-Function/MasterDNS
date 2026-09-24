@@ -70,6 +70,6 @@
 
 **Files:** `apps/api/test/provider-rotation-acceptance.test.ts`，新增 schedule 集成测试，`docs/validation/2026-09-24-interval-ip-rotation.md`。
 
-- [ ] 对 AWS、Azure、Linode 分别模拟保存日程 → 到期 → 既有执行器 → 成功/暂停 → 下次执行；断言执行策略与现有路径一致。
-- [ ] 回归现有云商限流、授权撤销、模糊写入不盲目重复、候选复测、DNS 发布、清理和人工恢复；不对真实云资源换址。
-- [ ] DB/API/Worker/Web 及相关 contracts/cloud-providers 测试、类型检查、Web 构建通过后记录验收证据。最终改动应集中于调度与入口衔接，不包含适配器策略重写。
+- [x] 对 AWS、Azure、Linode 分别模拟保存日程 → 到期 → 既有执行器 → 成功/暂停 → 下次执行；断言执行策略与现有路径一致。
+- [x] 回归现有云商限流、授权撤销、模糊写入不盲目重复、候选复测、DNS 发布、清理和人工恢复；不对真实云资源换址。
+- [x] DB/API/Worker/Web 及相关 contracts/cloud-providers 测试、类型检查、Web 构建通过后记录验收证据。最终改动应集中于调度与入口衔接，不包含适配器策略重写。

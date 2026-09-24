@@ -279,3 +279,13 @@ it("exposes GET, PATCH, and resume through the schedule controller", async () =>
   await connection.db.update(rotationSchedules).set({ pausedReason: "manual_pause" }).where(eq(rotationSchedules.slotId, f.slot.id));
   expect(await controller.resume(f.actor, f.slot.id, { revision: 1 })).toMatchObject({ pausedReason: null, revision: 2 });
 });
+
+it("returns the same 404 for missing and foreign-owned slots across every schedule operation", async () => {
+  const f = await fixture();
+  const foreign = await fixture();
+  for (const slotId of [randomUUID(), foreign.slot.id]) {
+    await expect(service.get(f.actor, slotId)).rejects.toMatchObject({ status: 404, message: "Address slot not found" });
+    await expect(service.update(f.actor, slotId, { revision: 0, enabled: false, intervalMinutes: 1440 })).rejects.toMatchObject({ status: 404, message: "Address slot not found" });
+    await expect(service.resume(f.actor, slotId, { revision: 0 })).rejects.toMatchObject({ status: 404, message: "Address slot not found" });
+  }
+});

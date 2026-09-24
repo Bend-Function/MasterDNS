@@ -4,11 +4,20 @@ import { Redis } from "ioredis";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { withDnsZoneLock } from "@masterdns/automation";
 import { encryptJson } from "@masterdns/crypto";
-import type { CloudCredentials } from "@masterdns/cloud-providers";
+import { Ec2CloudAdapter, type CloudAdapter, type CloudCredentials } from "@masterdns/cloud-providers";
 import type { DnsRecordInput, ProviderRecord } from "@masterdns/contracts";
 import * as db from "@masterdns/db";
 vi.mock("../src/config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 vi.mock("../../worker/src/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
+// Replace only the AWS SDK transport; runtime identity checks and every adapter remain real.
+const fakeAwsAdapters = vi.hoisted(() => new Map<string, CloudAdapter>());
+vi.mock("@masterdns/cloud-providers", async importOriginal => {
+  const original = await importOriginal<typeof import("@masterdns/cloud-providers")>();
+  return { ...original, createCloudAdapter: (input: Parameters<typeof original.createCloudAdapter>[0]) => fakeAwsAdapters.get(input.accountId) ?? original.createCloudAdapter(input) };
+});
+import { RotationSchedulesController } from "../src/modules/rotation/rotation-schedules.controller.js";
+import { RotationSchedulesService } from "../src/modules/rotation/rotation-schedules.service.js";
+import { RotationSchedulerService } from "../../worker/src/rotation/rotation-scheduler.service.js";
 import { CloudBindingsService } from "../src/modules/cloud/cloud-bindings.service.js";
 import { fixture } from "../../worker/src/rotation/rotation-test-utils.js";
 import { CloudSyncService } from "../../worker/src/cloud/cloud-sync.service.js";
@@ -23,12 +32,12 @@ let redis: Redis;
 beforeAll(async () => { redis = new Redis(process.env.MASTERDNS_TEST_REDIS_URL!, { maxRetriesPerRequest: null }); await redis.ping(); });
 afterAll(async () => { vi.unstubAllGlobals(); await redis?.quit(); });
 
-type HttpCloud = { credentials: CloudCredentials; externalAccountId: string; service: "azure_vm" | "linode"; region: string; instanceId: string; interfaceId: string; oldAddress: string; candidateAddress: string; fetch: typeof fetch; writes: string[]; mutateOwner(): void; advanceCandidate(): void };
+type HttpCloud = { credentials: CloudCredentials; externalAccountId: string; service: "ec2" | "azure_vm" | "linode"; adapter?(accountId: string): CloudAdapter; region: string; instanceId: string; interfaceId: string; oldAddress: string; candidateAddress: string; fetch: typeof fetch; writes: string[]; mutateOwner(): void; advanceCandidate(): void };
 async function setup(remote: HttpCloud, trigger: "health" | "scheduled" = "health") {
   const f = await fixture();
   const encrypted = encryptJson(remote.credentials, Buffer.alloc(32, 1));
-  await f.d.update(db.cloudAccounts).set({ provider: remote.service === "azure_vm" ? "azure" : "linode", externalAccountId: remote.externalAccountId, credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag }).where(eq(db.cloudAccounts.id, f.account.id));
-  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: remote.service, region: remote.region, generation: 1 });
+  await f.d.update(db.cloudAccounts).set({ provider: remote.service === "azure_vm" ? "azure" : remote.service === "ec2" ? "aws" : "linode", externalAccountId: remote.externalAccountId, credentialCiphertext: encrypted.ciphertext, credentialIv: encrypted.iv, credentialTag: encrypted.tag }).where(eq(db.cloudAccounts.id, f.account.id));
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: remote.service, region: remote.region, generation: 1 }).onConflictDoNothing();
   await f.d.update(db.cloudInstances).set({ service: remote.service, region: remote.region, externalId: remote.instanceId }).where(eq(db.cloudInstances.id, f.instance.id));
   await f.d.update(db.cloudInterfaces).set({ externalId: remote.interfaceId }).where(eq(db.cloudInterfaces.id, f.slot.interfaceId));
   await f.d.update(db.cloudAddresses).set({ address: remote.oldAddress }).where(eq(db.cloudAddresses.id, f.address.id));
@@ -36,6 +45,7 @@ async function setup(remote: HttpCloud, trigger: "health" | "scheduled" = "healt
   await f.d.update(db.instanceAuthorizations).set({ allowIpv4Rotation: true, allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
   await f.d.insert(db.rotationPolicies).values({ slotId: f.slot.id, enabled: trigger === "health" });
   vi.stubGlobal("fetch", remote.fetch);
+  if (remote.adapter) fakeAwsAdapters.set(f.account.id, remote.adapter(f.account.id));
   const runtime = new CloudRuntimeService({ db: f.d } as never);
   const adapter = await runtime.adapter(f.account.id, remote.service);
   const inventory = await adapter.inspect({ accountId: f.account.id, service: remote.service, region: remote.region, instanceId: remote.instanceId });
@@ -73,12 +83,76 @@ async function setup(remote: HttpCloud, trigger: "health" | "scheduled" = "healt
     await f.d.update(db.addressHealthStates).set({ addressId: slot!.candidateAddressId ?? slot!.currentAddressId, addressVersion: slot!.candidateAddressId ? slot!.candidateVersion : slot!.currentVersion, healthState: decision === "success" ? "healthy" : "unhealthy", latestDecision: decision, consecutiveSuccesses: decision === "success" ? 3 : 0, consecutiveFailures: decision === "failure" ? 3 : 0, lastCheckedAt: new Date(), evidenceExpiresAt: new Date(Date.now() + 60000) }).where(eq(db.addressHealthStates.slotId, f.slot.id));
   };
   await setHealth(trigger === "health" ? "failure" : "success");
-  if (trigger === "scheduled") await f.d.insert(db.rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
-  const incident = await f.d.transaction(async tx => trigger === "health"
-    ? db.createRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), randomUUID())
-    : db.createScheduledRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id)));
+  const schedules = new RotationSchedulesController(new RotationSchedulesService({ db: f.d } as never));
+  const actor = { id: f.account.ownerUserId, role: "user" } as never;
+  const jobs: string[] = [];
+  const scheduler = new RotationSchedulerService({ db: f.d } as never, { rotation: { add: async (_name: string, data: { incidentId: string }) => { jobs.push(data.incidentId); } } } as never);
+  let incident: typeof db.rotationIncidents.$inferSelect;
+  if (trigger === "scheduled") {
+    const configured = await schedules.update(actor, f.slot.id, { revision: 0, enabled: true, intervalMinutes: 17 });
+    expect(configured).toMatchObject({ revision: 1, enabled: true, intervalMinutes: 17 });
+    expect(new Date(configured.nextRunAt!).getTime()).toBeGreaterThan(Date.now());
+    await scheduler.scan();
+    expect(await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id))).toEqual([]);
+    // Simulate elapsed time without changing policy, health, or engine results.
+    await f.d.update(db.rotationSchedules).set({ nextRunAt: new Date(0) }).where(eq(db.rotationSchedules.slotId, f.slot.id));
+    await scheduler.scan(); await scheduler.scan();
+    const admitted = await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id));
+    expect(admitted).toHaveLength(1);
+    incident = admitted[0]!;
+    expect(jobs.filter(id => id === incident.id)).toHaveLength(1);
+    expect(incident.sourceEventId).toBe("scheduled-1-1970-01-01T00:00:00.000Z");
+    expect(remote.writes).toEqual([]);
+  } else incident = await f.d.transaction(async tx => db.createRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), randomUUID()));
   const drive = async (turns = 1) => { for (let n = 0; n < turns; n++) await processor.run(incident.id); };
-  return { ...f, runtime, inventory, incident, processor, publication, cleanup, drive, setHealth, reconcilePending, dnsWrites };
+  return { ...f, runtime, inventory, incident, processor, publication, cleanup, drive, setHealth, reconcilePending, dnsWrites, schedules, actor, scheduler };
+}
+
+function awsCloud(): HttpCloud {
+  const number = ++fixtureNumber;
+  const externalAccountId = String(100000000000 + number);
+  const instanceId = `i-${randomUUID()}`, interfaceId = `eni-${randomUUID()}`;
+  const oldAddress = `198.51.100.${100 + number * 2}`, candidateAddress = `198.51.100.${101 + number * 2}`;
+  const oldAllocationId = `eipalloc-old-${number}`, newAllocationId = `eipalloc-new-${number}`;
+  const credentials = { kind: "access_key" as const, accessKeyId: "fake", secretAccessKey: "fake" };
+  type Allocation = { AllocationId: string; PublicIp: string; NetworkInterfaceId?: string; PrivateIpAddress?: string; AssociationId?: string; Tags?: Array<{ Key: string; Value: string }> };
+  const allocations: Allocation[] = [{ AllocationId: oldAllocationId, PublicIp: oldAddress, NetworkInterfaceId: interfaceId, PrivateIpAddress: "10.0.0.1", AssociationId: "assoc-old" }];
+  let owner = instanceId;
+  const writes: string[] = [];
+  const eni = () => {
+    const attached = allocations.find(address => address.NetworkInterfaceId === interfaceId);
+    return { NetworkInterfaceId: interfaceId, Attachment: { InstanceId: owner, DeviceIndex: 0 }, PrivateIpAddresses: [{ Primary: true, PrivateIpAddress: "10.0.0.1", Association: attached ? { PublicIp: attached.PublicIp, AllocationId: attached.AllocationId, AssociationId: attached.AssociationId } : undefined }], Ipv6Addresses: [] };
+  };
+  return { credentials, externalAccountId, service: "ec2", region: "us-east-1", instanceId, interfaceId, oldAddress, candidateAddress, writes,
+    mutateOwner: () => { owner = "i-foreign"; }, advanceCandidate: () => { throw new Error("Unexpected second AWS allocation"); },
+    fetch: async () => { throw new Error("Unexpected network access in fake AWS acceptance"); },
+    adapter: accountId => new Ec2CloudAdapter(accountId, credentials, {
+      stsSend: async () => ({ Account: externalAccountId }),
+      ec2Send: async command => {
+        const action = command.constructor.name;
+        const input = command.input as Record<string, any>;
+        if (action === "DescribeInstancesCommand") return { Reservations: [{ Instances: [{ InstanceId: instanceId, State: { Name: "running" } }] }] };
+        if (action === "DescribeNetworkInterfacesCommand") return { NetworkInterfaces: [eni()] };
+        if (action === "DescribeAddressesCommand") return { Addresses: allocations.filter(address => input.AllocationIds ? input.AllocationIds.includes(address.AllocationId) : (input.Filters ?? []).every((filter: { Name: string; Values: string[] }) => address.Tags?.some(tag => `tag:${tag.Key}` === filter.Name && filter.Values.includes(tag.Value)))) };
+        writes.push(action);
+        if (action === "AllocateAddressCommand") {
+          const allocation = { AllocationId: newAllocationId, PublicIp: candidateAddress, Tags: input.TagSpecifications[0].Tags };
+          allocations.push(allocation); return allocation;
+        }
+        if (action === "AssociateAddressCommand") {
+          expect(input).toMatchObject({ AllocationId: newAllocationId, NetworkInterfaceId: interfaceId, PrivateIpAddress: "10.0.0.1", AllowReassociation: false });
+          for (const address of allocations) { delete address.NetworkInterfaceId; delete address.PrivateIpAddress; delete address.AssociationId; }
+          Object.assign(allocations.find(address => address.AllocationId === newAllocationId)!, { NetworkInterfaceId: interfaceId, PrivateIpAddress: "10.0.0.1", AssociationId: "assoc-new" });
+          return { AssociationId: "assoc-new" };
+        }
+        if (action === "ReleaseAddressCommand") {
+          expect(input.AllocationId).toBe(oldAllocationId);
+          allocations.splice(allocations.findIndex(address => address.AllocationId === input.AllocationId), 1); return {};
+        }
+        throw new Error(`Unexpected AWS mutation ${action}`);
+      },
+    }),
+  };
 }
 
 function linodeCloud(): HttpCloud {
@@ -164,20 +238,71 @@ it.each(["azure", "linode"] as const)("rotates %s through the real runtime and p
   expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, publication!.id)))[0]!.status).toBe("applied");
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
 });
-it.each(["azure", "linode"] as const)("rotates scheduled %s with the existing cloud steps, budget and publication verification", async provider => {
-  const remote = provider === "azure" ? azureCloud() : linodeCloud();
+it.each(["aws", "azure", "linode"] as const)("completes scheduled %s from API configuration through scanning, DNS, cleanup and the next deadline", async provider => {
+  const remote = provider === "aws" ? awsCloud() : provider === "azure" ? azureCloud() : linodeCloud();
   const f = await setup(remote, "scheduled");
   expect(f.incident.trigger).toBe("scheduled");
   expect(f.dnsWrites).toEqual([remote.oldAddress]);
+  await f.d.update(db.instanceAuthorizations).set({ allowReleaseAddress: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
   await f.drive(5);
   expect(remote.writes).toHaveLength(2);
   expect((await f.d.select().from(db.rotationBudgetSegments).where(eq(db.rotationBudgetSegments.incidentId, f.incident.id)))[0]).toMatchObject({ attemptsUsed: 1, maxAttempts: 3 });
+  await f.drive(); await f.reconcilePending();
+  expect(f.dnsWrites).toEqual([remote.oldAddress]);
   await f.setHealth("success"); await f.drive(2); await f.reconcilePending();
   const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, f.incident.id));
   await f.publication.observe(publication!.id);
   expect(f.dnsWrites).toEqual([remote.oldAddress, remote.candidateAddress]);
-  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, publication!.id)))[0]!.status).toBe("applied");
-  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup", status: "active" });
+  const incident = async () => (await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!;
+  expect(await incident()).toMatchObject({ phase: "cleanup", status: "active" });
+  const [original] = await f.d.select().from(db.rotationResources).where(and(eq(db.rotationResources.incidentId, f.incident.id), eq(db.rotationResources.role, "original")));
+  expect(original).toMatchObject({ cleanupStatus: "pending", cleanupAddressVersion: 2 });
+  expect(original!.cleanupDueAt!.getTime()).toBeGreaterThan(Date.now());
+  await f.cleanup.run(original!.id, new Date()); await f.cleanup.complete(f.incident.id); await f.scheduler.scan();
+  expect(remote.writes).toHaveLength(2);
+  expect(await f.schedules.get(f.actor, f.slot.id)).toMatchObject({ nextRunAt: null, activeIncidentId: f.incident.id, lastCompletedAt: null });
+  // Move only the TTL deadline; cleanup still executes its real ownership and health gates.
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, original!.id));
+  for (let n = 0; n < 4; n++) await f.cleanup.run(original!.id, new Date());
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, original!.id)))[0]!.cleanupStatus).toBe("released");
+  if (provider === "linode") {
+    await f.cleanup.complete(f.incident.id); await f.scheduler.scan();
+    expect(await incident()).toMatchObject({ phase: "cleanup", status: "active", errorCode: "probe_insufficient" });
+    expect((await f.schedules.get(f.actor, f.slot.id)).nextRunAt).toBeNull();
+    // Simulate the next externally verified probe epoch after the cleanup reboot.
+    const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, original!.id));
+    await f.setHealth("success");
+    await f.d.update(db.addressHealthStates).set({ lastAppliedSequence: Number(resource!.snapshot.cleanupHealthCutoff) + 1 }).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  }
+  await f.cleanup.complete(f.incident.id); await f.scheduler.scan();
+  const completed = await incident();
+  expect(completed).toMatchObject({ status: "complete", phase: "complete", errorCode: null });
+  const schedule = await f.schedules.get(f.actor, f.slot.id);
+  expect(schedule).toMatchObject({ enabled: true, revision: 1, activeIncidentId: null, pausedReason: null, lastHandledIncidentId: f.incident.id, lastCompletedAt: completed.completedAt!.toISOString(), nextRunAt: new Date(completed.completedAt!.getTime() + 17 * 60_000).toISOString() });
+  await f.scheduler.scan();
+  expect(await f.schedules.get(f.actor, f.slot.id)).toEqual(schedule);
+  expect(await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id))).toHaveLength(1);
+  const attempts = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.incidentId, f.incident.id));
+  const steps = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, attempts[0]!.id));
+  expect(steps.map(step => step.plan.action).sort()).toEqual((provider === "aws" ? ["ec2.eip.allocate", "ec2.eip.associate", "ec2.eip.release"] : provider === "azure" ? ["azure.public-ip.allocate", "azure.public-ip.associate", "azure.public-ip.delete"] : ["linode.ipv4.allocate", "linode.instance.reboot", "linode.ipv4.release", "linode.instance.reboot"]).sort());
+  expect(remote.writes).toHaveLength(provider === "linode" ? 4 : 3);
+});
+it.each(["aws", "azure", "linode"] as const)("pauses scheduled %s on authorization withdrawal and resumes only the schedule explicitly", async provider => {
+  const remote = provider === "aws" ? awsCloud() : provider === "azure" ? azureCloud() : linodeCloud();
+  const f = await setup(remote, "scheduled");
+  await f.d.update(db.instanceAuthorizations).set({ managed: false }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.drive(); await f.scheduler.scan();
+  const paused = await f.schedules.get(f.actor, f.slot.id);
+  expect(paused).toMatchObject({ pausedReason: "authorization_revoked", nextRunAt: null, activeIncidentId: f.incident.id });
+  expect(remote.writes).toEqual([]);
+  await f.d.update(db.instanceAuthorizations).set({ managed: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  const resumed = await f.schedules.resume(f.actor, f.slot.id, { revision: paused.revision });
+  expect(resumed).toMatchObject({ pausedReason: null, revision: paused.revision + 1, activeIncidentId: f.incident.id });
+  expect(new Date(resumed.nextRunAt!).getTime()).toBeGreaterThan(Date.now());
+  await f.d.update(db.rotationSchedules).set({ nextRunAt: new Date(0) }).where(eq(db.rotationSchedules.slotId, f.slot.id));
+  await f.scheduler.scan();
+  expect(await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.slotId, f.slot.id))).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.status).toBe("paused");
 });
 it.each(["azure", "linode"] as const)("blocks a foreign %s resource before any new cloud effect", async provider => {
   const remote = provider === "azure" ? azureCloud() : linodeCloud();
