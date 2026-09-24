@@ -399,3 +399,10 @@ tbody tr:hover { background: #fafcfb; }
   .lifecycle-policy-status > div { border-right: 0; border-bottom: 1px solid var(--border); }
   .lifecycle-policy-status > div:last-child { border-bottom: 0; }
 }
+
+.rotation-schedule-section { display: grid; gap: 12px; padding-bottom: 24px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }
+.rotation-schedule-section > p, .rotation-schedule-section .policy-form > p { margin: 0; }
+.rotation-schedule-facts { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 8px 16px; margin: 0; }
+.rotation-schedule-facts dt { color: var(--muted); }
+.rotation-schedule-facts dd { margin: 0; }
+.rotation-policy-heading { margin: 0 0 16px; font-size: 16px; }

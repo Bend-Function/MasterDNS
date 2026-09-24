@@ -32,7 +32,7 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
           if (run.incident.status === "paused" || run.incident.pausedByUserId) { await this.store.defer(incidentId); return; }
           // Health may expire between candidate verification and publication.
           // Wait for the same candidate; never bypass the health state machine.
-          if (run.incident.trigger === "health" && action.kind !== "publish") { await this.store.settle(incidentId, lease); return; }
+          if (run.incident.trigger !== "manual" && action.kind !== "publish") { await this.store.settle(incidentId, lease); return; }
         }
         await this.store.release(lease);
         if (run.incident.phase === "publish") {

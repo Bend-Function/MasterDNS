@@ -28,7 +28,7 @@ export function mergeMachinePolicies(incoming: RotationMachine[], previous: Rota
 export function machinePolicySummary(row: RotationMachine): string {
   if (row.loadError || row.slots.some(slot => !slot.policy)) return "策略状态未完整读取";
   if (!row.slots.length) return "暂无地址槽位";
-  return row.slots.some(slot => slot.policy?.enabled) ? "策略已开启" : "自动轮换未开启";
+  return row.slots.some(slot => slot.policy?.enabled) ? "故障轮换已开启" : "故障轮换未开启";
 }
 
 export function rotationSlotBlock(row: CloudInstanceRow, slot: AddressSlot): string | null {

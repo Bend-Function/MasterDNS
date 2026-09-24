@@ -44,7 +44,7 @@ export class RotationStore {
     const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, c.slot.id), eq(rotationPublications.addressVersion, incident.addressVersion)));
     const snapshot: RotationSnapshot = {
       phase: incident.phase,
-      authorization: { lifecycleBlocked: c.lifecycleBlocked, managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger === "manual" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
+      authorization: { lifecycleBlocked: c.lifecycleBlocked, managed: !!c.account.enabled && !!c.account.externalAccountId && !!c.authorization?.managed, familyEnabled: (incident.trigger !== "health" || !!c.policy?.enabled) && !!(c.slot.family === "4" ? c.authorization?.allowIpv4Rotation : c.authorization?.allowIpv6Rotation), present: !!c.iface && !!c.address?.inventoryPresent && c.instance.metadata.present !== false && c.iface.scanGeneration === c.instance.scanGeneration,
         regionAllowed: !!c.scope && (c.account.regions === null || c.account.regions.includes(c.instance.region)), conflictingManager: c.conflictingManager },
       revisions: { authorization: c.authorization?.revision ?? 0, policy: c.policy?.revision ?? 0, address: c.addressVersion },
       expectedRevisions: { authorization: incident.authorizationRevision, policy: incident.policyRevision, address: incident.addressVersion },
@@ -72,7 +72,7 @@ export class RotationStore {
       else if (incident.trigger !== "manual" && !healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
       else if (c.physicalKey !== incident.physicalKey) action = { kind: "pause", reason: "remote_identity_changed" };
     }
-    if (incident.trigger !== "manual" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
+    if (incident.trigger === "health" && action.kind === "execute" && h.success && !attempt?.charged && !physical?.unresolvedStepId) {
       action = c.slot.candidateAddressId ? { kind: "publish", mode: "dispatch", addressVersion: c.slot.candidateVersion } : { kind: "complete" };
     }
     if (action.kind === "execute" && incident.errorCode === "rotation_rate_limited" && incident.nextRunAt > h.now) {
@@ -213,7 +213,14 @@ export class RotationStore {
         if (run.attempt) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
         await rotationAudit(tx, incident, "rotation.current_recovered");
       } else if (action.kind === "pause") await this.pauseIn(tx, incident, action.reason, run.h.now);
-      else await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode, nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000), updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
+      else {
+        // Queue retries of the same paused observation must not look like a new
+        // failure to the schedule reconciler after an explicit schedule resume.
+        const unchangedPause = action.kind === "wait" && (incident.status === "paused" || incident.status === "exhausted");
+        await tx.update(rotationIncidents).set({ errorCode: action.kind === "probe" ? "probe_insufficient" : incident.errorCode,
+          nextRunAt: action.kind === "wait" && action.until ? new Date(action.until) : new Date(run.h.now.getTime() + 15000),
+          updatedAt: unchangedPause ? sql`${rotationIncidents.updatedAt}` : run.h.now }).where(eq(rotationIncidents.id, id));
+      }
     });
   }
   async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '30 seconds')` }).where(eq(rotationIncidents.id, id)); }
@@ -221,7 +228,10 @@ export class RotationStore {
   private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
     if (incident.terminatedAt) return;
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
-    await tx.update(rotationIncidents).set({ status: code === "attempts_exhausted" ? "exhausted" : "paused", errorCode: code, nextRunAt: new Date(now.getTime() + 15000), updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
+    const status = code === "attempts_exhausted" ? "exhausted" : "paused";
+    const unchangedPause = incident.status === status && incident.errorCode === code;
+    await tx.update(rotationIncidents).set({ status, errorCode: code, nextRunAt: new Date(now.getTime() + 15000),
+      updatedAt: unchangedPause ? sql`${rotationIncidents.updatedAt}` : now }).where(eq(rotationIncidents.id, incident.id));
     if (incident.errorCode !== code) await rotationAudit(tx, incident, "rotation.paused", undefined, { code });
   }
   private async installCandidate(tx: RotationTransaction, c: RotationContext, incident: Incident, steps: Step[], now: Date) {

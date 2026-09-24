@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { and, eq, ne } from "drizzle-orm";
-import { addressHealthPolicies, addressHealthStates, auditLogs, healthCheckConfigs, probeGroups, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPolicies, rotationSteps } from "./schema/index.js";
+import { addressHealthPolicies, addressHealthStates, auditLogs, healthCheckConfigs, probeGroups, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPolicies, rotationSchedules, rotationSteps } from "./schema/index.js";
 import { hasFreshHealthEvidence } from "./address-health.js";
 import { databaseNow, rotationAuthorizationError, type RotationContext, type RotationTransaction } from "./rotation-context.js";
 
@@ -27,26 +27,54 @@ export function healthRevisionMatches(incident: typeof rotationIncidents.$inferS
   return h.configured && incident.healthPolicyId === h.policy?.id && incident.healthPolicyRevision === h.policy?.revision && incident.configId === h.config?.id && incident.configRevision === h.config?.revision && incident.groupId === h.group?.id && incident.groupRevision === h.group?.revision;
 }
 export async function createRotationIncident(tx: RotationTransaction, c: RotationContext, sourceEventId: string, actorUserId?: string) {
+  return (await createCrossCloudRotationIncident(tx, c, "health", sourceEventId, actorUserId)).incident;
+}
+export async function createScheduledRotationIncident(tx: RotationTransaction, c: RotationContext) {
+  const [schedule] = await tx.select().from(rotationSchedules).where(eq(rotationSchedules.slotId, c.slot.id)).for("update");
+  if (!schedule) throw new Error("rotation_schedule_not_found");
+  const now = await databaseNow(tx);
+  if (!schedule.enabled) throw new Error("rotation_schedule_disabled");
+  if (schedule.pausedReason) throw new Error("rotation_schedule_paused");
+  if (schedule.activeIncidentId) throw new Error("rotation_schedule_active");
+  if (!schedule.nextRunAt || schedule.nextRunAt > now) throw new Error("rotation_schedule_not_due");
+  const prerequisiteError = scheduledRotationPrerequisiteError(c); if (prerequisiteError) throw new Error(prerequisiteError);
+  const sourceEventId = `scheduled-${schedule.revision}-${schedule.nextRunAt.toISOString()}`;
+  const result = await createCrossCloudRotationIncident(tx, c, "scheduled", sourceEventId);
+  await tx.update(rotationSchedules).set({ activeIncidentId: result.incident.id, nextRunAt: null, lastStartedAt: result.now, updatedAt: result.now }).where(eq(rotationSchedules.slotId, c.slot.id));
+  return result.incident;
+}
+export function scheduledRotationPrerequisiteError(c: RotationContext): string | undefined {
+  if (c.slot.candidateAddressId && c.slot.candidateAddressId !== c.slot.currentAddressId) return "rotation_candidate_exists";
+  if (c.slot.family !== "4" || c.slot.currentAddressId !== c.address?.id || isIP(c.address.address) !== 4) return "rotation_public_ipv4_required";
+  const providerMetadata = record(c.address.metadata.providerMetadata);
+  if (providerMetadata?.awsAddressScope === "private" || isPrivateIpv4(c.address.address)) return "rotation_private_ipv4_unsupported";
+  const supported = (c.account.provider === "aws" && (c.instance.service === "ec2" || c.instance.service === "lightsail"))
+    || (c.account.provider === "azure" && c.instance.service === "azure_vm")
+    || (c.account.provider === "linode" && c.instance.service === "linode");
+  if (!supported) return "rotation_provider_service_unsupported";
+}
+async function createCrossCloudRotationIncident(tx: RotationTransaction, c: RotationContext, trigger: "health" | "scheduled", sourceEventId: string, actorUserId?: string) {
   const [existing] = await tx.select().from(rotationIncidents).where(and(eq(rotationIncidents.slotId, c.slot.id), ne(rotationIncidents.status, "complete"))).for("update");
   if (existing) {
-    if (existing.trigger !== "health") throw new Error("rotation_active_conflict");
-    return existing;
+    if (existing.trigger !== trigger) throw new Error("rotation_active_conflict");
+    return { incident: existing, now: existing.createdAt };
   }
   const [source] = await tx.select().from(rotationIncidents).where(and(eq(rotationIncidents.slotId, c.slot.id), eq(rotationIncidents.sourceEventId, sourceEventId)));
   if (source) {
-    if (source.trigger !== "health") throw new Error("rotation_active_conflict");
-    return source;
+    if (source.trigger !== trigger) throw new Error("rotation_active_conflict");
+    return { incident: source, now: source.createdAt };
   }
-  const error = rotationAuthorizationError(c); if (error) throw new Error(error);
+  const error = rotationAuthorizationError(c, trigger); if (error) throw new Error(error);
+  if (!c.policy) throw new Error("rotation_policy_missing");
   const h = await lockRotationHealth(tx, c);
-  if (!h.failure) throw new Error("confirmed_failure_required");
+  if (trigger === "health" && !h.failure) throw new Error("confirmed_failure_required");
   const currentSegmentId = randomUUID();
-  const [incident] = await tx.insert(rotationIncidents).values({ ownerUserId: c.account.ownerUserId, slotId: c.slot.id, family: c.slot.family, physicalKey: c.physicalKey, sourceEventId, currentSegmentId,
+  const [incident] = await tx.insert(rotationIncidents).values({ ownerUserId: c.account.ownerUserId, slotId: c.slot.id, family: c.slot.family, physicalKey: c.physicalKey, sourceEventId, trigger, currentSegmentId,
     releaseOldAddress: true,
-    authorizationRevision: c.authorization!.revision, policyRevision: c.policy!.revision, addressVersion: c.addressVersion, ...healthRevisions(h), nextRunAt: h.now, nextAttemptAt: h.now }).returning();
-  await tx.insert(rotationBudgetSegments).values({ id: currentSegmentId, incidentId: incident!.id, maxAttempts: c.policy!.maxAttempts, actorUserId });
-  await rotationAudit(tx, incident!, "rotation.start", actorUserId, { sourceEventId });
-  return incident!;
+    authorizationRevision: c.authorization!.revision, policyRevision: c.policy.revision, addressVersion: c.addressVersion, ...healthRevisions(h), nextRunAt: h.now, nextAttemptAt: h.now }).returning();
+  await tx.insert(rotationBudgetSegments).values({ id: currentSegmentId, incidentId: incident!.id, maxAttempts: c.policy.maxAttempts, actorUserId });
+  await rotationAudit(tx, incident!, trigger === "scheduled" ? "rotation.scheduled" : "rotation.start", actorUserId, { sourceEventId });
+  return { incident: incident!, now: h.now };
 }
 export async function createManualRotationIncident(tx: RotationTransaction, c: RotationContext, sourceEventId: string, actorUserId: string) {
   const [existing] = await tx.select().from(rotationIncidents).where(and(eq(rotationIncidents.slotId, c.slot.id), ne(rotationIncidents.status, "complete"))).for("update");
@@ -78,8 +106,8 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
   if (!incident || incident.status === "complete") throw new Error("rotation_not_resumable");
   const error = rotationAuthorizationError(c, incident.trigger); if (error) throw new Error(error);
   if (!c.policy) throw new Error("rotation_policy_missing");
-  const h = incident.trigger === "health" ? await lockRotationHealth(tx, c) : { now: await databaseNow(tx) };
-  const revisions = incident.trigger === "health" ? healthRevisions(h as RotationHealth) : {};
+  const h = incident.trigger !== "manual" ? await lockRotationHealth(tx, c) : { now: await databaseNow(tx) };
+  const revisions = incident.trigger !== "manual" ? healthRevisions(h as RotationHealth) : {};
   const [lease] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey)).for("update");
   if (lease?.unresolvedStepId) throw new Error("cloud_observation_required");
   if (incident.status === "active") return incident;
@@ -97,8 +125,8 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
     }
   }
   const segmentId = incident.trigger === "manual" ? incident.currentSegmentId : randomUUID();
-  if (incident.trigger === "health") await tx.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: id, maxAttempts: c.policy.maxAttempts, actorUserId });
-  const [updated] = await tx.update(rotationIncidents).set({ status: "active", currentSegmentId: continuingCloud || incident.trigger === "manual" ? incident.currentSegmentId : segmentId, pendingSegmentId: incident.trigger === "health" && continuingCloud ? segmentId : null, ...(incident.phase === "cloud" && !continuingCloud ? { currentAttemptId: null } : {}), pausedByUserId: null, errorCode: null,
+  if (incident.trigger !== "manual") await tx.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: id, maxAttempts: c.policy.maxAttempts, actorUserId });
+  const [updated] = await tx.update(rotationIncidents).set({ status: "active", currentSegmentId: continuingCloud || incident.trigger === "manual" ? incident.currentSegmentId : segmentId, pendingSegmentId: incident.trigger !== "manual" && continuingCloud ? segmentId : null, ...(incident.phase === "cloud" && !continuingCloud ? { currentAttemptId: null } : {}), pausedByUserId: null, errorCode: null,
     authorizationRevision: c.authorization!.revision, policyRevision: c.policy!.revision, addressVersion: c.addressVersion, ...revisions, nextRunAt: h.now, updatedAt: h.now }).where(eq(rotationIncidents.id, id)).returning();
   await rotationAudit(tx, updated!, "rotation.resume", actorUserId, { previousSegmentId: incident.currentSegmentId, segmentId });
   return updated!;

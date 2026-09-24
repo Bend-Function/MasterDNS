@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
-import { bindingAssignments, cloudEndpointLinks, dnsRecords, domainBindings, endpointPools, endpoints, providerAccounts, zones, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, probeGroups, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationSteps, users } from "@masterdns/db";
+import { bindingAssignments, cloudEndpointLinks, dnsRecords, domainBindings, endpointPools, endpoints, providerAccounts, zones, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, createRotationIncident, createScheduledRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationSchedules, rotationSteps, users } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 vi.mock("../../config/env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { RotationService } from "./rotation.service.js";
@@ -103,6 +103,106 @@ it("admits manual rotation while healthy and reuses its active incident across d
   ]);
   expect(concurrent.id).toBe(first.id);
   expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id))).toHaveLength(1);
+});
+it("admits a due scheduled rotation while the old address is healthy and failure rotation is disabled", async () => {
+  const f = await fixture();
+  await connection.db.update(addressHealthStates).set({ healthState: "healthy", latestDecision: "success", consecutiveFailures: 0, consecutiveSuccesses: 3 }).where(eq(addressHealthStates.id, f.health.id));
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false, maxAttempts: 5 });
+  await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, enabled: true, revision: 3, nextRunAt: new Date(0) });
+
+  const incident = await connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)));
+
+  expect(incident).toMatchObject({ trigger: "scheduled", policyRevision: 1, healthPolicyId: f.policy.id, healthPolicyRevision: 1 });
+  expect(incident.sourceEventId).toMatch(/^scheduled-3-/);
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, incident.id)))[0]).toMatchObject({ maxAttempts: 5, attemptsUsed: 0 });
+  expect((await connection.db.select().from(rotationSchedules).where(eq(rotationSchedules.slotId, f.slot.id)))[0]).toMatchObject({ activeIncidentId: incident.id, nextRunAt: null, lastStartedAt: expect.any(Date) });
+});
+it("admits one incident when concurrent workers claim the same due schedule", async () => {
+  const f = await fixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false });
+  await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
+
+  const results = await Promise.allSettled([1, 2].map(() => connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)))));
+
+  expect(results.filter(result => result.status === "fulfilled")).toHaveLength(1);
+  expect(results.filter(result => result.status === "rejected")).toHaveLength(1);
+  expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(1);
+  const [schedule] = await connection.db.select().from(rotationSchedules).where(eq(rotationSchedules.slotId, f.slot.id));
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id));
+  expect(schedule).toMatchObject({ activeIncidentId: incident!.id, nextRunAt: null });
+});
+it("requires real due schedule authority and preserves health failure evidence admission", async () => {
+  const scheduled = await fixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: scheduled.slot.id, enabled: false });
+  await expect(connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, scheduled.slot.id)))).rejects.toThrow("rotation_schedule_not_found");
+
+  const health = await fixture();
+  await connection.db.update(addressHealthStates).set({ healthState: "healthy", latestDecision: "success", consecutiveFailures: 0, consecutiveSuccesses: 3 }).where(eq(addressHealthStates.id, health.health.id));
+  await connection.db.insert(rotationPolicies).values({ slotId: health.slot.id, enabled: true });
+  await expect(connection.db.transaction(async tx => createRotationIncident(tx, await lockRotationContext(tx, health.slot.id), randomUUID()))).rejects.toThrow("confirmed_failure_required");
+});
+it.each([
+  { name: "disabled", values: { enabled: false, nextRunAt: new Date(0) }, code: "rotation_schedule_disabled" },
+  { name: "paused", values: { enabled: true, pausedReason: "manual_pause", nextRunAt: new Date(0) }, code: "rotation_schedule_paused" },
+  { name: "not due", values: { enabled: true, nextRunAt: new Date("2999-01-01T00:00:00.000Z") }, code: "rotation_schedule_not_due" },
+])("rejects a $name schedule under the admission lock", async ({ values, code }) => {
+  const f = await fixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false });
+  await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, ...values });
+  await expect(connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)))).rejects.toThrow(code);
+  expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
+});
+it("rejects scheduled admission for non-public IPv4 and unsupported provider targets", async () => {
+  const cases = [
+    { code: "rotation_public_ipv4_required", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const [ipv6] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.slot.interfaceId, family: "6", kind: "host", address: "2001:db8::1", origin: "user", scanGeneration: 1 }).returning();
+      await connection.db.update(managedAddressSlots).set({ family: "6", currentAddressId: ipv6!.id }).where(eq(managedAddressSlots.id, f.slot.id));
+    } },
+    { code: "rotation_private_ipv4_unsupported", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => connection.db.update(cloudAddresses).set({ address: "10.0.0.4" }).where(eq(cloudAddresses.id, f.address.id)) },
+    { code: "rotation_private_ipv4_unsupported", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => connection.db.update(cloudAddresses).set({ metadata: { providerMetadata: { awsAddressScope: "private" } } }).where(eq(cloudAddresses.id, f.address.id)) },
+    { code: "rotation_candidate_exists", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => {
+      const [candidate] = await connection.db.insert(cloudAddresses).values({ interfaceId: f.slot.interfaceId, family: "4", kind: "host", address: "198.51.100.2", origin: "system", scanGeneration: 1 }).returning();
+      await connection.db.update(managedAddressSlots).set({ candidateAddressId: candidate!.id, candidateVersion: 2 }).where(eq(managedAddressSlots.id, f.slot.id));
+    } },
+    { code: "rotation_provider_service_unsupported", mutate: async (f: Awaited<ReturnType<typeof fixture>>) => connection.db.update(cloudAccounts).set({ provider: "azure" }).where(eq(cloudAccounts.id, f.account.id)) },
+  ];
+  for (const testCase of cases) {
+    const f = await fixture();
+    await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false });
+    await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
+    await testCase.mutate(f);
+    await expect(connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)))).rejects.toThrow(testCase.code);
+    expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
+  }
+});
+it("resumes a scheduled rotation with a persisted policy-sized budget segment", async () => {
+  const f = await fixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false, maxAttempts: 4 });
+  await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
+  const incident = await connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)));
+  await connection.db.update(rotationBudgetSegments).set({ attemptsUsed: 4, exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
+  await connection.db.update(rotationIncidents).set({ status: "exhausted", errorCode: "attempts_exhausted" }).where(eq(rotationIncidents.id, incident.id));
+
+  const resumed = await connection.db.transaction(async tx => resumeRotationIncident(tx, await lockRotationContext(tx, f.slot.id), incident.id, f.actor.id));
+
+  expect(resumed.currentSegmentId).not.toBe(incident.currentSegmentId);
+  expect(resumed.pendingSegmentId).toBeNull();
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.id, resumed.currentSegmentId)))[0]).toMatchObject({ incidentId: incident.id, maxAttempts: 4, attemptsUsed: 0 });
+});
+it("keeps a charged scheduled attempt on its current segment and attaches the resume budget as pending", async () => {
+  const f = await fixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false, maxAttempts: 4 });
+  await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, enabled: true, nextRunAt: new Date(0) });
+  const incident = await connection.db.transaction(async tx => createScheduledRotationIncident(tx, await lockRotationContext(tx, f.slot.id)));
+  const attemptId = randomUUID();
+  await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident.id, segmentId: incident.currentSegmentId, sequence: 1, charged: true, status: "cloud", beforeInventory: {} });
+  await connection.db.update(rotationIncidents).set({ phase: "cloud", status: "paused", currentAttemptId: attemptId, pausedByUserId: f.actor.id }).where(eq(rotationIncidents.id, incident.id));
+
+  const resumed = await connection.db.transaction(async tx => resumeRotationIncident(tx, await lockRotationContext(tx, f.slot.id), incident.id, f.actor.id));
+
+  expect(resumed).toMatchObject({ currentSegmentId: incident.currentSegmentId, currentAttemptId: attemptId });
+  expect(resumed.pendingSegmentId).toBeTruthy();
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.id, resumed.pendingSegmentId!)))[0]).toMatchObject({ incidentId: incident.id, maxAttempts: 4, attemptsUsed: 0 });
 });
 it("rejects unauthorized, invalid, private, foreign and candidate-bearing manual slots before incident creation", async () => {
   const unauthorized = await fixture();

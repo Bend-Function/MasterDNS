@@ -22,4 +22,24 @@ describe("durable rotation storage", () => {
     }
     expect(config.checks.map(item => item.name)).toContain("rotation_incidents_trigger_epoch");
   });
+  it("exports schedules with ownership, incident association and a due index", () => {
+    const config = getTableConfig(schema.rotationSchedules);
+    const foreignKeys = config.foreignKeys.map(item => item.reference());
+    expect(config.columns.map(column => column.name)).toEqual(expect.arrayContaining([
+      "slot_id",
+      "enabled",
+      "interval_minutes",
+      "revision",
+      "next_run_at",
+      "active_incident_id",
+      "last_started_at",
+      "last_completed_at",
+      "last_handled_incident_id",
+      "paused_reason",
+      "updated_at",
+    ]));
+    expect(foreignKeys).toHaveLength(2);
+    expect(config.indexes.map(item => item.config.name)).toContain("rotation_schedules_due_idx");
+    expect(config.checks.map(item => item.name)).toContain("rotation_schedule_bounds");
+  });
 });
