@@ -6,29 +6,36 @@ import type { CloudInventory, CloudObservation, CloudStepResult } from "./provid
 import { makeRotationStep, rotationArguments } from "./rotation-plan.js";
 import type { CleanupPlanOptions, RotationStepArguments } from "./rotation-plan.js";
 
-const actions = new Set(["linode.ipv4.allocate", "linode.instance.reboot", "linode.ipv4.release"]);
+const actions = new Set(["linode.ipv4.allocate", "linode.instance.reboot", "linode.instance.stop", "linode.instance.start", "linode.ipv4.release"]);
+type LinodeRestartMode = "reboot" | "stop_start";
+function powerActions(mode: LinodeRestartMode = "reboot"): Array<"linode.instance.reboot" | "linode.instance.stop" | "linode.instance.start"> {
+  return mode === "stop_start" ? ["linode.instance.stop", "linode.instance.start"] : ["linode.instance.reboot"];
+}
 function requireCapability(slot: SlotRef, inventory: CloudInventory, allowStop?: boolean, permission: "read" | "write" = "write") {
   const capability = linodeCapabilities(slot, inventory, permission);
   if (!capability.available) throw new CloudError("rotation_unsupported", false, undefined, capability.reason);
   if (allowStop !== true) throw new CloudError("rotation_unsupported", false, undefined, "linode_reboot_permission_required");
 }
-export function planLinodeRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string }): CloudStep[] {
+export function planLinodeRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string; linodeRestartMode?: LinodeRestartMode }): CloudStep[] {
   requireCapability(slot, inventory, options.allowStop);
   const args: RotationStepArguments = { slot, before: inventory, phase: "rotation", ...options };
-  const steps = [makeRotationStep("linode.ipv4.allocate", args, 0), makeRotationStep("linode.instance.reboot", args, 1)];
+  const steps = ["linode.ipv4.allocate" as const, ...powerActions(options.linodeRestartMode)].map((action, index) => makeRotationStep(action, args, index));
   rotationArguments(steps[0]!); return steps;
 }
 export function planLinodeCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {
   requireCapability(slot, inventory, options.allowStop);
   const args: RotationStepArguments = { slot, before: inventory, phase: "post_publish_cleanup", ...options };
   assertCleanup(args);
-  const steps = [makeRotationStep("linode.ipv4.release", args, 0), makeRotationStep("linode.instance.reboot", args, 1)];
+  const steps = ["linode.ipv4.release" as const, ...powerActions(options.linodeRestartMode)].map((action, index) => makeRotationStep(action, args, index));
   rotationArguments(steps[0]!); return steps;
 }
 function validate(step: CloudStep, adapter: LinodeCloudAdapter): RotationStepArguments {
   const args = rotationArguments(step);
   if (!actions.has(step.action) || args.slot.accountId !== adapter.accountId || args.slot.service !== "linode" || args.slot.family !== 4 || args.slot.interfaceId !== "public"
-    || (step.action === "linode.ipv4.allocate" && args.phase !== "rotation") || (step.action === "linode.ipv4.release" && args.phase !== "post_publish_cleanup")) throw new CloudError("invalid_rotation_step", false);
+    || (step.action === "linode.ipv4.allocate" && args.phase !== "rotation") || (step.action === "linode.ipv4.release" && args.phase !== "post_publish_cleanup")
+    || !["reboot", "stop_start"].includes(args.linodeRestartMode ?? "reboot")
+    || (step.action === "linode.instance.reboot" && args.linodeRestartMode === "stop_start")
+    || (["linode.instance.stop", "linode.instance.start"].includes(step.action) && args.linodeRestartMode !== "stop_start")) throw new CloudError("invalid_rotation_step", false);
   requireCapability(args.slot, args.before, args.allowStop);
   return args;
 }
@@ -109,8 +116,18 @@ function verifyReleaseReceipt(args: RotationStepArguments): CloudStepResult {
     || receipt.after?.region !== args.slot.region || receipt.after?.attemptId !== args.attemptId || !Number.isSafeInteger(receipt.before?.eventWatermark)) throw new CloudError("resource_ownership_ambiguous", false);
   return receipt;
 }
+function verifyShutdownReceipt(args: RotationStepArguments): CloudStepResult {
+  const receipt = args.priorReceipts?.find(item => item.action === "linode.instance.stop")?.receipt;
+  if (!receipt || !Number.isSafeInteger(Number(receipt.operationId)) || Number(receipt.operationId) < 1 || receipt.after?.eventStatus !== "finished" && receipt.after?.eventStatus !== "completed"
+    || receipt.after?.powerState !== "offline" || receipt.after?.attemptId !== args.attemptId
+    || receipt.after?.externalAccountId !== args.before.metadata?.externalAccountId || receipt.after?.instanceId !== args.slot.instanceId
+    || receipt.after?.region !== args.slot.region || receipt.after?.configId !== args.before.metadata?.configId) throw new CloudError("resource_ownership_ambiguous", false);
+  return receipt;
+}
 function watermark(args: RotationStepArguments): number {
-  const source = args.receipt?.before?.eventWatermark ?? (args.phase === "post_publish_cleanup" ? verifyReleaseReceipt(args).before?.eventWatermark : candidateReceipt(args)?.before?.eventWatermark ?? args.before.metadata?.eventWatermark);
+  const source = args.receipt?.before?.eventWatermark ?? (args.linodeRestartMode === "stop_start" && args.priorReceipts?.some(item => item.action === "linode.instance.stop")
+    ? Number(verifyShutdownReceipt(args).operationId)
+    : args.phase === "post_publish_cleanup" ? verifyReleaseReceipt(args).before?.eventWatermark : candidateReceipt(args)?.before?.eventWatermark ?? args.before.metadata?.eventWatermark);
   if (!Number.isSafeInteger(source) || Number(source) < 0) throw new CloudError("resource_ownership_ambiguous", false);
   return Number(source);
 }
@@ -124,7 +141,7 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
   }
   const current = await adapter.inspect(args.slot);
   identity(args, current);
-  if (current.state !== "running") throw new CloudError("rotation_unsupported", false, undefined, "linode_not_running");
+  if (current.state !== (step.action === "linode.instance.start" ? "offline" : "running")) throw new CloudError("rotation_unsupported", false, undefined, "linode_unexpected_power_state");
   const before = snapshot(current);
   if (step.action === "linode.ipv4.allocate") {
     currentCapability(args, current);
@@ -151,13 +168,17 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
     verifyReleaseReceipt(args);
     if (ipv4(current).includes(args.slot.address) || await exactIp(adapter, args.slot.address)) throw new CloudError("resource_ownership_ambiguous", false);
   } else verifyAssigned(args, await exactIp(adapter, args.slot.address), args.slot.address);
+  if (step.action === "linode.instance.start") {
+    before.eventWatermark = Number(verifyShutdownReceipt(args).operationId);
+  }
   // The before inventory and prior allocation/release receipt already retain a watermark if this response is lost.
   watermark(args);
   const rebootIdentity = args.phase === "post_publish_cleanup"
     ? { remoteId: args.slot.address, allocationId: verifyReleaseReceipt(args).allocationId!, resourceId: verifyReleaseReceipt(args).resourceId! }
     : { remoteId: args.slot.instanceId };
-  await adapter.http.request(`/linode/instances/${args.slot.instanceId}/reboot`, { method: "POST", body: { config_id: current.metadata!.configId } });
-  return { ...rebootIdentity, before, after: { ...snapshot(current), attemptId: args.attemptId, rebootRequested: true } };
+  const command = step.action === "linode.instance.stop" ? "shutdown" : step.action === "linode.instance.start" ? "boot" : "reboot";
+  await adapter.http.request(`/linode/instances/${args.slot.instanceId}/${command}`, { method: "POST", body: command === "shutdown" ? {} : { config_id: current.metadata!.configId } });
+  return { ...rebootIdentity, before, after: { ...snapshot(current), attemptId: args.attemptId, powerActionRequested: command, ...(command === "reboot" ? { rebootRequested: true } : {}) } };
 }
 
 export async function observeLinodeRotation(step: CloudStep, adapter: LinodeCloudAdapter): Promise<CloudObservation> {
@@ -191,20 +212,23 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
       base.remoteId = args.slot.address; base.allocationId = released.allocationId!; base.resourceId = released.resourceId!;
       if (ipv4(current).includes(args.slot.address) || await exactIp(adapter, args.slot.address)) return { ...base, status: "ambiguous" };
     }
+    if (step.action === "linode.instance.start") verifyShutdownReceipt(args);
     const afterId = watermark(args);
     base.before = { ...base.before, eventWatermark: afterId };
-    const events = (await adapter.events(args.slot.instanceId)).filter(event => event.id > afterId && event.action === "linode_reboot" && event.entity?.type === "linode" && event.entity.id === Number(args.slot.instanceId));
+    const eventAction = step.action === "linode.instance.stop" ? "linode_shutdown" : step.action === "linode.instance.start" ? "linode_boot" : "linode_reboot";
+    const events = (await adapter.events(args.slot.instanceId)).filter(event => event.id > afterId && event.action === eventAction && event.entity?.type === "linode" && event.entity.id === Number(args.slot.instanceId));
     if (events.length === 0) return { ...base, status: "pending" };
     if (events.length !== 1) return { ...base, status: "ambiguous" };
     const event = events[0]!;
     if (event.username !== args.before.metadata?.authenticatedUsername || (args.receipt?.operationId && args.receipt.operationId !== String(event.id))) return { ...base, status: "ambiguous" };
-    if (event.status === "failed") throw new CloudError("cloud_operation_failed", false, undefined, "linode_reboot_failed");
+    if (event.status === "failed") throw new CloudError("cloud_operation_failed", false, undefined, `linode_${eventAction}_failed`);
     const result = { ...base, operationId: String(event.id), before: { ...base.before, eventWatermark: afterId }, after: { ...base.after, eventStatus: event.status } };
-    if (!["finished", "completed"].includes(event.status ?? "") || current.state !== "running") return { ...result, status: "pending" };
+    const desiredState = step.action === "linode.instance.stop" ? "offline" : "running";
+    if (!["finished", "completed"].includes(event.status ?? "") || current.state !== desiredState) return { ...result, status: "pending" };
     const address = current.interfaces.find(i => i.id === args.slot.interfaceId)!.addresses.find(ip => ip.family === 4 && ip.address === candidate.candidateAddress)!;
     const resource = args.phase === "post_publish_cleanup" ? verifyReleaseReceipt(args) : candidate;
     return { ...result, candidateAddress: candidate.candidateAddress!, candidateRepeated: candidate.candidateRepeated ?? false, allocationId: resource.allocationId!, resourceId: resource.resourceId!,
-      after: { ...result.after, attemptId: args.attemptId, addressMetadata: address.metadata ?? {}, ...(address.privateAddress === undefined ? {} : { privateAddress: address.privateAddress }) }, status: "applied" };
+      after: { ...result.after, attemptId: args.attemptId, powerState: current.state, addressMetadata: address.metadata ?? {}, ...(address.privateAddress === undefined ? {} : { privateAddress: address.privateAddress }) }, status: "applied" };
   } catch (error) {
     if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
     throw error;

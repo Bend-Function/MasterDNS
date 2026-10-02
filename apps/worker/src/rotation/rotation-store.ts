@@ -89,7 +89,7 @@ export class RotationStore {
       if (!c.address || !c.iface) return false;
       const attemptId = randomUUID();
       const slot = { accountId: c.account.id, service: c.instance.service, region: c.instance.region, instanceId: c.instance.externalId, interfaceId: c.iface.externalId, slotId: c.slot.id, address: c.address.address, family: c.slot.family === "4" ? 4 as const : 6 as const };
-      const plan = planCloudRotation(slot, inventory, { allowStop: c.authorization!.allowStopStart, attemptId });
+      const plan = planCloudRotation(slot, inventory, { allowStop: c.authorization!.allowStopStart, attemptId, linodeRestartMode: c.policy?.linodeRestartMode ?? "reboot" });
       const previous = await tx.select({ sequence: rotationAttempts.sequence }).from(rotationAttempts).where(eq(rotationAttempts.incidentId, id));
       const failed = await tx.select({ address: rotationResources.address }).from(rotationResources).where(and(eq(rotationResources.incidentId, id), eq(rotationResources.role, "candidate")));
       if (run.attempt && incident.phase === "candidate") await tx.update(rotationAttempts).set({ status: "candidate_failed" }).where(eq(rotationAttempts.id, run.attempt.id));
@@ -108,7 +108,7 @@ export class RotationStore {
       if (run.action.kind !== "execute" || run.action.operation !== "cloud_step" || run.action.stepId !== stepId || !run.attempt || !run.physical || run.physical.unresolvedStepId || run.physical.incidentId !== id) return;
       const error = rotationAuthorizationError(c, incident.trigger); if (error) throw new Error(error);
       const step = run.steps.find(s => s.id === stepId)!;
-      if (step.plan.action === "linode.instance.reboot" && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
+      if (["linode.instance.reboot", "linode.instance.stop", "linode.instance.start"].includes(step.plan.action) && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
       const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
       const allocation = prior.filter(s => s.plan.action.endsWith(".allocate")).at(-1);
       const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };

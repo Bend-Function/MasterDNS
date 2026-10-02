@@ -14,8 +14,9 @@ export function defineRotationSchema(dependencies: Dependencies) {
     minIntervalSeconds: integer("min_interval_seconds").notNull().default(60),
     cloudWaitSeconds: integer("cloud_wait_seconds").notNull().default(120),
     candidateWindowSeconds: integer("candidate_window_seconds").notNull().default(180),
+    linodeRestartMode: varchar("linode_restart_mode", { length: 16 }).$type<"reboot" | "stop_start">().notNull().default("reboot"),
     updatedAt: time("updated_at").notNull().defaultNow(),
-  }, t => [check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`)]);
+  }, t => [check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`), check("rotation_policy_linode_restart_mode", sql`${t.linodeRestartMode} in ('reboot','stop_start')`)]);
   const rotationIncidents = pgTable("rotation_incidents", {
     id: uuid("id").primaryKey().defaultRandom(),
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "restrict" }),

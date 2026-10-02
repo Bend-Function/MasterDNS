@@ -18,4 +18,14 @@ describe("rotation policy downtime permission", () => {
     expect(blocked).toContain("再次重启");
     expect(render(true).match(/<button[^>]*role="switch"[^>]*>/)?.[0]).not.toContain('disabled=""');
   });
+  it("shows the selected stop-start strategy on Linode slots", () => {
+    const base = demoCloudSlots[0]!;
+    const slot = { ...base, ref: { ...base.ref!, service: "linode" as const }, capability: { ...base.capability!, requiresStop: true } };
+    const markup = renderToStaticMarkup(createElement(RotationPolicyForm, {
+      formId: "policy", slot, authorization: { ...demoCloudInstances[0]!.authorization!, managed: true, allowStopStart: true },
+      policy: { ...demoRotationPolicy, linodeRestartMode: "stop_start" }, onSubmit: async () => undefined,
+    }));
+    expect(markup).toContain('<option value="stop_start" selected="">关机后开机</option>');
+    expect(markup).toContain("先关机再开机");
+  });
 });

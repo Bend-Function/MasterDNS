@@ -225,6 +225,13 @@
       "when": 1790240635707,
       "tag": "0031_true_callisto",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1790747564989,
+      "tag": "0032_slim_the_anarchist",
+      "breakpoints": true
     }
   ]
 }

@@ -17,7 +17,7 @@ export class RotationService {
   async policy(actor: AuthUser, slotId: string) {
     await this.ownedSlot(actor, slotId);
     const [policy] = await this.database.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, slotId));
-    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180 };
+    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot" as const };
   }
   async setPolicy(actor: AuthUser, slotId: string, input: RotationPolicyInput) {
     await this.ownedSlot(actor, slotId);

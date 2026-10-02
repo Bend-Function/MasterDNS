@@ -198,7 +198,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         const chain = await this.chain(tx, resource);
         const persisted = chain.find(s => s.id === stepId);
         if (!persisted || !["prepared", "not_applied", "rejected_no_effect"].includes(persisted.status)) return;
-        if (persisted.plan.action === "linode.instance.reboot" && !current.authorization!.allowStopStart) throw new Error("stop_not_authorized");
+        if (["linode.instance.reboot", "linode.instance.stop", "linode.instance.start"].includes(persisted.plan.action) && !current.authorization!.allowStopStart) throw new Error("stop_not_authorized");
         const applied = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, resource.attemptId)).orderBy(asc(rotationSteps.sequence));
         const prior = applied.filter(s => s.status === "applied" && (s.plan.arguments.phase === "rotation" || chain.some(member => member.id === s.id)));
         const allocation = prior.filter(s => s.plan.arguments.phase === "rotation" && s.plan.action.endsWith(".allocate")).at(-1);
@@ -302,6 +302,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
   private async plan(tx: RotationTransaction, c: RotationContext, r: Resource, live?: CloudInventory) {
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, r.attemptId));
     if (!attempt) throw new Error("cleanup_attempt_missing");
+    const [rotationStep] = await tx.select({ plan: rotationSteps.plan }).from(rotationSteps).where(eq(rotationSteps.attemptId, r.attemptId)).orderBy(asc(rotationSteps.sequence)).limit(1);
+    const linodeRestartMode = rotationStep?.plan.arguments.linodeRestartMode === "stop_start" ? "stop_start" : "reboot";
     const slot = r.snapshot.slot as SlotRef | undefined;
     if (
       !slot ||
@@ -363,6 +365,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       releaseAuthorized: true,
       publishedAddress: c.address!.address,
       allowStop: c.authorization!.allowStopStart,
+      linodeRestartMode,
       ...(live ? { publishedInventory: live } : {}),
       ...(publishedReceipt ? { publishedReceipt, publishedAttemptId: c.address!.attemptId! } : {}),
       ...(cleanupReceipt ? { cleanupReceipt } : {}),
@@ -439,7 +442,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       }
       const next = status === "applied" && !historyAmbiguous ? chain[chain.findIndex(member => member.id === stepId) + 1] : undefined;
       let snapshot = resource.snapshot;
-      if (status === "applied" && step.status !== "applied" && step.plan.action === "linode.instance.reboot") {
+      if (status === "applied" && step.status !== "applied" && ["linode.instance.reboot", "linode.instance.start"].includes(step.plan.action)) {
         const now = await databaseNow(tx);
         const [sequence] = await tx.select().from(probeRoundSequences).where(eq(probeRoundSequences.slotId, context.slot.id));
         const health = await lockRotationHealth(tx, context);

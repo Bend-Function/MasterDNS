@@ -18,6 +18,9 @@ describe("validateRotationPolicy", () => {
 });
 
 describe("parseRotationPolicyInput", () => {
+  it("preserves the selected Linode restart mode", () => {
+    expect(parseRotationPolicyInput({ revision: 2, linodeRestartMode: "stop_start" }).linodeRestartMode).toBe("stop_start");
+  });
   it("rejects values outside the shared rotation policy bounds", () => {
     expect(() => parseRotationPolicyInput({ revision: 2, enabled: true, maxAttempts: 3, minIntervalSeconds: 59, cloudWaitSeconds: 120, candidateWindowSeconds: 180 })).toThrow(ZodError);
   });

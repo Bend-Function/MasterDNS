@@ -13,7 +13,7 @@ export type RotationAction =
   | "lightsail.static-ip.allocate" | "lightsail.static-ip.detach" | "lightsail.static-ip.attach" | "lightsail.static-ip.release"
   | "lightsail.ipv6.disable" | "lightsail.ipv6.enable"
   | "azure.public-ip.allocate" | "azure.public-ip.associate" | "azure.public-ip.delete"
-  | "linode.ipv4.allocate" | "linode.instance.reboot" | "linode.ipv4.release";
+  | "linode.ipv4.allocate" | "linode.instance.reboot" | "linode.instance.stop" | "linode.instance.start" | "linode.ipv4.release";
 
 /** Trusted server-side evidence captured while the original allocation belonged to this slot. */
 export type CleanupOwnershipSnapshot = {
@@ -36,6 +36,7 @@ export type RotationStepArguments = {
   /** Trusted receipts from earlier persisted applied steps, in execution order. */
   priorReceipts?: Array<{ action: string; receipt: CloudStepResult }>;
   allowStop?: boolean;
+  linodeRestartMode?: "reboot" | "stop_start";
   /** Set on recovery of a previously dispatched step; never blindly reissue uncertain writes. */
   previousExecution?: boolean;
   failedCandidates?: string[];
@@ -78,7 +79,7 @@ export function makeRotationStep(action: RotationAction, args: RotationStepArgum
   return step;
 }
 
-export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string }): CloudStep[] {
+export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string; linodeRestartMode?: "reboot" | "stop_start" }): CloudStep[] {
   if (slot.service === "azure_vm") return planAzureRotation(slot, inventory, options);
   if (slot.service === "linode") return planLinodeRotation(slot, inventory, options);
   const capability = evaluateCapabilities(slot, inventory);
@@ -117,6 +118,7 @@ export type CleanupPlanOptions = {
   /** Immutable applied allocation receipt for a system-owned cleanup resource. */
   cleanupReceipt?: CloudStepResult;
   allowStop?: boolean;
+  linodeRestartMode?: "reboot" | "stop_start";
 };
 
 export function planCloudRotationCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {

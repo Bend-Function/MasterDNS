@@ -39,8 +39,8 @@ describe("rotation machine overview", () => {
   });
 
   it("only changes enabled and retains the saved policy revision and every tuning parameter", () => {
-    const policy = { ...demoRotationPolicy, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900 };
-    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900 });
+    const policy = { ...demoRotationPolicy, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" as const };
+    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" });
     const rows = [machine()];
     const updated = updateMachinePolicy(rows, { ...policy, enabled: false, revision: policy.revision + 1 });
     expect(updated[0]!.slots[0]!.policy?.enabled).toBe(false);

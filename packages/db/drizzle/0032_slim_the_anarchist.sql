@@ -1,0 +1,2 @@
+ALTER TABLE "rotation_policies" ADD COLUMN "linode_restart_mode" varchar(16) DEFAULT 'reboot' NOT NULL;--> statement-breakpoint
+ALTER TABLE "rotation_policies" ADD CONSTRAINT "rotation_policy_linode_restart_mode" CHECK ("rotation_policies"."linode_restart_mode" in ('reboot','stop_start'));

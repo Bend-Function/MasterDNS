@@ -49,7 +49,7 @@ export function familyControl(row: RotationMachine, family: "4" | "6") {
 }
 
 export function policyToggleInput(policy: RotationPolicy, enabled: boolean): RotationPolicyInput {
-  return { enabled, revision: policy.revision, maxAttempts: policy.maxAttempts, minIntervalSeconds: policy.minIntervalSeconds, cloudWaitSeconds: policy.cloudWaitSeconds, candidateWindowSeconds: policy.candidateWindowSeconds };
+  return { enabled, revision: policy.revision, maxAttempts: policy.maxAttempts, minIntervalSeconds: policy.minIntervalSeconds, cloudWaitSeconds: policy.cloudWaitSeconds, candidateWindowSeconds: policy.candidateWindowSeconds, linodeRestartMode: policy.linodeRestartMode };
 }
 
 export function updateMachinePolicy(rows: RotationMachine[], policy: RotationPolicy): RotationMachine[] {

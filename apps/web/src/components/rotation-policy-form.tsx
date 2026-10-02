@@ -14,14 +14,15 @@ export function RotationPolicyForm({ formId, slot, authorization, policy, blockR
   const [minIntervalSeconds, setMinIntervalSeconds] = useState(policy.minIntervalSeconds);
   const [cloudWaitSeconds, setCloudWaitSeconds] = useState(policy.cloudWaitSeconds);
   const [candidateWindowSeconds, setCandidateWindowSeconds] = useState(policy.candidateWindowSeconds);
+  const [linodeRestartMode, setLinodeRestartMode] = useState(policy.linodeRestartMode);
   const [error, setError] = useState<string | null>(null);
   const block = blockReason ?? cloudRotationBlock(slot, authorization);
-  const downtime = rotationDowntimeNotice(slot, true);
+  const downtime = rotationDowntimeNotice(slot, true, linodeRestartMode);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setError(null);
     if (enabled && block) { setError(block); return; }
-    try { await onSubmit(parseRotationPolicyInput({ revision: policy.revision, enabled, maxAttempts, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds })); }
+    try { await onSubmit(parseRotationPolicyInput({ revision: policy.revision, enabled, maxAttempts, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds, linodeRestartMode })); }
     catch (value) { setError(value instanceof Error ? value.message : "轮换策略保存失败"); }
   };
 
@@ -30,6 +31,7 @@ export function RotationPolicyForm({ formId, slot, authorization, policy, blockR
     <div className="switch-row policy-enable"><span><strong>故障自动轮换 IPv{slot.slot.family}</strong><small>仅在确认故障后启动 · 与定时开关独立</small></span><Switch checked={enabled} label={`故障自动轮换 IPv${slot.slot.family}`} disabled={!enabled && block !== null} onCheckedChange={setEnabled} /></div>
     {block && <div className="inline-warning">{block}</div>}
     {downtime && <div className="inline-warning">{downtime}</div>}
+    {slot.ref?.service === "linode" && <Field label="换址时实例重启方式"><select value={linodeRestartMode} onChange={event => setLinodeRestartMode(event.target.value as RotationPolicyInput["linodeRestartMode"])}><option value="reboot">重启</option><option value="stop_start">关机后开机</option></select></Field>}
     <p>新地址接管并完成 DNS 切换后，系统会等待旧记录缓存期限结束，自动释放可释放的旧云端 IP，不作为备用保留。</p>
     <div className="field-grid"><Field label="每个任务最多换址"><input type="number" min={1} max={20} value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} required /></Field><Field label="尝试最小间隔（秒）"><input type="number" min={60} max={86400} value={minIntervalSeconds} onChange={(event) => setMinIntervalSeconds(Number(event.target.value))} required /></Field><Field label="等待云端生效（秒）"><input type="number" min={10} max={3600} value={cloudWaitSeconds} onChange={(event) => setCloudWaitSeconds(Number(event.target.value))} required /></Field><Field label="候选复测窗口（秒）"><input type="number" min={15} max={86400} value={candidateWindowSeconds} onChange={(event) => setCandidateWindowSeconds(Number(event.target.value))} required /></Field></div>
     <p className="muted">次数耗尽后保持锁存；重启、持续失败和恢复执行不会补回本次任务预算。</p>

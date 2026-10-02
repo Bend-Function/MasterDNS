@@ -181,9 +181,14 @@ function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuth
 
 const authorizationFields = ["managed", "allowIpv4Rotation", "allowIpv6Rotation", "allowStopStart", "allowDelete", "allowReleaseAddress"] as const;
 
-export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean): string | null {
+export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean, linodeRestartMode: "reboot" | "stop_start" = "reboot"): string | null {
   if (!slot.capability?.requiresStop) return null;
-  if (slot.ref?.service === "linode") return `Linode 换址将重启实例，使 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? "已授权释放用户原有 IPv4，DNS 发布并满足清理条件后，清理还会再次重启实例。" : "未授权释放用户原有 IPv4。"}此释放开关仅控制用户原有地址；系统创建的地址（包括失败候选和后续换下的旧地址）仍可自动清理，在停机授权有效时可能导致多次额外重启和服务中断。额外 IPv4 需获批配额并产生费用。`;
+  if (slot.ref?.service === "linode") {
+    const action = linodeRestartMode === "stop_start" ? "先关机再开机" : "重启";
+    const cleanupAction = linodeRestartMode === "stop_start" ? "再次关机，然后开机" : "再次重启";
+    const extraAction = linodeRestartMode === "stop_start" ? "关机与开机" : "重启";
+    return `Linode 换址将使实例${action}，由 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? `已授权释放用户原有 IPv4，DNS 发布并满足清理条件后，清理还会使实例${cleanupAction}。` : "未授权释放用户原有 IPv4。"}此释放开关仅控制用户原有地址；系统创建的地址（包括失败候选和后续换下的旧地址）仍可自动清理，在停机授权有效时可能导致多次额外${extraAction}和服务中断。额外 IPv4 需获批配额并产生费用。`;
+  }
   return "该槽位换址需要停止并启动或重启实例，期间服务会中断。";
 }
 

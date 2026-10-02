@@ -2,7 +2,7 @@ import { demoNow } from "./demo";
 import { demoCloudTarget } from "./cloud-demo";
 import type { RotationDetail, RotationIncident, RotationPolicy } from "./rotation-types";
 
-export const demoRotationPolicy: RotationPolicy = { slotId: "slot-v4", enabled: true, revision: 2, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, updatedAt: demoNow };
+export const demoRotationPolicy: RotationPolicy = { slotId: "slot-v4", enabled: true, revision: 2, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot", updatedAt: demoNow };
 export const demoRotations: RotationIncident[] = [{ cloudTarget: { ...demoCloudTarget, slot: { ...demoCloudTarget.slot, candidateVersion: 3 }, candidateAddress: { id: "address-new", address: "203.0.113.44" } }, id: "rotation-01", ownerUserId: "user-1", slotId: "slot-v4", family: "4", sourceEventId: "scheduled-2-preview", trigger: "scheduled", status: "active", phase: "candidate", currentSegmentId: "segment-1", currentAttemptId: "attempt-1", addressVersion: 2, nextAttemptAt: demoNow, nextRunAt: demoNow, candidateDeadline: demoNow, errorCode: null, createdAt: demoNow, updatedAt: demoNow, completedAt: null }];
 export const demoRotationDetail: RotationDetail = {
   incident: demoRotations[0]!, instanceId: "cloud-instance-1",

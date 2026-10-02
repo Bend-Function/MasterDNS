@@ -14,6 +14,7 @@ export const rotationPolicySchema = z.object({
   minIntervalSeconds: z.number().int().min(60).max(86400).default(60),
   cloudWaitSeconds: z.number().int().min(10).max(3600).default(120),
   candidateWindowSeconds: z.number().int().min(15).max(86400).default(180),
+  linodeRestartMode: z.enum(["reboot", "stop_start"]).default("reboot"),
 }).strict();
 export const rotationStartSchema = z.object({ slotId: z.uuid() }).strict();
 export type RotationPolicyInput = z.infer<typeof rotationPolicySchema>;

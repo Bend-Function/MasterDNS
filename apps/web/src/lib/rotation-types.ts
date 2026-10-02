@@ -8,6 +8,7 @@ export type RotationPolicy = {
   minIntervalSeconds: number;
   cloudWaitSeconds: number;
   candidateWindowSeconds: number;
+  linodeRestartMode: "reboot" | "stop_start";
   updatedAt?: string;
 };
 
