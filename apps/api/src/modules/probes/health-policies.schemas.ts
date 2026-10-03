@@ -13,6 +13,7 @@ export const healthPolicyInputSchema = z.object({
   if (!!p.slotId === !!p.endpointId) c.addIssue({ code: "custom", message: "Choose exactly one target" });
   if (p.slotId && p.mode === "local") c.addIssue({ code: "custom", path: ["mode"], message: "Cloud slots require external probe authority" });
   if (p.mode !== "local" && !p.groupId) c.addIssue({ code: "custom", path: ["groupId"], message: "External votes require a probe group" });
-  if (p.checkIntervalSeconds < p.executionWindowSeconds || p.resultExpirySeconds < p.executionWindowSeconds) c.addIssue({ code: "custom", message: "Interval and expiry must cover the execution window" });
+  if (p.checkIntervalSeconds < p.executionWindowSeconds) c.addIssue({ code: "custom", message: "Interval must cover the execution window" });
+  if (p.resultExpirySeconds < p.checkIntervalSeconds + p.executionWindowSeconds) c.addIssue({ code: "custom", message: "Expiry must cover the check interval plus the execution window" });
 });
 export const slotHealthConfigSchema = z.object({ config: healthCheckConfigSchema, expectedRevision: z.number().int().min(1).optional() }).strict();

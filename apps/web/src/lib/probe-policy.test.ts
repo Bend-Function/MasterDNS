@@ -80,8 +80,31 @@ describe("validateProbePolicyDraft", () => {
     });
 
     expect(errors).toContain("interval_before_window");
-    expect(errors).toContain("expiry_before_window");
+    expect(errors).toContain("expiry_before_coverage");
     expect(errors).toContain("timeout_exceeds_window");
+  });
+
+  it("rejects expiry that ends before the next round completes", () => {
+    const errors = validateProbePolicyDraft({
+      cohortSize: 3,
+      mode: "external",
+      consensus: { mode: "majority", minimumValid: 3 },
+      checkIntervalSeconds: 60,
+      executionWindowSeconds: 10,
+      resultExpirySeconds: 15,
+      timeoutMs: 3_000,
+    });
+
+    expect(errors).toContain("expiry_before_coverage");
+    expect(validateProbePolicyDraft({
+      cohortSize: 3,
+      mode: "external",
+      consensus: { mode: "majority", minimumValid: 3 },
+      checkIntervalSeconds: 60,
+      executionWindowSeconds: 10,
+      resultExpirySeconds: 70,
+      timeoutMs: 3_000,
+    })).toEqual([]);
   });
 
   it("requires an external vote for a mixed cloud slot cohort", () => {

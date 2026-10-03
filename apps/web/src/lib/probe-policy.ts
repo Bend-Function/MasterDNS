@@ -44,7 +44,7 @@ export type ProbePolicyDraft = {
 export function validateProbePolicyDraft(input: ProbePolicyDraft): string[] {
   const errors: string[] = [];
   if (input.checkIntervalSeconds < input.executionWindowSeconds) errors.push("interval_before_window");
-  if (input.resultExpirySeconds < input.executionWindowSeconds) errors.push("expiry_before_window");
+  if (input.resultExpirySeconds < input.checkIntervalSeconds + input.executionWindowSeconds) errors.push("expiry_before_coverage");
   if (input.timeoutMs + 1_000 > input.executionWindowSeconds * 1_000 && input.mode !== "local") errors.push("timeout_exceeds_window");
   if (input.consensus.minimumValid > input.cohortSize) errors.push("minimum_valid_exceeds_cohort");
   if (input.consensus.mode === "at_least" && (input.consensus.failureVotes ?? 1) > input.cohortSize) errors.push("failure_votes_exceed_cohort");
