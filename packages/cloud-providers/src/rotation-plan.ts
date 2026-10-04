@@ -13,7 +13,14 @@ export type RotationAction =
   | "lightsail.static-ip.allocate" | "lightsail.static-ip.detach" | "lightsail.static-ip.attach" | "lightsail.static-ip.release"
   | "lightsail.ipv6.disable" | "lightsail.ipv6.enable"
   | "azure.public-ip.allocate" | "azure.public-ip.associate" | "azure.public-ip.delete"
-  | "linode.ipv4.allocate" | "linode.instance.reboot" | "linode.instance.stop" | "linode.instance.start" | "linode.ipv4.release";
+  | "linode.ipv4.allocate" | "linode.instance.reboot" | "linode.instance.stop" | "linode.instance.start" | "linode.ipv4.release"
+  | "linode.swap.allocate" | "linode.ipv4.swap" | "linode.swap.delete";
+
+export type LinodeSwapOptions = {
+  linodeIpv4Strategy?: "additional_ipv4" | "instance_swap";
+  linodeSwapPlan?: string;
+  allowTemporaryInstance?: boolean;
+};
 
 /** Trusted server-side evidence captured while the original allocation belonged to this slot. */
 export type CleanupOwnershipSnapshot = {
@@ -25,7 +32,7 @@ export type CleanupOwnershipSnapshot = {
   resourceId?: string;
 };
 
-export type RotationStepArguments = {
+export type RotationStepArguments = LinodeSwapOptions & {
   slot: SlotRef;
   attemptId: string;
   before: CloudInventory;
@@ -51,6 +58,8 @@ export type RotationStepArguments = {
   publishedAttemptId?: string;
   /** Immutable applied allocation receipt for a system-owned cleanup resource. */
   cleanupReceipt?: CloudStepResult;
+  /** Applied IP swap ownership proof for the exact temporary instance being deleted. */
+  linodeSwapReceipt?: CloudStepResult;
 };
 
 export function rotationArguments(step: CloudStep): RotationStepArguments {
@@ -79,7 +88,7 @@ export function makeRotationStep(action: RotationAction, args: RotationStepArgum
   return step;
 }
 
-export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string; linodeRestartMode?: "reboot" | "stop_start" }): CloudStep[] {
+export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, options: LinodeSwapOptions & { allowStop: boolean; attemptId: string; linodeRestartMode?: "reboot" | "stop_start" }): CloudStep[] {
   if (slot.service === "azure_vm") return planAzureRotation(slot, inventory, options);
   if (slot.service === "linode") return planLinodeRotation(slot, inventory, options);
   const capability = evaluateCapabilities(slot, inventory);
@@ -105,7 +114,7 @@ export function planCloudRotation(slot: SlotRef, inventory: CloudInventory, opti
 }
 
 /** Build only after DNS publication, fresh release authorization and trusted ownership evidence. */
-export type CleanupPlanOptions = {
+export type CleanupPlanOptions = LinodeSwapOptions & {
   attemptId: string;
   releaseAuthorized: boolean;
   publishedAddress: string;
@@ -117,6 +126,7 @@ export type CleanupPlanOptions = {
   publishedAttemptId?: string;
   /** Immutable applied allocation receipt for a system-owned cleanup resource. */
   cleanupReceipt?: CloudStepResult;
+  linodeSwapReceipt?: CloudStepResult;
   allowStop?: boolean;
   linodeRestartMode?: "reboot" | "stop_start";
 };

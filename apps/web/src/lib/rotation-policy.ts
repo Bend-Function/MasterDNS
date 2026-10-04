@@ -1,4 +1,6 @@
 import { rotationPolicySchema, type RotationPolicyInput } from "@masterdns/contracts/rotation";
+import type { RotationPolicy } from "./rotation-types";
+import { demoRotationPolicy } from "./rotation-demo";
 
 export type RotationAuthorizationCheck = {
   managed: boolean;
@@ -16,6 +18,20 @@ export function validateRotationPolicy(input: RotationAuthorizationCheck): strin
   return errors;
 }
 
-export function parseRotationPolicyInput(input: unknown): RotationPolicyInput {
-  return rotationPolicySchema.parse(input);
+export function parseRotationPolicyInput(input: unknown, context?: { savedPolicy: RotationPolicy; blockReason: string | null }): RotationPolicyInput {
+  const parsed = rotationPolicySchema.parse(input);
+  const revokesTemporaryInstance = context?.savedPolicy.enabled && context.savedPolicy.linodeAllowTemporaryInstance && !parsed.linodeAllowTemporaryInstance;
+  if (parsed.enabled && context?.blockReason && !revokesTemporaryInstance) throw new Error(context.blockReason);
+  return parsed;
+}
+
+export function linodeTemporaryInstanceBlock(policy: Pick<RotationPolicy, "linodeIpv4Strategy" | "linodeAllowTemporaryInstance">): string | null {
+  return policy.linodeIpv4Strategy === "instance_swap" && !policy.linodeAllowTemporaryInstance ? "请先授权创建和删除临时实例，并保存换址策略" : null;
+}
+
+export async function resolveManualRotationPolicy(service: string, slotId: string, savedPolicy: RotationPolicy | undefined, preview: boolean, request: (path: string) => Promise<RotationPolicy>): Promise<RotationPolicy | null> {
+  if (service !== "linode") return null;
+  if (savedPolicy) return savedPolicy;
+  if (preview) return { ...demoRotationPolicy, slotId };
+  return request(`/v1/rotation-policies?slotId=${encodeURIComponent(slotId)}`);
 }

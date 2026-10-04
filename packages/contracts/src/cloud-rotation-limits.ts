@@ -24,7 +24,7 @@ const actions: Record<CloudService, Record<string, string>> = {
     "lightsail.instance.start": "StartInstance", "lightsail.instance.stop": "StopInstance", "lightsail.instance.delete": "DeleteInstance",
   },
   azure_vm: { "azure.public-ip.allocate": "PublicIPAddresses.CreateOrUpdate", "azure.public-ip.associate": "NetworkInterfaces.CreateOrUpdate", "azure.public-ip.delete": "PublicIPAddresses.Delete", "azure_vm.instance.start": "VirtualMachines.Start", "azure_vm.instance.stop": "VirtualMachines.Deallocate", "azure_vm.instance.delete": "VirtualMachines.Delete" },
-  linode: { "linode.ipv4.allocate": "InstanceIP.Allocate", "linode.instance.reboot": "Instance.Reboot", "linode.ipv4.release": "InstanceIP.Delete", "linode.instance.start": "Instance.Boot", "linode.instance.stop": "Instance.Shutdown", "linode.instance.delete": "Instance.Delete" },
+  linode: { "linode.ipv4.allocate": "InstanceIP.Allocate", "linode.instance.reboot": "Instance.Reboot", "linode.ipv4.release": "InstanceIP.Delete", "linode.instance.start": "Instance.Boot", "linode.instance.stop": "Instance.Shutdown", "linode.instance.delete": "Instance.Delete", "linode.swap.allocate": "Instance.Create", "linode.ipv4.swap": "IP.Assign", "linode.swap.delete": "Instance.Delete" },
 };
 export function cloudRotationOperation(service: CloudService, action: string): string {
   const operation = Object.hasOwn(actions[service] ?? {}, action) ? actions[service][action] : undefined;

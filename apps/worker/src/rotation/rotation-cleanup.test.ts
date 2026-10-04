@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
 import { terminateRotationIncident } from "@masterdns/db";
@@ -91,6 +91,136 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
   const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => adapter } as never);
   return { ...f, resource: resource!, state, cleanup, incident: incident! };
 }
+
+let linodeCleanupAddress = 100;
+async function linodeSwapCleanupFixture() {
+  const f = await cleanupFixture("user", "4", `203.0.113.${++linodeCleanupAddress}`);
+  const externalAccountId = randomUUID();
+  const physicalKey = JSON.stringify(["linode", externalAccountId, "linode", "us-east", "42"]);
+  const helperKey = JSON.stringify(["linode", externalAccountId, "linode", "us-east", "99"]);
+  await f.d.update(db.cloudAccounts).set({ provider: "linode", externalAccountId }).where(eq(db.cloudAccounts.id, f.account.id));
+  await f.d.update(db.cloudInstances).set({ service: "linode", region: "us-east", externalId: "42" }).where(eq(db.cloudInstances.id, f.instance.id));
+  await f.d.update(db.cloudInterfaces).set({ externalId: "public" }).where(eq(db.cloudInterfaces.id, f.slot.interfaceId));
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  await f.d.update(db.instanceAuthorizations).set({ allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await f.d.update(db.rotationPolicies).set({ enabled: false, linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: true }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.d.update(db.rotationIncidents).set({ physicalKey, trigger: "manual", releaseOldAddress: true, healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationPublications).set({ incidentId: f.incident.id }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.d.delete(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  await f.d.delete(db.addressHealthPolicies).where(eq(db.addressHealthPolicies.slotId, f.slot.id));
+  await f.d.delete(db.healthCheckConfigs).where(eq(db.healthCheckConfigs.id, f.policy.configId));
+  const live: CloudInventory = f.live;
+  live.ref = { accountId: f.account.id, service: "linode", region: "us-east", instanceId: "42" };
+  live.interfaces[0]!.id = "public";
+  live.interfaces[0]!.addresses = [{ address: f.address.address, family: 4, primary: true, allocationId: f.address.address, resourceId: `/linode/instances/42/ips/${f.address.address}` }];
+  live.metadata = { interfaceGeneration: "legacy_config", configCount: 1, configId: 7, networkHelper: true, runLevel: "default", simplePublicInterface: true, advancedNetworking: false, eventWatermark: 10, externalAccountId, authenticatedUsername: "test", permissionScopes: ["*"], instanceCreated: "2025-01-01T00:00:00Z", reservedIpv4Count: 0 };
+  const before = structuredClone(live);
+  before.interfaces[0]!.addresses = [{ address: f.resource.address, family: 4, primary: true, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}` }];
+  const temporaryInstance = { id: "99", label: `masterdns-swap-${createHash("sha256").update(JSON.stringify([f.account.id, "42", f.resource.attemptId])).digest("hex").slice(0, 32)}`, created: "2026-10-04T00:00:00Z", region: "us-east", attemptId: f.resource.attemptId, targetInstanceId: "42", originalAddress: f.resource.address, candidateAddress: f.address.address, type: "g6-nanode-1", accountId: f.account.id, externalAccountId };
+  const receipt = { candidateAddress: f.address.address, allocationId: f.address.address, resourceId: `/linode/instances/42/ips/${f.address.address}`, after: { externalAccountId, instanceId: "42", region: "us-east", configId: 7, instanceCreated: "2025-01-01T00:00:00Z", attemptId: f.resource.attemptId, swapVerified: true, temporaryInstance } };
+  const slot = { ...before.ref, interfaceId: "public", slotId: f.slot.id, address: f.resource.address, family: 4 };
+  const snapshot = { slot, inventory: before, ownership: before.interfaces[0]!.addresses[0], linodeSwapReceipt: receipt };
+  await f.d.update(db.rotationAttempts).set({ beforeInventory: before }).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.update(db.rotationResources).set({ snapshot, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}`, attached: false }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.d.insert(db.rotationLeases).values({ physicalKey: helperKey, incidentId: f.incident.id });
+  const swap = { writes: [] as Array<Parameters<import("@masterdns/cloud-providers").CloudAdapter["execute"]>[0]>, observations: 0, lost: false, pending: false };
+  const deleteReceipt = { ...receipt, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}` };
+  const adapter = {
+    inspect: async () => f.live,
+    execute: async (step: Parameters<import("@masterdns/cloud-providers").CloudAdapter["execute"]>[0]) => {
+      swap.writes.push(step);
+      if (swap.lost) throw new CloudError("temporary_cloud_error", true);
+      return deleteReceipt;
+    },
+    observeDetails: async () => { swap.observations++; return { ...deleteReceipt, status: swap.pending ? "pending" : "applied" }; },
+  };
+  const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => adapter } as never);
+  return { ...f, cleanup, swap, receipt, snapshot, before, helperKey, physicalKey, adapter };
+}
+
+it("deletes the saved temporary Linode only after DNS publication and TTL grace, then releases its reservation after readback", async () => {
+  const f = await linodeSwapCleanupFixture();
+  await f.d.update(db.rotationPublications).set({ status: "pending", appliedAt: null }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toEqual([]);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupError: "cleanup_publication_pending" });
+  await f.d.update(db.rotationPublications).set({ status: "applied", appliedAt: new Date() }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(Date.now() + 60000) }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date(Date.now() + 120000));
+  expect(f.swap.writes).toEqual([]);
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toMatchObject([{ action: "linode.swap.delete", arguments: { linodeSwapReceipt: { after: { temporaryInstance: { id: "99", targetInstanceId: "42" } } }, publishedAddress: f.address.address, allowTemporaryInstance: true } }]);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: f.swap.writes[0]!.id });
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("pending");
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("released");
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: null, unresolvedStepId: null });
+  await f.cleanup.complete(f.incident.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete" });
+});
+
+it("retains the temporary Linode when cleanup authorization is revoked", async () => {
+  const f = await linodeSwapCleanupFixture();
+  await f.d.update(db.rotationPolicies).set({ linodeAllowTemporaryInstance: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toEqual([]);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("failed");
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.helperKey)))[0]!.incidentId).toBe(f.incident.id);
+});
+
+it("observes a lost temporary Linode delete response after grant revocation without deleting twice", async () => {
+  const f = await linodeSwapCleanupFixture();
+  f.swap.lost = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.d.update(db.rotationPolicies).set({ linodeAllowTemporaryInstance: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toHaveLength(1);
+  expect(f.swap.observations).toBe(1);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("released");
+});
+
+it("retains both temporary Linode delete fences after termination and late readback until operator resolution", async () => {
+  const f = await linodeSwapCleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  const stepId = f.swap.writes[0]!.id;
+  await f.d.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.account.ownerUserId));
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: stepId });
+  const observed = await f.adapter.observeDetails();
+  await (f.cleanup as any).receipt(f.resource, stepId, observed, true);
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: stepId });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.physicalKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: stepId });
+  const [helper] = await f.d.insert(db.cloudInstances).values({ accountId: f.account.id, service: "linode", region: "us-east", externalId: "99", metadata: { present: true }, scanGeneration: 1 }).returning();
+  await f.d.insert(db.instanceAuthorizations).values({ instanceId: helper!.id, managed: true, allowStopStart: true, allowDelete: true });
+  expect(await f.d.transaction(async tx => db.lifecycleAuthorizationError(await db.lockCloudLifecycleContext(tx, helper!.id), "delete"))).toBe("rotation_in_progress");
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, stepId)))[0]).toMatchObject({ receipt: { after: { temporaryInstance: { id: "99" } } } });
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("retained");
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+});
+
+it("cleans a previous candidate through the later original swap receipt so a second attempt selects its own helper", async () => {
+  const f = await linodeSwapCleanupFixture();
+  const earlierAttemptId = randomUUID();
+  await f.d.update(db.rotationAttempts).set({ sequence: 2 }).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.insert(db.rotationAttempts).values({ id: earlierAttemptId, incidentId: f.incident.id, segmentId: f.incident.currentSegmentId, sequence: 1, beforeInventory: f.before });
+  const earlierHelper = { ...f.receipt.after.temporaryInstance, id: "98", attemptId: earlierAttemptId, originalAddress: "203.0.113.1", candidateAddress: f.resource.address,
+    label: `masterdns-swap-${createHash("sha256").update(JSON.stringify([f.account.id, "42", earlierAttemptId])).digest("hex").slice(0, 32)}` };
+  const [alias] = await f.d.insert(db.rotationResources).values({ incidentId: f.incident.id, attemptId: earlierAttemptId, address: f.resource.address, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}`, origin: "system", ownershipAttemptId: earlierAttemptId, role: "candidate", attached: false, cleanupStatus: "pending", cleanupDueAt: new Date(0), cleanupAddressVersion: 1,
+    createdAt: new Date(Date.now() - 60000), snapshot: { slot: f.snapshot.slot, receipt: { candidateAddress: f.resource.address, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}`, after: { ...f.receipt.after, attemptId: earlierAttemptId, temporaryInstance: earlierHelper } } } }).returning();
+  await f.d.update(db.rotationResources).set({ origin: "system", ownershipAttemptId: earlierAttemptId }).where(eq(db.rotationResources.id, f.resource.id));
+  await f.cleanup.run(alias!.id, new Date());
+  expect(f.swap.writes).toEqual([]);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, alias!.id)))[0]!.snapshot.cleanupCanonicalResourceId).toBe(f.resource.id);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.swap.writes).toMatchObject([{ action: "linode.swap.delete", arguments: { linodeSwapReceipt: { after: { temporaryInstance: { id: "99" } } } } }]);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, alias!.id)))[0]!.cleanupStatus).toBe("released");
+  expect(f.swap.writes).toHaveLength(1);
+});
+
 it("retains original user addresses without independent release authorization", async () => {
   const f = await cleanupFixture("user");
   await f.cleanup.run(f.resource.id, new Date());

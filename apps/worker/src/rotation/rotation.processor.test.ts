@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
@@ -298,6 +298,186 @@ it.each(["reboot", "stop_start"] as const)("manual Linode observes every %s step
   expect(f.state.observations).toHaveLength(steps.length);
   expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ maxAttempts: 1, attemptsUsed: 1 }]);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ trigger: "manual", phase: "publish", status: "active" });
+});
+
+async function linodeSwapFixture(linodeRestartMode: "reboot" | "stop_start" = "reboot") {
+  const f = await manualFixture();
+  const physicalKey = JSON.stringify(["linode", f.account.externalAccountId, "linode", "us-east", "42"]);
+  const helperKey = JSON.stringify(["linode", f.account.externalAccountId, "linode", "us-east", "99"]);
+  await connection.db.update(cloudAccounts).set({ provider: "linode" }).where(eq(cloudAccounts.id, f.account.id));
+  await connection.db.update(cloudInstances).set({ service: "linode", region: "us-east", externalId: "42" }).where(eq(cloudInstances.id, f.instance.id));
+  await connection.db.update(cloudInterfaces).set({ externalId: "public" }).where(eq(cloudInterfaces.id, f.iface.id));
+  await connection.db.insert(cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  await connection.db.update(instanceAuthorizations).set({ allowStopStart: true }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await connection.db.update(rotationPolicies).set({ linodeRestartMode, linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: true }).where(eq(rotationPolicies.slotId, f.slot.id));
+  await connection.db.update(rotationIncidents).set({ physicalKey }).where(eq(rotationIncidents.id, f.incident.id));
+  f.inventory.ref = { ...f.inventory.ref, service: "linode", region: "us-east", instanceId: "42" };
+  f.inventory.interfaces[0]!.id = "public";
+  f.inventory.interfaces[0]!.addresses = [{ address: f.address.address, family: 4, primary: true, allocationId: f.address.address, resourceId: `/linode/instances/42/ips/${f.address.address}` }];
+  f.inventory.metadata = { interfaceGeneration: "legacy_config", configCount: 1, configId: 7, networkHelper: true, runLevel: "default", simplePublicInterface: true, advancedNetworking: false, eventWatermark: 10, externalAccountId: f.account.externalAccountId, authenticatedUsername: "test", permissionScopes: ["*"], instanceCreated: "2025-01-01T00:00:00Z", reservedIpv4Count: 0 };
+  const swap = { writes: [] as string[], observations: [] as string[], pendingAction: undefined as string | undefined, lostCreate: false, lostSwap: false };
+  const result = (step: Parameters<CloudAdapter["execute"]>[0], candidate: boolean, verified: boolean): CloudStepResult => {
+    const attemptId = String(step.arguments.attemptId);
+    return {
+      remoteId: "99",
+      ...(candidate ? { candidateAddress: "198.51.100.88", allocationId: "198.51.100.88", resourceId: "/linode/instances/42/ips/198.51.100.88" } : {}),
+      after: { externalAccountId: f.account.externalAccountId, instanceId: "42", region: "us-east", configId: 7, instanceCreated: "2025-01-01T00:00:00Z", attemptId,
+        ...(verified ? { swapVerified: true } : {}),
+        temporaryInstance: { id: "99", label: `masterdns-swap-${createHash("sha256").update(JSON.stringify([f.account.id, "42", attemptId])).digest("hex").slice(0, 32)}`, created: "2026-10-04T00:00:00Z", region: "us-east", attemptId, targetInstanceId: "42", originalAddress: f.address.address, ...(candidate ? { candidateAddress: "198.51.100.88" } : {}), type: "g6-nanode-1", accountId: f.account.id, externalAccountId: f.account.externalAccountId },
+      },
+    };
+  };
+  f.adapter.execute = async step => {
+    swap.writes.push(step.action);
+    if (step.action === "linode.swap.allocate" && swap.lostCreate) throw new CloudError("temporary_cloud_error", true);
+    if (step.action === "linode.ipv4.swap") {
+      f.inventory.interfaces[0]!.addresses = [{ address: "198.51.100.88", family: 4, primary: true, allocationId: "198.51.100.88", resourceId: "/linode/instances/42/ips/198.51.100.88" }];
+      if (swap.lostSwap) throw new CloudError("temporary_cloud_error", true);
+    }
+    return result(step, step.action !== "linode.swap.allocate", step.action.startsWith("linode.instance."));
+  };
+  f.adapter.observeDetails = async step => {
+    swap.observations.push(step.action);
+    if (step.action === "linode.swap.allocate" && !step.arguments.receipt) return { status: "ambiguous" };
+    const status = swap.pendingAction === step.action ? "pending" as const : "applied" as const;
+    return { ...result(step, true, step.action !== "linode.swap.allocate" && status === "applied"), status };
+  };
+  const steps = async () => {
+    const [attempt] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+    return attempt ? connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt.id)).orderBy(rotationSteps.sequence) : [];
+  };
+  return { ...f, swap, steps, helperKey, physicalKey };
+}
+
+it.each([
+  ["reboot", ["linode.swap.allocate", "linode.ipv4.swap", "linode.instance.reboot"]],
+  ["stop_start", ["linode.swap.allocate", "linode.ipv4.swap", "linode.instance.stop", "linode.instance.start"]],
+] as const)("manual Linode instance swap observes the %s plan before publishing with automatic rotation disabled", async (mode, actions) => {
+  const f = await linodeSwapFixture(mode);
+  await drive(f, 12);
+  expect(f.swap.writes).toEqual(actions);
+  expect(f.swap.observations).toEqual(actions);
+  expect((await f.steps()).every(step => step.status === "applied")).toBe(true);
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: null });
+  expect(await connection.db.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, f.slot.id))).toEqual([]);
+  expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]).toMatchObject({ enabled: false });
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toMatchObject([{ status: "pending", addressVersion: 2 }]);
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ attemptsUsed: 1, maxAttempts: 1 }]);
+  const [original] = await connection.db.select().from(rotationResources).where(and(eq(rotationResources.incidentId, f.incident.id), eq(rotationResources.role, "original")));
+  expect(original).toMatchObject({ address: f.address.address, attached: false, snapshot: { linodeSwapReceipt: { after: { swapVerified: true, temporaryInstance: { id: "99", targetInstanceId: "42" } } } } });
+  const publication = new RotationPublicationService({ db: connection.db } as never, f.runtime as never);
+  await publication.publish(f.incident.id);
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]).toMatchObject({ currentVersion: 2, candidateAddressId: null });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "cleanup", status: "active" });
+});
+
+it("persists and reserves a temporary Linode before its IPv4 is observed", async () => {
+  const f = await linodeSwapFixture();
+  await drive(f, 2);
+  const [allocation] = await f.steps();
+  expect(allocation).toMatchObject({ status: "pending", receipt: { remoteId: "99", after: { temporaryInstance: { id: "99" } } } });
+  expect(allocation!.receipt).not.toHaveProperty("candidateAddress");
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id });
+  expect(await connection.db.select().from(rotationResources).where(and(eq(rotationResources.incidentId, f.incident.id), eq(rotationResources.role, "candidate")))).toEqual([]);
+  await drive(f, 1);
+  expect((await f.steps())[0]).toMatchObject({ status: "applied", receipt: { candidateAddress: "198.51.100.88" } });
+  expect(f.swap.writes).toEqual(["linode.swap.allocate"]);
+});
+
+it("waits for observed two-way swap before any power operation or publication", async () => {
+  const f = await linodeSwapFixture();
+  f.swap.pendingAction = "linode.ipv4.swap";
+  await drive(f, 8);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate", "linode.ipv4.swap"]);
+  expect((await f.steps())[1]).toMatchObject({ status: "pending" });
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toEqual([]);
+  expect((await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+  f.swap.pendingAction = undefined;
+  await drive(f, 6);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate", "linode.ipv4.swap", "linode.instance.reboot"]);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "publish" });
+});
+
+it.each([0, 1, 3, 5])("requires the temporary-instance grant before the next Linode mutation after %s turns", async turns => {
+  const f = await linodeSwapFixture();
+  await drive(f, turns);
+  const before = [...f.swap.writes];
+  await connection.db.update(rotationPolicies).set({ linodeAllowTemporaryInstance: false }).where(eq(rotationPolicies.slotId, f.slot.id));
+  await drive(f, 5);
+  expect(f.swap.writes).toEqual(before);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]!.status).toBe("paused");
+  expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.incidentId, f.incident.id))).toEqual([]);
+});
+
+it("does not recreate a Linode when its create response is lost", async () => {
+  const f = await linodeSwapFixture();
+  f.swap.lostCreate = true;
+  await drive(f, 10);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate"]);
+  expect((await f.steps())[0]).toMatchObject({ status: "ambiguous", receipt: { status: "ambiguous" } });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", errorCode: "resource_ownership_ambiguous" });
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
+});
+
+it("recovers a lost swap response by observation without swapping twice", async () => {
+  const f = await linodeSwapFixture();
+  f.swap.lostSwap = true;
+  await drive(f, 12);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate", "linode.ipv4.swap", "linode.instance.reboot"]);
+  expect((await f.steps())[1]).toMatchObject({ status: "applied", receipt: { after: { swapVerified: true } } });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "publish" });
+});
+
+it.each(["pause", "terminate"] as const)("retains the paid Linode helper and its proof after %s", async action => {
+  const f = await linodeSwapFixture();
+  await drive(f, 3);
+  if (action === "terminate") await connection.db.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.owner.id));
+  else await f.store.pause(f.incident.id, "operator_review");
+  await drive(f, 6);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate"]);
+  expect((await f.steps())[0]).toMatchObject({ receipt: { after: { temporaryInstance: { id: "99" } } } });
+  const { publicRotationTemporaryInstances } = await import("@masterdns/db");
+  const resources = await connection.db.select().from(rotationResources).where(eq(rotationResources.incidentId, f.incident.id));
+  expect(publicRotationTemporaryInstances(await f.steps(), resources)).toMatchObject([{ id: "99", cleanupStatus: "retained" }]);
+});
+
+it("blocks separate lifecycle writes to a reserved temporary Linode discovered in local inventory", async () => {
+  const f = await linodeSwapFixture();
+  await drive(f, 2);
+  const [helper] = await connection.db.insert(cloudInstances).values({ accountId: f.account.id, service: "linode", region: "us-east", externalId: "99", metadata: { present: true }, scanGeneration: 1 }).returning();
+  await connection.db.insert(instanceAuthorizations).values({ instanceId: helper!.id, managed: true, allowStopStart: true, allowDelete: true });
+  const { lockCloudLifecycleContext, lifecycleAuthorizationError } = await import("@masterdns/db");
+  const errors = await connection.db.transaction(async tx => {
+    const context = await lockCloudLifecycleContext(tx, helper!.id);
+    return ["start", "stop", "delete"].map(action => lifecycleAuthorizationError(context, action as "start" | "stop" | "delete"));
+  });
+  expect(errors).toEqual(["rotation_in_progress", "rotation_in_progress", "rotation_in_progress"]);
+});
+
+it("retains both Linode swap fences after termination and late readback until operator resolution", async () => {
+  const f = await linodeSwapFixture();
+  f.swap.pendingAction = "linode.ipv4.swap";
+  await drive(f, 4);
+  const swapStep = (await f.steps())[1]!;
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: swapStep.id });
+  await connection.db.transaction(tx => terminateRotationIncident(tx, f.incident.id, f.owner.id));
+  const [helper] = await connection.db.insert(cloudInstances).values({ accountId: f.account.id, service: "linode", region: "us-east", externalId: "99", metadata: { present: true }, scanGeneration: 1 }).returning();
+  await connection.db.insert(instanceAuthorizations).values({ instanceId: helper!.id, managed: true, allowStopStart: true, allowDelete: true });
+  const { lockCloudLifecycleContext, lifecycleAuthorizationError } = await import("@masterdns/db");
+  expect(await connection.db.transaction(async tx => lifecycleAuthorizationError(await lockCloudLifecycleContext(tx, helper!.id), "delete"))).toBe("rotation_in_progress");
+  await drive(f, 3);
+  expect(f.swap.writes).toEqual(["linode.swap.allocate", "linode.ipv4.swap"]);
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, f.helperKey)))[0]).toMatchObject({ incidentId: f.incident.id, unresolvedStepId: swapStep.id });
+  f.swap.pendingAction = undefined;
+  const observed = await f.adapter.observeDetails!({ ...swapStep.plan, arguments: { ...swapStep.plan.arguments, receipt: swapStep.receipt, previousExecution: true } });
+  await f.store.saveReceipt(f.incident.id, swapStep.id, observed, true);
+  expect(await connection.db.select().from(rotationLeases).where(inArray(rotationLeases.physicalKey, [f.helperKey, f.physicalKey]))).toMatchObject([
+    { incidentId: f.incident.id, unresolvedStepId: swapStep.id },
+    { incidentId: f.incident.id, unresolvedStepId: swapStep.id },
+  ]);
+  expect((await f.steps())[1]).toMatchObject({ receipt: { after: { temporaryInstance: { id: "99" } } } });
+  expect(await connection.db.transaction(async tx => lifecycleAuthorizationError(await lockCloudLifecycleContext(tx, helper!.id), "delete"))).toBe("rotation_in_progress");
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
 });
 
 it("manual change advances a same-address initial verification placeholder without probes", async () => {

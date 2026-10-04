@@ -106,6 +106,21 @@ it("rejects manual Linode IPv4 without saved downtime permission before creating
   await expect(service.startManual(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409, message: "rotation_stop_start_not_authorized" });
   expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
 });
+it("requires the saved temporary-instance grant for manual Linode swaps", async () => {
+  const f = await linodeManualFixture();
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 0, linodeIpv4Strategy: "instance_swap" }));
+  await expect(service.startManual(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409, message: "rotation_temporary_instance_not_authorized" });
+  expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
+  await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 1, linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: true }));
+  expect(await service.startManual(f.actor, f.slot.id, randomUUID())).toMatchObject({ trigger: "manual", policyRevision: 2 });
+});
+it("can revoke a helper grant even after external health configuration becomes unavailable", async () => {
+  const f = await linodeManualFixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: true, linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: true });
+  const revoked = await service.setPolicy(f.actor, f.slot.id, rotationPolicySchema.parse({ revision: 1, enabled: true, linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: false }));
+  expect(revoked).toMatchObject({ enabled: true, linodeAllowTemporaryInstance: false, revision: 2 });
+  await expect(service.startManual(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409, message: "rotation_temporary_instance_not_authorized" });
+});
 it("admits a same-address initial-verification placeholder without changing its slot state", async () => {
   const f = await fixture();
   await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));

@@ -5,6 +5,8 @@ import type { LinodeCloudAdapter, LinodeIp } from "./linode.js";
 import type { CloudInventory, CloudObservation, CloudStepResult } from "./provider.js";
 import { makeRotationStep, rotationArguments } from "./rotation-plan.js";
 import type { CleanupPlanOptions, RotationStepArguments } from "./rotation-plan.js";
+import type { LinodeSwapOptions } from "./rotation-plan.js";
+import { executeLinodeSwap, observeLinodeSwap, planLinodeSwap, planLinodeSwapCleanup } from "./linode-swap.js";
 
 const actions = new Set(["linode.ipv4.allocate", "linode.instance.reboot", "linode.instance.stop", "linode.instance.start", "linode.ipv4.release"]);
 type LinodeRestartMode = "reboot" | "stop_start";
@@ -16,13 +18,15 @@ function requireCapability(slot: SlotRef, inventory: CloudInventory, allowStop?:
   if (!capability.available) throw new CloudError("rotation_unsupported", false, undefined, capability.reason);
   if (allowStop !== true) throw new CloudError("rotation_unsupported", false, undefined, "linode_reboot_permission_required");
 }
-export function planLinodeRotation(slot: SlotRef, inventory: CloudInventory, options: { allowStop: boolean; attemptId: string; linodeRestartMode?: LinodeRestartMode }): CloudStep[] {
+export function planLinodeRotation(slot: SlotRef, inventory: CloudInventory, options: LinodeSwapOptions & { allowStop: boolean; attemptId: string; linodeRestartMode?: LinodeRestartMode }): CloudStep[] {
+  if (options.linodeIpv4Strategy === "instance_swap") return planLinodeSwap(slot, inventory, options);
   requireCapability(slot, inventory, options.allowStop);
   const args: RotationStepArguments = { slot, before: inventory, phase: "rotation", ...options };
   const steps = ["linode.ipv4.allocate" as const, ...powerActions(options.linodeRestartMode)].map((action, index) => makeRotationStep(action, args, index));
   rotationArguments(steps[0]!); return steps;
 }
 export function planLinodeCleanup(slot: SlotRef, inventory: CloudInventory, options: CleanupPlanOptions): CloudStep[] {
+  if (options.linodeIpv4Strategy === "instance_swap" || options.linodeSwapReceipt) return planLinodeSwapCleanup(slot, inventory, options);
   requireCapability(slot, inventory, options.allowStop);
   const args: RotationStepArguments = { slot, before: inventory, phase: "post_publish_cleanup", ...options };
   assertCleanup(args);
@@ -133,6 +137,7 @@ function watermark(args: RotationStepArguments): number {
 }
 
 export async function executeLinodeRotation(step: CloudStep, adapter: LinodeCloudAdapter): Promise<CloudStepResult> {
+  if (step.arguments.linodeIpv4Strategy === "instance_swap" || step.action.startsWith("linode.swap.") || step.action === "linode.ipv4.swap") return executeLinodeSwap(step, adapter);
   const args = validate(step, adapter);
   if (args.previousExecution || args.receipt) {
     const observation = await observeLinodeRotation(step, adapter);
@@ -182,6 +187,7 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
 }
 
 export async function observeLinodeRotation(step: CloudStep, adapter: LinodeCloudAdapter): Promise<CloudObservation> {
+  if (step.arguments.linodeIpv4Strategy === "instance_swap" || step.action.startsWith("linode.swap.") || step.action === "linode.ipv4.swap") return observeLinodeSwap(step, adapter);
   const args = validate(step, adapter);
   const current = await adapter.inspect(args.slot);
   // Credential rotation may change the reader, but the saved dispatch actor still controls event matching.

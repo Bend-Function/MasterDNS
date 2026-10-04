@@ -28,4 +28,27 @@ describe("rotation policy downtime permission", () => {
     expect(markup).toContain('<option value="stop_start" selected="">关机后开机</option>');
     expect(markup).toContain("先关机再开机");
   });
+  it("shows saved swap settings with temporary-instance authorization and no extra-IP quota claim", () => {
+    const base = demoCloudSlots[0]!;
+    const slot = { ...base, ref: { ...base.ref!, service: "linode" as const }, capability: { ...base.capability!, requiresStop: true } };
+    const markup = renderToStaticMarkup(createElement(RotationPolicyForm, {
+      formId: "policy", slot, authorization: { ...demoCloudInstances[0]!.authorization!, managed: true, allowStopStart: true },
+      policy: { ...demoRotationPolicy, linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true }, onSubmit: async () => undefined,
+    }));
+    expect(markup).toContain('<option value="instance_swap" selected="">临时实例交换 IPv4</option>');
+    expect(markup).toContain('value="g6-standard-1"');
+    expect(markup).toMatch(/<input[^>]*type="checkbox"[^>]*checked=""/);
+    expect(markup).toContain("仅限本次换址创建的临时实例");
+    expect(markup).not.toContain("额外 IPv4 需获批配额");
+  });
+  it("prevents enabling swap before granting temporary-instance creation and deletion", () => {
+    const base = demoCloudSlots[0]!;
+    const markup = renderToStaticMarkup(createElement(RotationPolicyForm, {
+      formId: "policy", slot: { ...base, ref: { ...base.ref!, service: "linode" as const } },
+      authorization: { ...demoCloudInstances[0]!.authorization!, managed: true, allowStopStart: true },
+      policy: { ...demoRotationPolicy, enabled: false, linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: false }, onSubmit: async () => undefined,
+    }));
+    expect(markup.match(/<button[^>]*role="switch"[^>]*>/)?.[0]).toContain('disabled=""');
+    expect(markup).toContain("请先授权创建和删除临时实例");
+  });
 });

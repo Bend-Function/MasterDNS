@@ -31,10 +31,12 @@ export async function lockCloudLifecycleContext(tx: RotationTransaction, instanc
   const physicalKey = JSON.stringify([account.provider, account.externalAccountId, instance.service, instance.region, instance.externalId]);
   await tx.insert(rotationLeases).values({ physicalKey }).onConflictDoNothing();
   const [lease] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, physicalKey)).for("update");
-  return { account, instance, authorization, scope, slots: slots.map(s => s.slot), physicalKey, lease: lease! };
+  const temporaryOwners = lease?.incidentId ? await tx.execute(sql`select 1 from rotation_incidents where id=${lease.incidentId} and physical_key<>${physicalKey} limit 1`) : [];
+  return { account, instance, authorization, scope, slots: slots.map(s => s.slot), physicalKey, lease: lease!, temporaryRotation: temporaryOwners.length > 0 };
 }
 export type CloudLifecycleContext = Awaited<ReturnType<typeof lockCloudLifecycleContext>>;
 export function lifecycleAuthorizationError(c: CloudLifecycleContext, action: CloudLifecycleAction): string | null {
+  if (c.temporaryRotation) return "rotation_in_progress";
   if (!c.account.enabled || !c.account.externalAccountId || !c.authorization?.managed || !(action === "delete" ? c.authorization.allowDelete : c.authorization.allowStopStart)) return "authorization_revoked";
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
   if (c.instance.metadata.present === false) return "resource_not_found";

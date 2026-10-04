@@ -7,10 +7,10 @@ import type { AddressSlot, CloudInstanceRow } from "../lib/cloud-types";
 import { capabilityReason } from "../lib/cloud-ui";
 import { previewRotationSchedule, previewScheduleRequest } from "../lib/rotation-schedule-demo";
 import { createRotationScheduleEditor, scheduleSlotBlock, type ScheduleDraft, type ScheduleEditorState } from "../lib/rotation-schedule";
-import type { RotationIncident } from "../lib/rotation-types";
+import type { RotationIncident, RotationPolicy } from "../lib/rotation-types";
 import { Button, Field, LoadingState, Switch } from "./ui";
 
-export function RotationScheduleEditor({ row, slot, incidents }: { row: CloudInstanceRow; slot: AddressSlot; incidents: RotationIncident[] }) {
+export function RotationScheduleEditor({ row, slot, incidents }: { row: CloudInstanceRow; slot: AddressSlot & { policy?: RotationPolicy | null }; incidents: RotationIncident[] }) {
   const [editor] = useState(() => createRotationScheduleEditor(slot.slot.id, UI_PREVIEW ? previewScheduleRequest : api, UI_PREVIEW ? previewRotationSchedule(slot.slot.id) : null));
   const state = useSyncExternalStore(editor.subscribe, editor.getSnapshot, editor.getSnapshot);
   useEffect(() => { void editor.load(); return () => editor.cancel(); }, [editor]);

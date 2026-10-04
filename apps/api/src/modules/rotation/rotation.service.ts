@@ -1,5 +1,6 @@
 import { rotationDisplay } from "./rotation-display.js";
 import { getCloudTargetsForSlots } from "@masterdns/db";
+import { publicRotationTemporaryInstances } from "@masterdns/db";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq } from "drizzle-orm";
 import { terminateRotationIncident } from "@masterdns/db";
@@ -17,14 +18,16 @@ export class RotationService {
   async policy(actor: AuthUser, slotId: string) {
     await this.ownedSlot(actor, slotId);
     const [policy] = await this.database.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, slotId));
-    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot" as const };
+    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot" as const, linodeIpv4Strategy: "additional_ipv4" as const, linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: false };
   }
   async setPolicy(actor: AuthUser, slotId: string, input: RotationPolicyInput) {
     await this.ownedSlot(actor, slotId);
     return this.transaction(async tx => {
       const c = await lockRotationContext(tx, slotId);
       if ((c.policy?.revision ?? 0) !== input.revision) throw new ConflictException("Policy revision has changed");
-      if (input.enabled) {
+      const revokingTemporaryGrant = c.policy?.linodeAllowTemporaryInstance && !input.linodeAllowTemporaryInstance
+        && (["enabled", "maxAttempts", "minIntervalSeconds", "cloudWaitSeconds", "candidateWindowSeconds", "linodeRestartMode", "linodeIpv4Strategy", "linodeSwapPlan"] as const).every(field => input[field] === c.policy![field]);
+      if (input.enabled && !revokingTemporaryGrant) {
         const h = await lockRotationHealth(tx, c);
         if (!h.configured || !h.policy) throw new ConflictException("External health policy is required");
         const requiredWindow = Math.max(h.policy.successThreshold, h.policy.failureThreshold) * h.policy.checkIntervalSeconds + h.policy.executionWindowSeconds;
@@ -71,7 +74,11 @@ export class RotationService {
     ]);
     const display = await this.database.db.transaction(tx => rotationDisplay(tx, incident.slotId));
     const targets = await getCloudTargetsForSlots(this.database.db, [incident.slotId]);
-    return { incident: { ...incident, cloudTarget: targets.get(incident.slotId) ?? null }, segments, attempts, steps, resources, publications, ...display };
+    const [helperSteps, helperResources] = await Promise.all([
+      this.database.db.select({ attemptId: rotationSteps.attemptId, receipt: rotationSteps.receipt }).from(rotationSteps).innerJoin(rotationAttempts, eq(rotationAttempts.id, rotationSteps.attemptId)).where(eq(rotationAttempts.incidentId, id)).orderBy(asc(rotationAttempts.sequence), asc(rotationSteps.sequence)),
+      this.database.db.select({ attemptId: rotationResources.attemptId, role: rotationResources.role, snapshot: rotationResources.snapshot, cleanupStatus: rotationResources.cleanupStatus }).from(rotationResources).where(eq(rotationResources.incidentId, id)),
+    ]);
+    return { incident: { ...incident, cloudTarget: targets.get(incident.slotId) ?? null }, segments, attempts, steps, resources, publications, temporaryInstances: publicRotationTemporaryInstances(helperSteps, helperResources), ...display };
   }
   async terminate(actor: AuthUser, id: string) {
     await this.ownedIncident(actor, id);

@@ -28,7 +28,7 @@ export class CloudLifecycleService {
       const operations = await tx.select().from(cloudLifecycleOperations).where(eq(cloudLifecycleOperations.instanceId, instanceId)).orderBy(desc(cloudLifecycleOperations.createdAt)).limit(30);
       const [control] = await tx.select().from(cloudInstanceControls).where(eq(cloudInstanceControls.physicalKey, c.physicalKey));
       const [pending] = await tx.select().from(cloudLifecycleOperations).where(and(eq(cloudLifecycleOperations.physicalKey, c.physicalKey), inArray(cloudLifecycleOperations.status, [...lifecycleActiveStatuses]))).limit(1);
-      const blockReason = pending ? "lifecycle_pending" : c.lease.unresolvedStepId || (c.lease.holder && c.lease.expiresAt > new Date()) ? "rotation_in_progress" : null;
+      const blockReason = pending ? "lifecycle_pending" : c.temporaryRotation || c.lease.unresolvedStepId || (c.lease.holder && c.lease.expiresAt > new Date()) ? "rotation_in_progress" : null;
       return { policy: publicTrafficPolicy(instanceId, policy), operations: operations.map(publicLifecycleOperation), blocked: !!blockReason, blockReason, powerHold: control?.powerHold ?? null };
     });
   }

@@ -1,9 +1,21 @@
 import { describe, expect, it } from "vitest";
 import {
+  rotationPolicySchema,
   rotationScheduleResumeSchema,
   rotationScheduleSchema,
   rotationScheduleUpdateSchema,
 } from "./rotation.js";
+
+describe("Linode swap policy", () => {
+  it("keeps existing policies on additional IPv4 without helper authorization", () => {
+    expect(rotationPolicySchema.parse({ revision: 0 })).toMatchObject({ linodeIpv4Strategy: "additional_ipv4", linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: false });
+  });
+  it("accepts swap with an explicit plan and grant independently of the power mode", () => {
+    expect(rotationPolicySchema.parse({ revision: 2, linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: true, linodeRestartMode: "stop_start" })).toMatchObject({ linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: true, linodeRestartMode: "stop_start" });
+    expect(rotationPolicySchema.safeParse({ revision: 0, linodeIpv4Strategy: "unknown" }).success).toBe(false);
+    expect(rotationPolicySchema.safeParse({ revision: 0, linodeSwapPlan: "../instances" }).success).toBe(false);
+  });
+});
 
 const schedule = {
   slotId: "00000000-0000-4000-8000-000000000001",

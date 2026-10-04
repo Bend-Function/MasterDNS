@@ -8,7 +8,7 @@ import { executeLinodeRotation, observeLinodeRotation } from "./linode-rotation.
 import type { Capability, CloudAdapter, CloudAddress, CloudInventory, CloudPage, LinodeCredentials } from "./provider.js";
 import { createCloudFetch } from "./proxy.js";
 
-export type LinodeIp = { address?: string; type?: string; public?: boolean; linode_id?: number; region?: string; reserved?: boolean };
+export type LinodeIp = { address?: string; type?: string; public?: boolean; linode_id?: number; region?: string; reserved?: boolean; interface_id?: number | null; vpc_nat_1_1?: unknown; assigned_entity?: { id?: number; type?: string } | null };
 export type LinodeEvent = { id: number; action?: string; entity?: { type?: string; id?: number }; status?: string; username?: string };
 type LinodeInstance = { id: number; label?: string; region?: string; status?: string; created?: string; interface_generation?: string };
 type LinodeConfig = { id?: number; helpers?: { network?: boolean }; run_level?: string; interfaces?: Array<{ purpose?: string; primary?: boolean; ipv4?: unknown; ip_ranges?: unknown[]; subnet_id?: unknown; vpc_id?: unknown }> | null };
@@ -138,6 +138,8 @@ export class LinodeCloudAdapter implements CloudAdapter {
     const ifaces = config?.interfaces;
     const simplePublicInterface = Array.isArray(ifaces) && (ifaces.length === 0 || (ifaces.length === 1 && ifaces[0]?.purpose === "public" && !ifaces[0].subnet_id && !ifaces[0].vpc_id && !ifaces[0].ipv4 && !ifaces[0].ip_ranges?.length));
     const metadata = { externalAccountId: this.http.externalAccountId!, authenticatedUsername: this.username!, permissionScopes: this.http.permissionScopes, interfaceGeneration: instance.interface_generation ?? "unknown", configCount,
+      ...(typeof instance.created === "string" ? { instanceCreated: instance.created } : {}),
+      reservedIpv4Count: Array.isArray(ips.ipv4.reserved) ? ips.ipv4.reserved.length : undefined,
       ...(config?.id === undefined ? {} : { configId: config.id }), networkHelper: config?.helpers?.network === true, runLevel: config?.run_level ?? "unknown", simplePublicInterface,
       advancedNetworking: !Array.isArray(ips.ipv4.shared) || ips.ipv4.shared.length > 0 || !Array.isArray(ips.ipv6?.global) || ips.ipv6.global.length > 0,
       ...(eventWatermark === undefined ? {} : { eventWatermark }) };

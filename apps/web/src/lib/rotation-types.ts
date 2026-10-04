@@ -9,6 +9,9 @@ export type RotationPolicy = {
   cloudWaitSeconds: number;
   candidateWindowSeconds: number;
   linodeRestartMode: "reboot" | "stop_start";
+  linodeIpv4Strategy: "additional_ipv4" | "instance_swap";
+  linodeSwapPlan: string;
+  linodeAllowTemporaryInstance: boolean;
   updatedAt?: string;
 };
 
@@ -39,6 +42,7 @@ export type RotationIncident = {
 export type RotationDetail = {
   incident: RotationIncident;
   instanceId: string;
+  temporaryInstances?: Array<{ id: string; label: string; region: string; attemptId: string; originalAddress: string; candidateAddress?: string; cleanupStatus: string }>;
   addresses: {
     observedCloud: { addresses: string[]; observedAt: string | null; source: "rotation_observation" | "inventory" };
     candidate: { id: string; address: string; version: number; verified: boolean } | null;

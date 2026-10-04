@@ -38,9 +38,18 @@ describe("rotation machine overview", () => {
     expect(rotationSlotBlock({ ...row, authorization: null }, slot)).toContain("授权");
   });
 
+  it("blocks starting Linode swap work until the temporary-instance grant is saved", () => {
+    const base = machine();
+    const row = { ...base, instance: { ...base.instance, service: "linode" as const }, authorization: { ...base.authorization!, allowStopStart: true } };
+    const slot = { ...row.slots[0]!, policy: { ...demoRotationPolicy, linodeIpv4Strategy: "instance_swap" as const, linodeAllowTemporaryInstance: false } };
+    expect(rotationSlotBlock(row, slot)).toContain("请先授权创建和删除临时实例");
+    expect(rotationSlotBlock(row, slot, { ...slot.policy, linodeAllowTemporaryInstance: true })).toBeNull();
+    expect(rotationSlotBlock(row, slot, null)).toBeNull();
+  });
+
   it("only changes enabled and retains the saved policy revision and every tuning parameter", () => {
-    const policy = { ...demoRotationPolicy, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" as const };
-    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" });
+    const policy = { ...demoRotationPolicy, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" as const, linodeIpv4Strategy: "instance_swap" as const, linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true };
+    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start", linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true });
     const rows = [machine()];
     const updated = updateMachinePolicy(rows, { ...policy, enabled: false, revision: policy.revision + 1 });
     expect(updated[0]!.slots[0]!.policy?.enabled).toBe(false);

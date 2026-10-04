@@ -49,13 +49,13 @@ export default function RotationsPage() {
     if (!selection) return; const generation = mutations.current.current(); setSaving(true); setError(null);
     try {
       const policy = UI_PREVIEW ? { ...selection.policy, ...input, revision: input.revision + 1 } : await api<RotationPolicy>(`/v1/rotation-policies/${selection.slot.slot.id}`, { method: "PATCH", ...jsonBody(input) });
-      if (mutations.current.isCurrent(generation)) { setSelection({ ...selection, policy }); setUpdatedPolicy(policy); setSaving(false); }
+      if (mutations.current.isCurrent(generation)) { setSelection({ ...selection, slot: { ...selection.slot, policy }, policy }); setUpdatedPolicy(policy); setSaving(false); }
     } catch (value) {
       if (!mutations.current.isCurrent(generation)) return;
       setSaving(false);
       if (value instanceof ApiError && value.status === 409) {
         const policy = UI_PREVIEW ? selection.policy : await api<RotationPolicy>(`/v1/rotation-policies?slotId=${encodeURIComponent(selection.slot.slot.id)}`);
-        if (mutations.current.isCurrent(generation)) { setSelection({ ...selection, policy }); setUpdatedPolicy(policy); }
+        if (mutations.current.isCurrent(generation)) { setSelection({ ...selection, slot: { ...selection.slot, policy }, policy }); setUpdatedPolicy(policy); }
         throw new Error("策略已被其他操作更新，已载入最新 Revision");
       }
       throw value;
@@ -90,12 +90,12 @@ export default function RotationsPage() {
       {manualSupported && selection?.row.account ? <ManualRotationButton
         key={selection.slot.slot.id} account={selection.row.account} instance={selection.row.instance} slot={selection.slot}
         savedAuthorization={selection.row.authorization} draftAuthorization={selection.row.authorization}
-        linodeRestartMode={selection.policy.linodeRestartMode} blockReason={rotationSlotBlock(selection.row, selection.slot)} disabled={saving} compact
+        savedPolicy={selection.policy} blockReason={rotationSlotBlock(selection.row, selection.slot, selection.policy)} disabled={saving} compact
       /> : <Button variant="secondary" icon={<RotateCw size={14} />} disabled={saving || !selection?.policy.enabled || rotationSlotBlock(selection.row, selection.slot) !== null} onClick={() => { startIntent.current.cancel(); setConfirmStart(true); }}>启动故障轮换</Button>}
       <Button type="submit" form="rotation-policy-form" disabled={saving}>{saving ? "保存中" : "保存策略"}</Button>
     </>}>
       {error && <div className="inline-error" role="alert">{error}</div>}
-      {selection && (confirmStart ? <div className="danger-summary"><strong>本次操作可能修改真实云地址</strong><p>系统将复核当前管理授权、IPv{selection.slot.slot.family} 独立授权、外部健康证据和区域范围。新地址通过复测前不会发布 DNS；每次实际换址会消耗本次故障预算。</p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode) && <p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode)}</p>}<dl>{selection.slot.cloudTarget && <><dt>账号 / 实例</dt><dd>{cloudTargetLabel(selection.slot.cloudTarget)}</dd></>}<dt>云服务</dt><dd>{cloudServiceLabel(selection.row.instance.service)} · {selection.row.instance.region}</dd><dt>当前实际地址</dt><dd className="mono">{selection.slot.currentAddress?.address ?? "暂无观测数据"}</dd><dt>换址方式</dt><dd>{selection.row.instance.service === "linode" ? selection.policy.linodeRestartMode === "stop_start" ? "关机后开机" : "重启" : "按云服务执行"}</dd><dt>最大尝试</dt><dd>{selection.policy.maxAttempts} 次</dd><dt>旧云端 IP</dt><dd>接管完成且 DNS 缓存期限结束后自动释放，不保留备用</dd><dt>允许停止、启动或重启</dt><dd>{selection.row.authorization?.allowStopStart ? "已授权" : "未授权"}</dd></dl></div> : <><RotationScheduleEditor key={selection.slot.slot.id} row={selection.row} slot={selection.slot} incidents={incidents ?? []} /><h2 className="rotation-policy-heading">换址策略</h2><RotationPolicyForm key={`${selection.slot.slot.id}:${selection.policy.revision}`} formId="rotation-policy-form" slot={selection.slot} authorization={selection.row.authorization} blockReason={rotationSlotBlock(selection.row, selection.slot)} policy={selection.policy} onSubmit={savePolicy} /></>)}
+      {selection && (confirmStart ? <div className="danger-summary"><strong>本次操作可能修改真实云地址</strong><p>系统将复核当前管理授权、IPv{selection.slot.slot.family} 独立授权、外部健康证据和区域范围。新地址通过复测前不会发布 DNS；每次实际换址会消耗本次故障预算。</p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode, selection.policy.linodeIpv4Strategy) && <p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode, selection.policy.linodeIpv4Strategy)}</p>}<dl>{selection.slot.cloudTarget && <><dt>账号 / 实例</dt><dd>{cloudTargetLabel(selection.slot.cloudTarget)}</dd></>}<dt>云服务</dt><dd>{cloudServiceLabel(selection.row.instance.service)} · {selection.row.instance.region}</dd><dt>当前实际地址</dt><dd className="mono">{selection.slot.currentAddress?.address ?? "暂无观测数据"}</dd><dt>换址方式</dt><dd>{selection.row.instance.service === "linode" ? `${selection.policy.linodeIpv4Strategy === "instance_swap" ? "临时实例交换 IPv4" : "申请额外 IPv4"} · ${selection.policy.linodeRestartMode === "stop_start" ? "关机后开机" : "重启"}` : "按云服务执行"}</dd><dt>最大尝试</dt><dd>{selection.policy.maxAttempts} 次</dd><dt>旧云端 IP</dt><dd>接管完成且 DNS 缓存期限结束后自动释放，不保留备用</dd><dt>允许停止、启动或重启</dt><dd>{selection.row.authorization?.allowStopStart ? "已授权" : "未授权"}</dd></dl></div> : <><RotationScheduleEditor key={selection.slot.slot.id} row={selection.row} slot={{ ...selection.slot, policy: selection.policy }} incidents={incidents ?? []} /><h2 className="rotation-policy-heading">换址策略</h2><RotationPolicyForm key={`${selection.slot.slot.id}:${selection.policy.revision}`} formId="rotation-policy-form" slot={selection.slot} authorization={selection.row.authorization} blockReason={rotationSlotBlock(selection.row, selection.slot, null)} policy={selection.policy} onSubmit={savePolicy} /></>)}
     </Dialog>
   </ConsoleLayout>;
 }

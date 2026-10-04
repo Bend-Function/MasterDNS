@@ -15,8 +15,11 @@ export function defineRotationSchema(dependencies: Dependencies) {
     cloudWaitSeconds: integer("cloud_wait_seconds").notNull().default(120),
     candidateWindowSeconds: integer("candidate_window_seconds").notNull().default(180),
     linodeRestartMode: varchar("linode_restart_mode", { length: 16 }).$type<"reboot" | "stop_start">().notNull().default("reboot"),
+    linodeIpv4Strategy: varchar("linode_ipv4_strategy", { length: 24 }).$type<"additional_ipv4" | "instance_swap">().notNull().default("additional_ipv4"),
+    linodeSwapPlan: varchar("linode_swap_plan", { length: 128 }).notNull().default("g6-nanode-1"),
+    linodeAllowTemporaryInstance: boolean("linode_allow_temporary_instance").notNull().default(false),
     updatedAt: time("updated_at").notNull().defaultNow(),
-  }, t => [check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`), check("rotation_policy_linode_restart_mode", sql`${t.linodeRestartMode} in ('reboot','stop_start')`)]);
+  }, t => [check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`), check("rotation_policy_linode_restart_mode", sql`${t.linodeRestartMode} in ('reboot','stop_start')`), check("rotation_policy_linode_ipv4_strategy", sql`${t.linodeIpv4Strategy} in ('additional_ipv4','instance_swap')`), check("rotation_policy_linode_swap_plan", sql`${t.linodeSwapPlan} ~ '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$'`)]);
   const rotationIncidents = pgTable("rotation_incidents", {
     id: uuid("id").primaryKey().defaultRandom(),
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "restrict" }),

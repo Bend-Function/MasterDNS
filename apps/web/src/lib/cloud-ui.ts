@@ -113,6 +113,8 @@ export function capabilityReason(reason?: string) {
   return ({
     rotation_in_progress: "此实例还有未完成的轮换，当前槽位暂不可再次换址",
     rotation_uncertain: "先前云操作的结果尚未确认，当前槽位暂不可再次换址",
+    rotation_temporary_instance_not_authorized: "请在 Linode 换址策略中授权创建和删除本次临时实例，并保存策略",
+    rotation_temporary_instance_busy: "临时实例正被其他操作占用或归属尚未确认，请先核对关联换址任务",
     lifecycle_pending: "此实例已有启动、停止或删除操作等待完成",
     instance_lifecycle_busy: "实例正在执行启动、停止或删除操作；完成前暂停新的换址与发布",
     cloud_state_reset: "已同步云端并清除旧流程的本地阻塞",
@@ -127,6 +129,7 @@ export function capabilityReason(reason?: string) {
     linode_boot_mode_unsupported: "仅支持 default 启动模式", linode_not_running: "Linode 必须处于运行状态",
     linode_event_observation_required: "无法确认重启事件或账号身份；需要可读取事件的凭证",
     linode_permissions_required: "需要 Linode 读写、IP 读取和事件读取权限；有效用户权限仍需云端确认",
+    linode_temporary_instance_permission_required: "临时实例交换 IPv4 需要单独授权创建和删除本次临时实例，请在换址策略中确认并保存",
     linode_address_ownership_unknown: "地址归属证据不完整", linode_reserved_ipv4_lifecycle_unsupported: "Reserved IPv4 生命周期不支持轮换",
     vm_topology_or_state_unsupported: "Azure VM 拓扑或运行状态不支持；需运行中的独立 VM",
     nic_topology_or_ownership_unsupported: "Azure NIC 配置、关联拓扑或归属不支持；需精确的现有 IP 配置",
@@ -185,10 +188,11 @@ function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuth
 
 const authorizationFields = ["managed", "allowIpv4Rotation", "allowIpv6Rotation", "allowStopStart", "allowDelete", "allowReleaseAddress"] as const;
 
-export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean, linodeRestartMode: "reboot" | "stop_start" = "reboot"): string | null {
+export function rotationDowntimeNotice(slot: AddressSlot, releaseAuthorized: boolean, linodeRestartMode: "reboot" | "stop_start" = "reboot", linodeIpv4Strategy: "additional_ipv4" | "instance_swap" = "additional_ipv4"): string | null {
   if (!slot.capability?.requiresStop) return null;
   if (slot.ref?.service === "linode") {
     const action = linodeRestartMode === "stop_start" ? "先关机再开机" : "重启";
+    if (linodeIpv4Strategy === "instance_swap") return `Linode 将在同一区域创建按实例计费的临时实例，交换两台实例的公网 IPv4，保留生产实例及其磁盘。账户默认开启备份时，还可能产生备份费用。生产实例会${action}以应用新地址，期间服务会中断。交换后旧 IP 不再连接生产实例，使用旧 DNS 缓存的访问会中断直至缓存更新。DNS 发布并等待旧记录缓存期限结束后，系统会删除临时实例并释放旧 IP。失败、暂停或终止的任务可能保留临时实例并持续计费，需人工核对。`;
     const cleanupAction = linodeRestartMode === "stop_start" ? "再次关机，然后开机" : "再次重启";
     const extraAction = linodeRestartMode === "stop_start" ? "关机与开机" : "重启";
     return `Linode 换址将使实例${action}，由 Network Helper 应用新 IPv4，期间服务会中断。${releaseAuthorized ? `已授权释放用户原有 IPv4，DNS 发布并满足清理条件后，清理还会使实例${cleanupAction}。` : "未授权释放用户原有 IPv4。"}此释放开关仅控制用户原有地址；系统创建的地址（包括失败候选和后续换下的旧地址）仍可自动清理，在停机授权有效时可能导致多次额外${extraAction}和服务中断。额外 IPv4 需获批配额并产生费用。`;

@@ -2,6 +2,7 @@ import type { RotationPolicyInput } from "@masterdns/contracts/rotation";
 import type { AddressSlot, CloudAccount, CloudInstanceRow } from "./cloud-types";
 import { cloudInstanceMatches, cloudRotationBlock, cloudErrorMessage } from "./cloud-ui";
 import type { RotationPolicy } from "./rotation-types";
+import { linodeTemporaryInstanceBlock } from "./rotation-policy";
 
 export type MachineSlot = AddressSlot & { policy: RotationPolicy | null; policyError?: string | undefined };
 export type RotationMachine = CloudInstanceRow & { slots: MachineSlot[]; loadError?: string };
@@ -31,12 +32,12 @@ export function machinePolicySummary(row: RotationMachine): string {
   return row.slots.some(slot => slot.policy?.enabled) ? "故障轮换已开启" : "故障轮换未开启";
 }
 
-export function rotationSlotBlock(row: CloudInstanceRow, slot: AddressSlot): string | null {
+export function rotationSlotBlock(row: CloudInstanceRow, slot: AddressSlot & { policy?: RotationPolicy | null }, policy = slot.policy): string | null {
   if (!row.account?.enabled) return "云账号已停用";
   if (row.instance.metadata.present === false || row.inventory?.status === "absent") return "云实例已不存在";
   if (!row.inScope) return "实例已不在管理范围内";
   if (slot.isCurrent === false) return "历史地址槽位，不能开启轮换";
-  return cloudRotationBlock(slot, row.authorization);
+  return cloudRotationBlock(slot, row.authorization) ?? (row.instance.service === "linode" && policy ? linodeTemporaryInstanceBlock(policy) : null);
 }
 
 export function familyControl(row: RotationMachine, family: "4" | "6") {
@@ -49,7 +50,7 @@ export function familyControl(row: RotationMachine, family: "4" | "6") {
 }
 
 export function policyToggleInput(policy: RotationPolicy, enabled: boolean): RotationPolicyInput {
-  return { enabled, revision: policy.revision, maxAttempts: policy.maxAttempts, minIntervalSeconds: policy.minIntervalSeconds, cloudWaitSeconds: policy.cloudWaitSeconds, candidateWindowSeconds: policy.candidateWindowSeconds, linodeRestartMode: policy.linodeRestartMode };
+  return { enabled, revision: policy.revision, maxAttempts: policy.maxAttempts, minIntervalSeconds: policy.minIntervalSeconds, cloudWaitSeconds: policy.cloudWaitSeconds, candidateWindowSeconds: policy.candidateWindowSeconds, linodeRestartMode: policy.linodeRestartMode, linodeIpv4Strategy: policy.linodeIpv4Strategy, linodeSwapPlan: policy.linodeSwapPlan, linodeAllowTemporaryInstance: policy.linodeAllowTemporaryInstance };
 }
 
 export function updateMachinePolicy(rows: RotationMachine[], policy: RotationPolicy): RotationMachine[] {

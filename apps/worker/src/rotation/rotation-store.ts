@@ -9,6 +9,8 @@ import { cloudAddresses, databaseNow, healthRevisionMatches, lockRotationContext
 import { DatabaseService } from "../database.service.js";
 import { reserveCloudRotationWrite, recordCloudRotationThrottle } from "@masterdns/db";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease, type RotationLease } from "./rotation-lock.js";
+import { linodeTemporaryInstanceProof } from "@masterdns/db";
+import { recordLinodeSwapState } from "./linode-swap-state.js";
 
 type Incident = typeof rotationIncidents.$inferSelect;
 type Step = typeof rotationSteps.$inferSelect;
@@ -89,7 +91,8 @@ export class RotationStore {
       if (!c.address || !c.iface) return false;
       const attemptId = randomUUID();
       const slot = { accountId: c.account.id, service: c.instance.service, region: c.instance.region, instanceId: c.instance.externalId, interfaceId: c.iface.externalId, slotId: c.slot.id, address: c.address.address, family: c.slot.family === "4" ? 4 as const : 6 as const };
-      const plan = planCloudRotation(slot, inventory, { allowStop: c.authorization!.allowStopStart, attemptId, linodeRestartMode: c.policy?.linodeRestartMode ?? "reboot" });
+      const plan = planCloudRotation(slot, inventory, { allowStop: c.authorization!.allowStopStart, attemptId, linodeRestartMode: c.policy?.linodeRestartMode ?? "reboot",
+        linodeIpv4Strategy: c.policy?.linodeIpv4Strategy ?? "additional_ipv4", linodeSwapPlan: c.policy?.linodeSwapPlan ?? "g6-nanode-1", allowTemporaryInstance: c.policy?.linodeAllowTemporaryInstance ?? false });
       const previous = await tx.select({ sequence: rotationAttempts.sequence }).from(rotationAttempts).where(eq(rotationAttempts.incidentId, id));
       const failed = await tx.select({ address: rotationResources.address }).from(rotationResources).where(and(eq(rotationResources.incidentId, id), eq(rotationResources.role, "candidate")));
       if (run.attempt && incident.phase === "candidate") await tx.update(rotationAttempts).set({ status: "candidate_failed" }).where(eq(rotationAttempts.id, run.attempt.id));
@@ -111,7 +114,18 @@ export class RotationStore {
       if (["linode.instance.reboot", "linode.instance.stop", "linode.instance.start"].includes(step.plan.action) && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
       const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
       const allocation = prior.filter(s => s.plan.action.endsWith(".allocate")).at(-1);
-      const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
+      let companionPhysicalKey: string | undefined;
+      if (step.plan.arguments.linodeIpv4Strategy === "instance_swap") {
+        if (!c.policy?.linodeAllowTemporaryInstance) throw new Error("rotation_temporary_instance_not_authorized");
+        if (step.plan.action !== "linode.swap.allocate") {
+          const proof = linodeTemporaryInstanceProof(allocation?.receipt);
+          const key = proof && JSON.stringify(["linode", c.account.externalAccountId, "linode", c.instance.region, proof.id]);
+          const [peer] = key ? await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, key)).for("update") : [];
+          if (!peer || peer.incidentId !== id || peer.unresolvedStepId || (peer.holder && peer.expiresAt > run.h.now)) throw new Error("rotation_temporary_instance_busy");
+          companionPhysicalKey = key;
+        }
+      }
+      const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, allowTemporaryInstance: c.policy?.linodeAllowTemporaryInstance ?? false, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
       const admission = await reserveCloudRotationWrite(tx, {
         accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: plan.action,
         remainingSteps: run.steps.filter(s => s.sequence >= step.sequence && s.plan.arguments.phase === "rotation" && ["prepared", "not_applied", "rejected_no_effect"].includes(s.status)).map(s => ({ id: s.id, action: s.plan.action })),
@@ -129,6 +143,7 @@ export class RotationStore {
       await tx.update(rotationSteps).set({ plan, status: "in_flight", fence: lease.revision, dispatchedAt: run.h.now, observeDeadline: new Date(run.h.now.getTime() + c.policy!.cloudWaitSeconds * 1000), receipt: null, errorCode: null, retryAt: null, updatedAt: run.h.now }).where(eq(rotationSteps.id, stepId));
       await tx.update(rotationIncidents).set({ errorCode: null, nextRunAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
       await tx.update(rotationLeases).set({ unresolvedStepId: stepId }).where(eq(rotationLeases.physicalKey, lease.physicalKey));
+      if (companionPhysicalKey) await tx.update(rotationLeases).set({ unresolvedStepId: stepId }).where(and(eq(rotationLeases.physicalKey, companionPhysicalKey), eq(rotationLeases.incidentId, id)));
       await rotationAudit(tx, incident, "rotation.dispatched", undefined, { attemptId: run.attempt.id, stepId, fence: lease.revision });
       return plan;
     });
@@ -144,15 +159,20 @@ export class RotationStore {
         return;
       }
       const now = await databaseNow(tx); const old = step.receipt ?? {};
-      const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]);
+      const oldHelper = linodeTemporaryInstanceProof(old), newHelper = linodeTemporaryInstanceProof(result);
+      const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]) || !!(oldHelper && newHelper && oldHelper.id !== newHelper.id);
       const receipt = { ...old, ...(step.status === "applied" ? {} : result), ...(old.resourceId ? { resourceId: old.resourceId } : {}), ...(old.allocationId ? { allocationId: old.allocationId } : {}) };
       const status = conflict ? "ambiguous" : step.status === "ambiguous" ? "ambiguous" : step.status === "applied" ? "applied" : observation ? (result as CloudObservation).status : "pending";
       await tx.update(rotationSteps).set({ receipt, status, updatedAt: now }).where(eq(rotationSteps.id, stepId));
       await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result }, createdAt: now });
       if (incident.terminatedAt) return;
-      if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.unresolvedStepId, stepId)));
+      if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.incidentId, id), eq(rotationLeases.unresolvedStepId, stepId)));
       if (status === "applied" && !incident.pausedByUserId && ["rotation_runtime_failed", "cloud_convergence_timeout", "temporary_cloud_error"].includes(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null }).where(eq(rotationIncidents.id, id));
       if (status === "ambiguous") await this.pauseIn(tx, incident, "resource_ownership_ambiguous", now);
+      if (!conflict && step.status !== "applied" && step.plan.arguments.linodeIpv4Strategy === "instance_swap" && receipt.after?.temporaryInstance) {
+        const reserved = await recordLinodeSwapState(tx, c, id, step.attemptId, receipt, step.plan.action === "linode.ipv4.swap" && status === "applied", now, stepId);
+        if (!reserved) { await this.pauseIn(tx, incident, "rotation_temporary_instance_busy", now); return; }
+      }
       const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, step.attemptId)).orderBy(asc(rotationSteps.sequence));
       if (!conflict && typeof receipt.candidateAddress === "string" && isIP(receipt.candidateAddress) === Number(c.slot.family)
         && (incident.phase === "cloud" || incident.phase === "candidate")) {
@@ -182,7 +202,7 @@ export class RotationStore {
       }
       const retryAt = code === "rate_limited" ? await recordCloudRotationThrottle(tx, { accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: step.plan.action, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) }) : null;
       await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code, retryAt, updatedAt: now }).where(eq(rotationSteps.id, stepId));
-      await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.unresolvedStepId, stepId)));
+      await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.incidentId, id), eq(rotationLeases.unresolvedStepId, stepId)));
       const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, step.attemptId)).for("update");
       if (step.sequence === 0 && attempt?.charged) {
         await tx.update(rotationAttempts).set({ charged: false, chargedAt: null }).where(eq(rotationAttempts.id, attempt.id));

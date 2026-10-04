@@ -15,6 +15,9 @@ export const rotationPolicySchema = z.object({
   cloudWaitSeconds: z.number().int().min(10).max(3600).default(120),
   candidateWindowSeconds: z.number().int().min(15).max(86400).default(180),
   linodeRestartMode: z.enum(["reboot", "stop_start"]).default("reboot"),
+  linodeIpv4Strategy: z.enum(["additional_ipv4", "instance_swap"]).default("additional_ipv4"),
+  linodeSwapPlan: z.string().trim().regex(/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/).default("g6-nanode-1"),
+  linodeAllowTemporaryInstance: z.boolean().default(false),
 }).strict();
 export const rotationStartSchema = z.object({ slotId: z.uuid() }).strict();
 export type RotationPolicyInput = z.infer<typeof rotationPolicySchema>;
