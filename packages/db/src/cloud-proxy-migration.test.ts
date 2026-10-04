@@ -30,7 +30,15 @@ it("adds reusable proxies without changing existing encrypted account credential
     expect((await sql`select credential_ciphertext,proxy_profile_id from cloud_accounts where id=${account!.id}`)[0]).toEqual({ credential_ciphertext: "encrypted-legacy", proxy_profile_id: null });
     const [profile] = await sql`insert into cloud_proxy_profiles(owner_user_id,name,credential_ciphertext,credential_iv,credential_tag) values (${owner!.id},'Reusable','encrypted-url','iv','tag') returning id`;
     await sql`update cloud_accounts set proxy_profile_id=${profile!.id} where id=${account!.id}`;
-    await expect(sql`delete from cloud_proxy_profiles where id=${profile!.id}`).rejects.toMatchObject({ code: "23001" });
+    await expect(sql`delete from cloud_proxy_profiles where id=${profile!.id}`).rejects.toMatchObject({
+      code: "23503",
+      constraint_name: "cloud_accounts_proxy_profile_id_cloud_proxy_profiles_id_fk",
+    });
+    expect(await sql`select id from cloud_proxy_profiles where id=${profile!.id}`).toEqual([{ id: profile!.id }]);
+    expect((await sql`select credential_ciphertext,proxy_profile_id from cloud_accounts where id=${account!.id}`)[0]).toEqual({
+      credential_ciphertext: "encrypted-legacy",
+      proxy_profile_id: profile!.id,
+    });
     await migrate(connection.db, { migrationsFolder: migrations });
   } finally {
     await connection?.close();
