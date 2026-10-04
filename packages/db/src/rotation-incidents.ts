@@ -133,9 +133,13 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
 }
 
 function manualRotationCapabilityError(c: RotationContext): string | undefined {
-  if (c.account.provider !== "aws" || (c.instance.service !== "ec2" && c.instance.service !== "lightsail") || c.slot.family !== "4" || c.slot.currentAddressId !== c.address?.id || isIP(c.address.address) !== 4) return "rotation_aws_public_ipv4_required";
+  const supported = (c.account.provider === "aws" && (c.instance.service === "ec2" || c.instance.service === "lightsail"))
+    || (c.account.provider === "linode" && c.instance.service === "linode");
+  if (!supported) return "rotation_provider_service_unsupported";
+  if (c.slot.family !== "4" || c.slot.currentAddressId !== c.address?.id || isIP(c.address.address) !== 4) return "rotation_public_ipv4_required";
   const providerMetadata = record(c.address.metadata.providerMetadata);
   if (providerMetadata?.awsAddressScope === "private" || isPrivateIpv4(c.address.address)) return "rotation_private_ipv4_unsupported";
+  if (c.instance.service === "linode" && !c.authorization?.allowStopStart) return "rotation_stop_start_not_authorized";
   const primaryAddresses = Array.isArray(c.iface?.metadata.primaryAddresses) ? c.iface.metadata.primaryAddresses : [];
   const primary = primaryAddresses.includes(c.address.address);
   if (c.instance.service === "ec2") {

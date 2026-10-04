@@ -274,6 +274,31 @@ it("manual change observes lost cloud responses without allocating another addre
   expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ phase: "publish" });
 });
+it.each(["reboot", "stop_start"] as const)("manual Linode observes every %s step before publication without probes", async linodeRestartMode => {
+  const f = await manualFixture();
+  await connection.db.update(cloudAccounts).set({ provider: "linode" }).where(eq(cloudAccounts.id, f.account.id));
+  await connection.db.update(cloudInstances).set({ service: "linode", region: "us-east", externalId: "42" }).where(eq(cloudInstances.id, f.instance.id));
+  await connection.db.update(cloudInterfaces).set({ externalId: "public" }).where(eq(cloudInterfaces.id, f.iface.id));
+  await connection.db.insert(cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  await connection.db.update(instanceAuthorizations).set({ allowStopStart: true }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await connection.db.update(rotationPolicies).set({ linodeRestartMode }).where(eq(rotationPolicies.slotId, f.slot.id));
+  await connection.db.update(rotationIncidents).set({ physicalKey: JSON.stringify(["linode", f.account.externalAccountId, "linode", "us-east", "42"]) }).where(eq(rotationIncidents.id, f.incident.id));
+  f.inventory.ref = { ...f.inventory.ref, service: "linode", region: "us-east", instanceId: "42" };
+  f.inventory.interfaces[0]!.id = "public";
+  f.inventory.interfaces[0]!.addresses[0] = { address: f.address.address, family: 4, primary: true, allocationId: f.address.address, resourceId: `/linode/instances/42/ips/${f.address.address}` };
+  f.inventory.metadata = { interfaceGeneration: "legacy_config", configCount: 1, configId: 7, networkHelper: true, runLevel: "default", simplePublicInterface: true, advancedNetworking: false, eventWatermark: 10, externalAccountId: f.account.externalAccountId, authenticatedUsername: "test", permissionScopes: ["*"] };
+  await drive(f, 12);
+  const [attempt] = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+  const steps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt!.id)).orderBy(rotationSteps.sequence);
+  expect(steps.map(step => step.plan.action)).toEqual(linodeRestartMode === "stop_start"
+    ? ["linode.ipv4.allocate", "linode.instance.stop", "linode.instance.start"]
+    : ["linode.ipv4.allocate", "linode.instance.reboot"]);
+  expect(steps.every(step => step.status === "applied")).toBe(true);
+  expect(f.state.count).toBe(1);
+  expect(f.state.observations).toHaveLength(steps.length);
+  expect(await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id))).toMatchObject([{ maxAttempts: 1, attemptsUsed: 1 }]);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ trigger: "manual", phase: "publish", status: "active" });
+});
 
 it("manual change advances a same-address initial verification placeholder without probes", async () => {
   const f = await manualFixture();

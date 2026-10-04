@@ -517,7 +517,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (!publication) return;
       const resources = await tx.select().from(rotationResources).where(eq(rotationResources.incidentId, incidentId));
       const rebooted = resources.filter(resource => typeof resource.snapshot.cleanupHealthCutoff === "number");
-      if (rebooted.length) {
+      if (rebooted.length && lockedIncident?.trigger !== "manual") {
         const health = await lockRotationHealth(tx, c);
         const cutoff = Math.max(...rebooted.map(resource => Number(resource.snapshot.cleanupHealthCutoff)));
         if (!health.success || !healthRevisionMatches(i, health) || !health.state || health.state.lastAppliedSequence <= cutoff) {

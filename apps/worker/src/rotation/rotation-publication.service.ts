@@ -105,7 +105,9 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
       incident.policyRevision !== c.policy!.revision ||
       (manual ? !["publish", "cleanup", "complete"].includes(incident.phase) : !healthRevisionMatches(incident, h)))
       throw new Error("publication_incident_changed");
-    if (manual && (c.account.provider !== "aws" || c.slot.family !== "4" || !["ec2", "lightsail"].includes(c.instance.service)))
+    const manualSupported = (c.account.provider === "aws" && ["ec2", "lightsail"].includes(c.instance.service))
+      || (c.account.provider === "linode" && c.instance.service === "linode");
+    if (manual && (c.slot.family !== "4" || !manualSupported))
       throw new Error("manual_rotation_unsupported");
     // Once a manual operation is finished, configured health checks regain control.
     if (completedManual && h.configured && !h.success) throw new Error("fresh_external_success_required");

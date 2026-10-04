@@ -560,6 +560,20 @@ it("rechecks current reboot permission after the release observation", async () 
   expect(f.state.writes).toBe(1);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).not.toBe("released");
 });
+it("completes manual Linode cleanup after observed release and reboot without probes", async () => {
+  const f = await chainFixture();
+  await f.d.update(db.rotationIncidents).set({ trigger: "manual", healthPolicyId: null, healthPolicyRevision: null, configId: null, configRevision: null, groupId: null, groupRevision: null }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationPublications).set({ incidentId: f.incident.id }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  await f.d.update(db.rotationPolicies).set({ enabled: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.d.delete(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.slot.id));
+  await f.d.delete(db.addressHealthPolicies).where(eq(db.addressHealthPolicies.slotId, f.slot.id));
+  await f.d.delete(db.healthCheckConfigs).where(eq(db.healthCheckConfigs.id, f.policy.configId));
+  for (let round = 0; round < 4; round++) await f.cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(2);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released" });
+  await f.cleanup.complete(f.incident.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: null });
+});
 
 import { ProbeHealthService } from "../probes/probe-health.service.js";
 import { HealthResultService } from "../health/health-result.service.js";

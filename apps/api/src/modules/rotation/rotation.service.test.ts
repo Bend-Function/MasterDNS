@@ -81,6 +81,31 @@ it("admits a manual AWS IPv4 rotation without probes and creates disabled timing
   expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]).toMatchObject({ enabled: false, revision: 1, maxAttempts: 3 });
   expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id)))[0]).toMatchObject({ maxAttempts: 1, attemptsUsed: 0 });
 });
+async function linodeManualFixture(allowStopStart = true) {
+  const f = await fixture();
+  await connection.db.update(cloudAccounts).set({ provider: "linode", externalAccountId: `linode-${randomUUID()}` }).where(eq(cloudAccounts.id, f.account.id));
+  await connection.db.update(cloudInstances).set({ service: "linode", region: "us-east" }).where(eq(cloudInstances.id, f.instance.id));
+  await connection.db.insert(cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  await connection.db.update(instanceAuthorizations).set({ allowStopStart }).where(eq(instanceAuthorizations.instanceId, f.instance.id));
+  await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));
+  await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.slotId, f.slot.id));
+  return f;
+}
+it.each(["reboot", "stop_start"] as const)("admits manual Linode IPv4 without probes using saved %s policy", async linodeRestartMode => {
+  const f = await linodeManualFixture();
+  await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id, enabled: false, linodeRestartMode });
+  const key = randomUUID();
+  const first = await service.startManual(f.actor, f.slot.id, key);
+  expect(await service.startManual(f.actor, f.slot.id, key)).toEqual(first);
+  expect(first).toMatchObject({ trigger: "manual", releaseOldAddress: true, healthPolicyId: null, configId: null, groupId: null });
+  expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, first.id)))[0]).toMatchObject({ maxAttempts: 1, attemptsUsed: 0 });
+  expect(await service.policy(f.actor, f.slot.id)).toMatchObject({ enabled: false, linodeRestartMode });
+});
+it("rejects manual Linode IPv4 without saved downtime permission before creating work", async () => {
+  const f = await linodeManualFixture(false);
+  await expect(service.startManual(f.actor, f.slot.id, randomUUID())).rejects.toMatchObject({ status: 409, message: "rotation_stop_start_not_authorized" });
+  expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(0);
+});
 it("admits a same-address initial-verification placeholder without changing its slot state", async () => {
   const f = await fixture();
   await connection.db.delete(addressHealthStates).where(eq(addressHealthStates.slotId, f.slot.id));

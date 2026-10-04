@@ -8,11 +8,12 @@ import { ConsoleLayout } from "../../components/console-layout";
 import { RelativeTime } from "../../components/relative-time";
 import { RotationScheduleEditor } from "../../components/rotation-schedule-form";
 import { RotationPolicyForm } from "../../components/rotation-policy-form";
+import { ManualRotationButton } from "../../components/manual-rotation-button";
 import { RotationMachines, type RotationSelection } from "../../components/rotation-machines";
 import { rotationSlotBlock } from "../../lib/rotation-machines";
 import { Button, Dialog, EmptyState, IconButton, LoadingState, MetricStrip, PageHeader, StatusBadge } from "../../components/ui";
 import { api, ApiError, jsonBody, UI_PREVIEW } from "../../lib/api";
-import { cloudTargetAddresses, cloudTargetLabel, cloudErrorMessage, capabilityReason, cloudServiceLabel, rotationDowntimeNotice } from "../../lib/cloud-ui";
+import { cloudTargetAddresses, cloudTargetLabel, cloudErrorMessage, capabilityReason, cloudServiceLabel, manualIpv4RotationEligibility, rotationDowntimeNotice } from "../../lib/cloud-ui";
 import { createRotationIntent } from "../../lib/rotation-action";
 import { rotationTriggerLabel } from "../../lib/rotation-schedule";
 import { rotationLimitWait } from "../../lib/rotation-display";
@@ -66,8 +67,12 @@ export default function RotationsPage() {
       if (!UI_PREVIEW) await api("/v1/rotations", { method: "POST", headers: { "idempotency-key": intent.key }, ...jsonBody(intent.payload) });
       if (!startIntent.current.complete(intent)) return;
       close(); setMachineRefresh(current => current + 1); await load();
-    } catch (value) { if (startIntent.current.isCurrent(intent)) { setSaving(false); setError(message(value, "手动轮换启动失败")); } }
+    } catch (value) { if (startIntent.current.isCurrent(intent)) { setSaving(false); setError(message(value, "故障轮换启动失败")); } }
   };
+  const manualSupported = selection && selection.row.account && manualIpv4RotationEligibility(selection.slot, {
+    accountEnabled: selection.row.account.enabled, provider: selection.row.account.provider, service: selection.row.instance.service,
+    instancePresent: selection.row.instance.metadata.present !== false, savedAuthorization: selection.row.authorization, draftAuthorization: selection.row.authorization,
+  }).visible;
   const active = incidents?.filter((incident) => incident.status === "active").length ?? 0;
   const paused = incidents?.filter((incident) => incident.status === "paused").length ?? 0;
   const exhausted = incidents?.filter((incident) => incident.status === "exhausted").length ?? 0;
@@ -80,7 +85,15 @@ export default function RotationsPage() {
     <MetricStrip items={[{ label: "进行中", value: active, detail: "包含云端等待与候选复测" }, { label: "已暂停", value: paused, detail: "预算与授权保持不变" }, { label: "次数耗尽", value: exhausted, detail: "任务预算保持锁存" }, { label: "历史", value: incidents?.length ?? "-", detail: "最多显示最近 200 条" }]} />
     {incidents === null ? <div className="surface"><LoadingState /></div> : incidents.length === 0 ? <div className="surface"><EmptyState title="暂无轮换记录" action={<Button variant="secondary" onClick={() => setTab("machines")}>查看机器与策略</Button>} /></div> : <div className="table-wrap"><table><thead><tr><th>轮换事件</th><th>地址族</th><th>状态</th><th>阶段 / 等待原因</th><th>地址版本</th><th>下次处理</th><th>创建时间</th><th aria-label="操作" /></tr></thead><tbody>{incidents.map((incident) => <tr key={incident.id}><td><Link className="table-primary" href={`/rotations/${incident.id}`}><strong>{incident.cloudTarget ? cloudTargetLabel(incident.cloudTarget) : shortId(incident.id)}</strong><small className="mono">{incident.cloudTarget ? cloudTargetAddresses(incident.cloudTarget) : shortId(incident.slotId)}</small></Link></td><td>IPv{incident.family}</td><td><StatusBadge value={incident.terminatedAt ? "terminated" : incident.status} /></td><td><div className="table-primary"><strong>{phaseLabel(incident.phase)}</strong><small>{rotationTriggerLabel(incident.trigger)} · {waitingLabel(incident)}</small></div></td><td>Version {incident.addressVersion}</td><td><RelativeTime value={incident.nextRunAt} future /></td><td><RelativeTime value={incident.createdAt} /></td><td><Link className="icon-button" href={`/rotations/${incident.id}`} aria-label="查看轮换详情"><ExternalLink size={15} /></Link></td></tr>)}</tbody></table></div>}
     </div>
-    <Dialog open={selection !== null} title={confirmStart ? "确认手动启动轮换" : selection ? selection.slot.cloudTarget ? `${cloudTargetLabel(selection.slot.cloudTarget)} · ${cloudTargetAddresses(selection.slot.cloudTarget)}` : `${selection.row.instance.name ?? selection.row.instance.externalId} · ${selection.slot.slot.name} / IPv${selection.slot.slot.family}` : "轮换策略"} size="large" onClose={() => { if (!saving) close(); }} footer={confirmStart ? <><Button variant="secondary" disabled={saving} onClick={() => { startIntent.current.cancel(); setConfirmStart(false); }}>返回</Button><Button variant="danger" icon={<RotateCw size={14} />} disabled={saving || !selection || rotationSlotBlock(selection.row, selection.slot) !== null} onClick={() => void start()}>{saving ? "提交中" : "确认启动"}</Button></> : <><Button variant="secondary" disabled={saving} onClick={close}>关闭</Button><Button variant="secondary" icon={<RotateCw size={14} />} disabled={saving || !selection?.policy.enabled || rotationSlotBlock(selection.row, selection.slot) !== null} onClick={() => { startIntent.current.cancel(); setConfirmStart(true); }}>手动启动</Button><Button type="submit" form="rotation-policy-form" disabled={saving}>{saving ? "保存中" : "保存策略"}</Button></>}>
+    <Dialog open={selection !== null} title={confirmStart ? "确认启动故障轮换" : selection ? selection.slot.cloudTarget ? `${cloudTargetLabel(selection.slot.cloudTarget)} · ${cloudTargetAddresses(selection.slot.cloudTarget)}` : `${selection.row.instance.name ?? selection.row.instance.externalId} · ${selection.slot.slot.name} / IPv${selection.slot.slot.family}` : "轮换策略"} size="large" onClose={() => { if (!saving) close(); }} footer={confirmStart ? <><Button variant="secondary" disabled={saving} onClick={() => { startIntent.current.cancel(); setConfirmStart(false); }}>返回</Button><Button variant="danger" icon={<RotateCw size={14} />} disabled={saving || !selection || rotationSlotBlock(selection.row, selection.slot) !== null} onClick={() => void start()}>{saving ? "提交中" : "确认启动"}</Button></> : <>
+      <Button variant="secondary" disabled={saving} onClick={close}>关闭</Button>
+      {manualSupported && selection?.row.account ? <ManualRotationButton
+        key={selection.slot.slot.id} account={selection.row.account} instance={selection.row.instance} slot={selection.slot}
+        savedAuthorization={selection.row.authorization} draftAuthorization={selection.row.authorization}
+        linodeRestartMode={selection.policy.linodeRestartMode} blockReason={rotationSlotBlock(selection.row, selection.slot)} disabled={saving} compact
+      /> : <Button variant="secondary" icon={<RotateCw size={14} />} disabled={saving || !selection?.policy.enabled || rotationSlotBlock(selection.row, selection.slot) !== null} onClick={() => { startIntent.current.cancel(); setConfirmStart(true); }}>启动故障轮换</Button>}
+      <Button type="submit" form="rotation-policy-form" disabled={saving}>{saving ? "保存中" : "保存策略"}</Button>
+    </>}>
       {error && <div className="inline-error" role="alert">{error}</div>}
       {selection && (confirmStart ? <div className="danger-summary"><strong>本次操作可能修改真实云地址</strong><p>系统将复核当前管理授权、IPv{selection.slot.slot.family} 独立授权、外部健康证据和区域范围。新地址通过复测前不会发布 DNS；每次实际换址会消耗本次故障预算。</p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode) && <p>{rotationDowntimeNotice(selection.slot, true, selection.policy.linodeRestartMode)}</p>}<dl>{selection.slot.cloudTarget && <><dt>账号 / 实例</dt><dd>{cloudTargetLabel(selection.slot.cloudTarget)}</dd></>}<dt>云服务</dt><dd>{cloudServiceLabel(selection.row.instance.service)} · {selection.row.instance.region}</dd><dt>当前实际地址</dt><dd className="mono">{selection.slot.currentAddress?.address ?? "暂无观测数据"}</dd><dt>换址方式</dt><dd>{selection.row.instance.service === "linode" ? selection.policy.linodeRestartMode === "stop_start" ? "关机后开机" : "重启" : "按云服务执行"}</dd><dt>最大尝试</dt><dd>{selection.policy.maxAttempts} 次</dd><dt>旧云端 IP</dt><dd>接管完成且 DNS 缓存期限结束后自动释放，不保留备用</dd><dt>允许停止、启动或重启</dt><dd>{selection.row.authorization?.allowStopStart ? "已授权" : "未授权"}</dd></dl></div> : <><RotationScheduleEditor key={selection.slot.slot.id} row={selection.row} slot={selection.slot} incidents={incidents ?? []} /><h2 className="rotation-policy-heading">换址策略</h2><RotationPolicyForm key={`${selection.slot.slot.id}:${selection.policy.revision}`} formId="rotation-policy-form" slot={selection.slot} authorization={selection.row.authorization} blockReason={rotationSlotBlock(selection.row, selection.slot)} policy={selection.policy} onSubmit={savePolicy} /></>)}
     </Dialog>

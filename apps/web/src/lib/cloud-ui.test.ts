@@ -197,7 +197,7 @@ describe("provider-aware rotation eligibility", () => {
   });
 });
 
-describe("manual AWS IPv4 eligibility", () => {
+describe("manual IPv4 eligibility", () => {
   const authorization: CloudAuthorization = {
     instanceId: "instance-1",
     revision: 4,
@@ -217,6 +217,19 @@ describe("manual AWS IPv4 eligibility", () => {
       savedAuthorization: authorization,
       draftAuthorization: authorization,
     })).toEqual({ visible: true, reason: null });
+  });
+  it("offers Linode IPv4 without a failure policy when downtime is authorized", () => {
+    const grant = { ...authorization, allowStopStart: true };
+    expect(manualIpv4RotationEligibility(slot({ capability: { ...slot().capability!, requiresStop: true } }), {
+      accountEnabled: true, provider: "linode", service: "linode", instancePresent: true,
+      savedAuthorization: grant, draftAuthorization: grant,
+    })).toEqual({ visible: true, reason: null });
+  });
+  it("requires saved downtime authorization for Linode manual IPv4 rotation", () => {
+    expect(manualIpv4RotationEligibility(slot({ capability: { ...slot().capability!, requiresStop: true } }), {
+      accountEnabled: true, provider: "linode", service: "linode", instancePresent: true,
+      savedAuthorization: authorization, draftAuthorization: authorization,
+    })).toEqual({ visible: true, reason: "尚未授权停止、启动或重启实例" });
   });
   it("blocks an observed replacement while the stable slot has an unresolved cloud operation", () => {
     expect(manualIpv4RotationEligibility(slot({ blockedRotation: { incidentId: "old-incident", reason: "rotation_uncertain" }, observedCapability: slot().capability }), {
@@ -246,7 +259,7 @@ describe("manual AWS IPv4 eligibility", () => {
     })).toEqual({ visible: true, reason: "请先保存当前授权更改" });
   });
 
-  it("does not offer the action for private IPv4, IPv6, or non-AWS slots", () => {
+  it("does not offer the action for private IPv4, IPv6, or unsupported services", () => {
     const context = { accountEnabled: true, provider: "aws" as const, service: "ec2" as const, instancePresent: true, savedAuthorization: authorization, draftAuthorization: authorization };
     const privateIpv4 = slot({ capability: { ...slot().capability!, available: false, reason: "private_ipv4_unsupported" } });
     const ipv6 = slot({ slot: { ...slot().slot, family: "6" }, currentAddress: { id: "address-6", address: "2001:db8::10", family: "6" } });

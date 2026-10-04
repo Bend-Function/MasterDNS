@@ -137,6 +137,8 @@ export function capabilityReason(reason?: string) {
     rotation_limit_too_low: "换址额度不足以完成一次换址；请提高云账号使用比例后恢复任务",
     cleanup_health_failed: "清理重启后探测未恢复", probe_insufficient: "外部探测证据不足，等待达到健康判定阈值",
     permission_denied: "云端拒绝访问，请检查凭证的有效权限", stop_start_not_authorized: "尚未授权停止、启动或重启实例",
+    rotation_stop_start_not_authorized: "尚未授权停止、启动或重启实例",
+    confirmed_failure_required: "当前地址尚无已确认且有效的外部探测故障；正常地址换址请使用“更换 IPv4”",
   } as Record<string, string>)[reason ?? ""] ?? reason ?? "未返回技术能力";
 }
 export function cloudRotationBlock(slot: AddressSlot, authorization: CloudAuthorization | null): string | null {
@@ -154,12 +156,12 @@ type ManualIpv4RotationContext = {
   service: CloudInstance["service"];
   instancePresent: boolean;
   savedAuthorization: CloudAuthorization | null;
-  draftAuthorization: CloudAuthorization;
+  draftAuthorization: CloudAuthorization | null;
 };
 
 export function manualIpv4RotationEligibility(slot: AddressSlot, context: ManualIpv4RotationContext): { visible: boolean; reason: string | null } {
-  const visible = context.provider === "aws"
-    && ["ec2", "lightsail"].includes(context.service)
+  const visible = ((context.provider === "aws" && ["ec2", "lightsail"].includes(context.service))
+    || (context.provider === "linode" && context.service === "linode"))
     && slot.slot.family === "4"
     && (slot.observedCapability ?? slot.capability)?.reason !== "private_ipv4_unsupported";
   if (!visible) return { visible: false, reason: null };
@@ -171,10 +173,12 @@ export function manualIpv4RotationEligibility(slot: AddressSlot, context: Manual
   if (!slot.currentAddress) return { visible: true, reason: "尚未观察到当前公网 IPv4" };
   if (!slot.capability?.available) return { visible: true, reason: capabilityReason(slot.capability?.reason) };
   if (!context.savedAuthorization?.managed || !context.savedAuthorization.allowIpv4Rotation) return { visible: true, reason: "请先保存“允许 IPv4 换址”授权" };
+  if ((context.service === "linode" || slot.capability.requiresStop) && !context.savedAuthorization.allowStopStart) return { visible: true, reason: capabilityReason("stop_start_not_authorized") };
   return { visible: true, reason: null };
 }
 
-function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuthorization): boolean {
+function authorizationChanged(saved: CloudAuthorization | null, draft: CloudAuthorization | null): boolean {
+  if (!draft) return saved !== null;
   if (!saved) return authorizationFields.some((field) => draft[field]);
   return authorizationFields.some((field) => saved[field] !== draft[field]);
 }

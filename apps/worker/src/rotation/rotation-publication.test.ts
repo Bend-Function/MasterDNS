@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
 import * as db from "@masterdns/db";
+import type { CloudInventory } from "@masterdns/cloud-providers";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { effectiveOldTtl, RotationPublicationService } from "./rotation-publication.service.js";
 import { fixture } from "./rotation-test-utils.js";
@@ -278,6 +279,31 @@ async function manualPublication(f: Awaited<ReturnType<typeof fixture>>) {
   return incident!;
 }
 
+it("manual Linode publication updates linked DNS without probe evidence", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.d.update(db.cloudAccounts).set({ provider: "linode" }).where(eq(db.cloudAccounts.id, f.account.id));
+  await f.d.update(db.cloudInstances).set({ service: "linode", region: "us-east" }).where(eq(db.cloudInstances.id, f.instance.id));
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: "linode", region: "us-east", generation: 1 });
+  await f.d.update(db.instanceAuthorizations).set({ allowStopStart: true }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  const physicalKey = JSON.stringify(["linode", f.account.externalAccountId, "linode", "us-east", f.instance.externalId]);
+  await f.d.update(db.rotationIncidents).set({ physicalKey }).where(eq(db.rotationIncidents.id, incident.id));
+  const live: CloudInventory = f.live;
+  live.ref.service = "linode"; live.ref.region = "us-east";
+  await f.service.publish(incident.id);
+  const addresses = await f.d.select().from(db.endpointAddresses).where(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id));
+  expect(addresses).toMatchObject([{ healthState: "unknown", consecutiveSuccesses: 0, lastCheckedAt: null }]);
+  const intents = await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, f.pools[0]!.id));
+  expect(intents).toHaveLength(1);
+  expect(await f.d.select().from(db.reconcileIntents).where(eq(db.reconcileIntents.poolId, f.pools[1]!.id))).toHaveLength(1);
+  f.state.failSecond = false;
+  await f.plan(); await f.execute();
+  const [publication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
+  await f.service.observe(publication!.id);
+  expect(f.remote.get("zone-0")?.content).toBe(f.address.address);
+  expect(f.remote.get("zone-1")?.content).toBe(f.address.address);
+  expect(f.state.cloudCalls).toBe(0);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ phase: "cleanup" });
+});
 it("manual publication updates linked DNS without health evidence and retries only failed DNS", async () => {
   const f = await dnsFixture(); const incident = await manualPublication(f);
   await f.service.publish(incident.id);
