@@ -680,6 +680,51 @@ it("recovers durable due work after a lost queue wakeup without creating a secon
   expect(jobs.filter(id => id === f.incident.id)).toHaveLength(2);
   expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, f.slot.id))).toHaveLength(1);
 });
+it("recovers unrelated due incidents when Linode temporary-instance authorization is revoked", async () => {
+  const due = await fixture();
+  const blocked = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "complete" }).where(eq(rotationIncidents.id, blocked.incident.id));
+  await connection.db.update(cloudAccounts).set({ provider: "linode" }).where(eq(cloudAccounts.id, blocked.account.id));
+  await connection.db.update(cloudInstances).set({ service: "linode" }).where(eq(cloudInstances.id, blocked.instance.id));
+  await connection.db.update(cloudScanScopes).set({ service: "linode" }).where(eq(cloudScanScopes.accountId, blocked.account.id));
+  await connection.db.update(rotationPolicies).set({ linodeIpv4Strategy: "instance_swap", linodeAllowTemporaryInstance: false }).where(eq(rotationPolicies.slotId, blocked.slot.id));
+  await evidence(blocked, "failure");
+  const jobs: string[] = [];
+  const recovery = new RotationRecoveryService({ db: connection.db } as never, { rotation: { add: async (_name: string, data: { incidentId: string }) => jobs.push(data.incidentId) } } as never);
+  try {
+    await recovery.recover();
+    expect(jobs).toContain(due.incident.id);
+    expect(jobs).not.toContain(blocked.incident.id);
+    expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, blocked.slot.id))).toMatchObject([{ id: blocked.incident.id, status: "complete" }]);
+  } finally {
+    await connection.db.update(rotationPolicies).set({ enabled: false }).where(eq(rotationPolicies.slotId, blocked.slot.id));
+  }
+});
+it("queues existing due incidents before surfacing an unexpected admission failure", async () => {
+  const due = await fixture();
+  const failure = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "complete" }).where(eq(rotationIncidents.id, failure.incident.id));
+  await evidence(failure, "failure");
+  await connection.client.unsafe(`
+    create function reject_recovery_admission() returns trigger language plpgsql as $$
+    begin
+      if NEW.slot_id = '${failure.slot.id}' then raise exception 'unexpected admission failure'; end if;
+      return NEW;
+    end $$;
+    create trigger reject_recovery_admission before insert on rotation_incidents
+      for each row execute function reject_recovery_admission();
+  `);
+  const jobs: string[] = [];
+  const recovery = new RotationRecoveryService({ db: connection.db } as never, { rotation: { add: async (_name: string, data: { incidentId: string }) => jobs.push(data.incidentId) } } as never);
+  try {
+    await expect(recovery.recover()).rejects.toMatchObject({ cause: { message: "unexpected admission failure" } });
+    expect(jobs).toContain(due.incident.id);
+    expect(await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.slotId, failure.slot.id))).toHaveLength(1);
+  } finally {
+    await connection.client.unsafe("drop trigger reject_recovery_admission on rotation_incidents; drop function reject_recovery_admission()");
+    await connection.db.update(rotationPolicies).set({ enabled: false }).where(eq(rotationPolicies.slotId, failure.slot.id));
+  }
+});
 it("completes a recovered current address before any effect without charging or publishing a fake candidate", async () => {
   const f = await fixture(); await drive(f, 1); await evidence(f, "success"); await drive(f, 1);
   expect(f.state.writes).toHaveLength(0);

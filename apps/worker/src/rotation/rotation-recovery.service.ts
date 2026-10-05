@@ -14,6 +14,19 @@ export class RotationRecoveryService implements OnModuleInit, OnModuleDestroy {
   async recover() {
     // Redis is only a wake-up channel. DB evidence and incident deadlines are the
     // source of truth across lost jobs, retries and process restarts.
+    let dueCount = 0;
+    try {
+      await this.admitFailures();
+    } finally {
+      // New admissions must not starve durable work. Unexpected admission errors
+      // still propagate to tick's logger after existing incidents are queued.
+      const due = await this.database.db.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(ne(rotationIncidents.status, "complete"), sql`${rotationIncidents.nextRunAt} <= clock_timestamp()`)).orderBy(asc(rotationIncidents.nextRunAt)).limit(200);
+      await Promise.all(due.map(row => this.queues.rotation.add("rotate", { incidentId: row.id }, { jobId: `rotation-${row.id}`, removeOnComplete: true, removeOnFail: true })));
+      dueCount = due.length;
+    }
+    return dueCount;
+  }
+  private async admitFailures() {
     // Apply the admission budget after authorization checks. Keyset pages let
     // rejected prefixes yield to eligible failures beyond the first page.
     let afterSlotId: string | undefined;
@@ -35,15 +48,12 @@ export class RotationRecoveryService implements OnModuleInit, OnModuleDestroy {
           });
           admitted++;
         } catch (error) {
-          if (!(error instanceof Error && ["confirmed_failure_required", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "external_health_required", "instance_lifecycle_busy"].includes(error.message))) throw error;
+          if (!(error instanceof Error && ["confirmed_failure_required", "authorization_revoked", "rotation_temporary_instance_not_authorized", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "external_health_required", "instance_lifecycle_busy"].includes(error.message))) throw error;
         }
         if (admitted === 200) break;
       }
       if (failures.length < 200) break;
     }
-    const due = await this.database.db.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(ne(rotationIncidents.status, "complete"), sql`${rotationIncidents.nextRunAt} <= clock_timestamp()`)).orderBy(asc(rotationIncidents.nextRunAt)).limit(200);
-    await Promise.all(due.map(row => this.queues.rotation.add("rotate", { incidentId: row.id }, { jobId: `rotation-${row.id}`, removeOnComplete: true, removeOnFail: true })));
-    return due.length;
   }
   private async tick() {
     if (this.running) return; this.running = true;
