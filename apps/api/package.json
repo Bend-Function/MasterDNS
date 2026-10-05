@@ -12,6 +12,7 @@
     "test": "vitest run src --passWithNoTests",
     "test:cloud-binding-reconcile": "vitest run test/cloud-binding-reconcile.test.ts",
     "test:ddns-external-health": "vitest run test/ddns-external-health.test.ts",
+    "test:ddns-local-health": "vitest run test/ddns-local-health.test.ts",
     "test:provider-rotation": "vitest run test/provider-rotation-acceptance.test.ts"
   },
   "dependencies": {

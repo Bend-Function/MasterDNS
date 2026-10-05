@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { BadRequestException, ConflictException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
-import type { HealthCheckJob } from "@masterdns/contracts";
+import { selectLocalHealthCheckConfigs, type HealthCheckJob } from "@masterdns/contracts";
 import { createOpaqueToken, hashToken } from "@masterdns/crypto";
 import {
+  addressHealthPolicies,
   auditLogs,
   ddnsAgents,
   endpointAddresses,
@@ -298,7 +299,7 @@ export class DdnsService {
     });
 
     let queuedChecks = 0;
-    for (const candidate of result.candidates) queuedChecks += await this.enqueueCandidateChecks(owned.pool.id, owned.endpoint.id, candidate.id);
+    for (const candidate of result.candidates) queuedChecks += await this.enqueueCandidateChecks(owned.pool.id, owned.endpoint.id, candidate.id, candidate.family);
     return {
       accepted: true,
       changed: result.addressStateChanged,
@@ -373,7 +374,12 @@ export class DdnsService {
     return { owned, runtimeTokenHash };
   }
 
-  private async enqueueCandidateChecks(poolId: string, endpointId: string, addressId: string) {
+  private async enqueueCandidateChecks(poolId: string, endpointId: string, addressId: string, family: "4" | "6") {
+    const [policy] = await this.database.db.select().from(addressHealthPolicies).where(and(
+      eq(addressHealthPolicies.endpointId, endpointId),
+      eq(addressHealthPolicies.family, family),
+    )).limit(1);
+    if (policy && policy.mode !== "local") return 0;
     const configs = await this.database.db.select().from(healthCheckConfigs).where(and(
       eq(healthCheckConfigs.enabled, true),
       or(
@@ -381,8 +387,7 @@ export class DdnsService {
         eq(healthCheckConfigs.poolId, poolId),
       ),
     ));
-    const endpointConfigs = configs.filter((config) => config.endpointId === endpointId);
-    const effective = endpointConfigs.length > 0 ? endpointConfigs : configs.filter((config) => config.poolId === poolId);
+    const effective = selectLocalHealthCheckConfigs(configs, { endpointId, poolId }, policy);
     if (effective.length === 0) throw new BadRequestException("DDNS 候选地址没有可用的节点或 Pool 健康检查，无法安全发布");
     await Promise.all(effective.map((config) => {
       const data: HealthCheckJob = {

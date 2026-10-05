@@ -55,6 +55,19 @@ export type HealthObservation = {
   consecutiveFailures: number;
 };
 
+/** Select base checks from enabled configs; callers keep binding checks separate. */
+export function selectLocalHealthCheckConfigs<T extends { id: string; endpointId: string | null; poolId: string | null }>(
+  configs: T[],
+  target: { endpointId: string; poolId: string },
+  policy?: { mode: "local" | "external" | "mixed"; configId?: string },
+): T[] {
+  if (policy && policy.mode !== "local") return [];
+  if (policy?.configId) return configs.filter(config => config.id === policy.configId
+    && (config.endpointId === target.endpointId || config.poolId === target.poolId));
+  const endpointConfigs = configs.filter(config => config.endpointId === target.endpointId);
+  return endpointConfigs.length > 0 ? endpointConfigs : configs.filter(config => config.poolId === target.poolId);
+}
+
 function isValidRegularExpression(value: string): boolean {
   try {
     new RegExp(value);

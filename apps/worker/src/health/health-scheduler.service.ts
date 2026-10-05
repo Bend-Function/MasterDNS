@@ -1,5 +1,5 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
-import type { HealthCheckJob } from "@masterdns/contracts";
+import { selectLocalHealthCheckConfigs, type HealthCheckJob } from "@masterdns/contracts";
 import { addressHealthPolicies, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs } from "@masterdns/db";
 import { and, eq } from "drizzle-orm";
 import { DatabaseService } from "../database.service.js";
@@ -105,9 +105,11 @@ export function buildScheduledHealthJobs(
 
   for (const target of targets) {
     const policy = policies.find(p => p.endpointId === target.endpointId && p.family === target.family);
-    const base = policy?.mode === "local" && policy.configId ? configs.filter(config => config.id === policy.configId) : endpointConfigs.get(target.endpointId) ?? poolConfigs.get(target.poolId) ?? [];
-    const localBase = target.addressMode !== "cloud" && (!policy || policy.mode === "local");
-    for (const config of localBase ? base : []) scheduled.push({
+    const base = target.addressMode === "cloud" ? [] : selectLocalHealthCheckConfigs([
+      ...(endpointConfigs.get(target.endpointId) ?? []),
+      ...(poolConfigs.get(target.poolId) ?? []),
+    ], target, policy);
+    for (const config of base) scheduled.push({
       data: { endpointId: target.endpointId, configId: config.id, addressId: target.addressId },
       intervalSeconds: policy?.checkIntervalSeconds ?? target.intervalSeconds,
     });
