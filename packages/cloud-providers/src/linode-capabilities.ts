@@ -34,4 +34,3 @@ export function linodeCapabilities(slot: SlotRef, inventory: CloudInventory, per
   if (ip.allocationId !== slot.address || ip.resourceId !== linodeIpResource(slot.instanceId, slot.address)) return no("linode_address_ownership_unknown");
   return { available: true, permission: "unverified", requiresStop: true, releasesOldAddress: false, canRestoreOldAddress: false };
 }
-
