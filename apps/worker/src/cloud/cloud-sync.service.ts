@@ -1,6 +1,6 @@
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
-import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, getCloudTargetsForSlots, managedAddressSlots, resetHealthEvidence, rotationAttempts, rotationIncidents, rotationSteps } from "@masterdns/db";
+import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, getCloudTargetsForSlots, deletedLinodeTemporaryInstances, forgetDeletedLinodeTemporaryInstance, matchesLinodeTemporaryInstance, managedAddressSlots, resetHealthEvidence, rotationAttempts, rotationIncidents, rotationSteps } from "@masterdns/db";
 import { CloudError, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 import { queueNames, cloudProviderServices, cloudServiceProvider, validCloudRegion, type CloudService, type CloudSyncJob } from "@masterdns/contracts";
 import { Worker } from "bullmq";
@@ -87,7 +87,9 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         if (currentScope?.generation !== scope.generation) throw new Error("Cloud scope already advanced");
         const generation = scope.generation + 1;
         const now = new Date();
+        const deletedHelpers = service === "linode" ? await deletedLinodeTemporaryInstances(tx, accountId, region) : [];
         for (const item of items) {
+          if (deletedHelpers.some(proof => matchesLinodeTemporaryInstance({ externalId: item.ref.instanceId, name: item.name, created: item.metadata?.instanceCreated }, proof))) continue;
           const metadata = { present: true, providerMetadata: item.metadata ?? {}, ...(item.nativeName !== undefined ? { nativeName: item.nativeName } : {}), ...(item.ipv6Only !== undefined ? { ipv6Only: item.ipv6Only } : {}) };
           const [instance] = await tx.insert(cloudInstances).values({ accountId, service, region, externalId: item.ref.instanceId, name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now })
             .onConflictDoUpdate({ target: [cloudInstances.accountId, cloudInstances.service, cloudInstances.region, cloudInstances.externalId], set: { name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now, updatedAt: now } }).returning();
@@ -182,6 +184,14 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         const targets = await getCloudTargetsForSlots(tx, scopeSlots.map(slot => slot.id));
         const historical = [...targets.values()].filter(target => !target.available).map(target => target.slot.id);
         if (historical.length) await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(inArray(addressHealthStates.slotId, historical));
+        if (deletedHelpers.length) {
+          const retained = await tx.select({ externalId: cloudInstances.externalId }).from(cloudInstances)
+            .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInstances.service, service), eq(cloudInstances.region, region)));
+          const retainedIds = new Set(retained.map(instance => instance.externalId));
+          for (const proof of deletedHelpers) {
+            if (retainedIds.has(proof.id) && await forgetDeletedLinodeTemporaryInstance(tx, proof)) retainedIds.delete(proof.id);
+          }
+        }
         return { scopeStatus: "complete", removedInstances: absent.length };
       });
     } catch (error) {

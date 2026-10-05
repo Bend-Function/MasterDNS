@@ -67,3 +67,5 @@ export * from "./rotation-temporary-instances.js";
 export * from "./idle-ip-guards.js";
 
 export * from "./cloud-lifecycle.js";
+
+export * from "./linode-temporary-inventory.js";

@@ -145,3 +145,14 @@
 - Azure 外部 NIC 并发 CAS 无保证；Linode 不确定分配不能从 inventory 差集推断，普通 IPv4 分配缺少不可变 generation、重启缺少请求相关 token，均需保留运维限制。具体边界见 [Azure](providers/azure.md) 与 [Linode](providers/linode.md)。
 - 桌面和移动端视觉/交互验收需在可用的授权浏览器环境完成。当前记录的原生 Mac 锁定与 Codex 浏览器认证不可用不会被自动化绕过；如未恢复，视觉验收保持待完成。
 - 本批不修改 Agent 协议，也不重新发布 Go Agent；平台构建不证明已进行新的 Agent 二进制验收。
+
+
+## 8. 运行时边界回归（2026-10-05）
+
+- `pnpm --filter @masterdns/api test:ddns-local-health`：隔离 PostgreSQL/Redis 验证 DDNS 按 IPv4/IPv6 地址策略选择 Pool 检查配置、候选提升、无策略回退、外部/混合模式和配置停用。
+- Worker `rotation.processor.test.ts`：撤销 Linode 临时实例授权不能阻断其他实例恢复；新事件准入发生意外数据库错误时，已有到期事件仍需排队且错误保持可观测。
+- Worker `rotation-cleanup.test.ts` / `cloud-sync.service.test.ts`：确认删除后清理临时库存树；成功扫描补清历史残留；旧扫描不得重建已删除实例；保留仍在清理、被管理、有不同创建身份或失败扫描涉及的资源。
+- Web `use-resource.test.tsx`：使用 happy-dom 和真实 React hook，控制请求完成顺序，验证初始加载、手动刷新、SSE 刷新、路径变化和卸载后的过期响应隔离。该测试不代表完整浏览器视觉验收。
+- `rotation-temporary-instances` 的数据库投影与 Web 渲染测试：已释放临时实例不再展示，未清理实例仍显示计费提醒。
+
+以上测试不调用真实云接口，不代替真实 Linode 建机、换址或删除验收。

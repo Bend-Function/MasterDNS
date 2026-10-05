@@ -1,6 +1,6 @@
 # MasterDNS 系统架构
 
-本文描述截至 2026-10-05、代码基线 `cc4b90d` 的实际实现。功能实现、自动化测试、真实云验收和生产部署是不同状态；本文不替代[验收计划](TEST_PLAN.md)和 `validation/` 中按提交记录的证据。
+本文描述截至 2026-10-05 的实际实现，包含运行时修复与 Linode 临时实例清理行为。功能实现、自动化测试、真实云验收和生产部署是不同状态；本文不替代[验收计划](TEST_PLAN.md)和 `validation/` 中按提交记录的证据。
 
 ## 1. 系统定位与边界
 
@@ -192,7 +192,7 @@ flowchart LR
 
 云端换址成功、DNS 发布成功和旧资源清理成功是三个独立结果。Publication 按 Slot/addressVersion 记录子 Pool 决策及 Operation，避免把 DNS 部分成功当作整体完成。清理还要检查授权、资源归属、引用及缓存宽限期。
 
-Linode `instance_swap` 通过同区域临时实例交换 IPv4，保留生产实例和磁盘；临时实例的身份证据保存在步骤回执及资源快照中。终止或失败不代表临时资源已经删除。默认 `additional_ipv4` 路径仍存在，两种策略均受能力与授权限制。
+Linode `instance_swap` 通过同区域临时实例交换 IPv4，保留生产实例和磁盘；临时实例的身份证据保存在步骤回执及资源快照中。终止或失败不代表临时资源已经删除。确认删除后，系统按回执中的账号、区域、实例 ID、名称和创建时间清理无业务引用的临时实例库存；后续成功同步也会补清历史残留，并拒绝旧扫描重建同一临时实例。实例已被管理或有业务/操作引用时保留关联，换址步骤与审计历史不随库存清理删除。默认 `additional_ipv4` 路径仍存在，两种策略均受能力与授权限制。
 
 代码入口：[换址状态机](../packages/automation/src/rotation-machine.ts)、[Store](../apps/worker/src/rotation/rotation-store.ts)、[Processor](../apps/worker/src/rotation/rotation.processor.ts)、[发布](../apps/worker/src/rotation/rotation-publication.service.ts)、[清理](../apps/worker/src/rotation/rotation-cleanup.service.ts)。
 

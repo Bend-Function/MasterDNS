@@ -37,5 +37,5 @@ export function publicRotationTemporaryInstances(
     instances.set(proof.id, { id: proof.id, label: proof.label, region: proof.region, attemptId: proof.attemptId, originalAddress: proof.originalAddress,
       ...(candidateAddress ? { candidateAddress } : {}), cleanupStatus: resource?.cleanupStatus ?? "retained" });
   }
-  return [...instances.values()];
+  return [...instances.values()].filter(instance => instance.cleanupStatus !== "released");
 }

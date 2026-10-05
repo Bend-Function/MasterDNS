@@ -9,10 +9,9 @@ describe("rotation temporary instances", () => {
     const html = renderToStaticMarkup(createElement(RotationTemporaryInstances, { instances: [helper] }));
     for (const value of ["123456", "masterdns-swap-attempt-1", "ap-south", "attempt-1", "192.0.2.1", "192.0.2.2", "持续计费"]) expect(html).toContain(value);
   });
-  it("does not claim a deleted helper still incurs charges", () => {
+  it("omits deleted helpers even when an older API response contains them", () => {
     const html = renderToStaticMarkup(createElement(RotationTemporaryInstances, { instances: [{ ...helper, cleanupStatus: "released" }] }));
-    expect(html).toContain("123456");
-    expect(html).not.toContain("持续计费");
+    expect(html).toBe("");
   });
   it("does not show a temporary-instance section for additional-IP rotations", () => {
     expect(renderToStaticMarkup(createElement(RotationTemporaryInstances, {}))).toBe("");

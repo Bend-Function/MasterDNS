@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, instanceAuthorizations, managedAddressSlots, rotationIncidents, users } from "@masterdns/db";
+import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, healthCheckConfigs, instanceAuthorizations, managedAddressSlots, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users } from "@masterdns/db";
 import { encryptJson } from "@masterdns/crypto";
 import { Ec2CloudAdapter, LightsailCloudAdapter, evaluateCapabilities, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 vi.mock("@masterdns/cloud-providers", async (importOriginal) => ({
@@ -319,4 +319,81 @@ describe("complete cloud scope sync", () => {
     expect(await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "failed" });
     expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id))).toEqual([]);
   });
+});
+
+async function deletedLinodeHelperFixture() {
+  const f = await fixture();
+  const externalAccountId = randomUUID();
+  await connection.db.update(cloudAccounts).set({ provider: "linode", externalAccountId }).where(eq(cloudAccounts.id, f.account.id));
+  const production: CloudInventory = { ...f.item, ref: { accountId: f.account.id, service: "linode", region: "us-east", instanceId: "42" }, name: "production", metadata: { instanceCreated: "2025-01-01T00:00:00Z" } };
+  const attemptId = randomUUID();
+  const proof = { id: "99", targetInstanceId: "42", accountId: f.account.id, externalAccountId, region: "us-east", attemptId, label: "masterdns-swap-owned", created: "2026-10-04T00:00:00Z", originalAddress: "192.0.2.2", candidateAddress: "192.0.2.1", type: "g6-nanode-1" };
+  const helper: CloudInventory = { ...production, ref: { ...production.ref, instanceId: proof.id }, name: proof.label, metadata: { instanceCreated: proof.created }, interfaces: [{ id: "public", addresses: [{ address: proof.originalAddress, family: 4, primary: true }] }] };
+  f.adapter.discover.mockResolvedValue({ items: [production, helper] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  const [slot] = await connection.db.select({ id: managedAddressSlots.id }).from(managedAddressSlots).innerJoin(cloudInterfaces, eq(managedAddressSlots.interfaceId, cloudInterfaces.id)).innerJoin(cloudInstances, eq(cloudInterfaces.instanceId, cloudInstances.id)).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "42")));
+  const segmentId = randomUUID();
+  const [incident] = await connection.db.insert(rotationIncidents).values({ ownerUserId: f.account.ownerUserId, slotId: slot!.id, family: "4", physicalKey: randomUUID(), sourceEventId: randomUUID(), trigger: "manual", status: "complete", phase: "complete", currentSegmentId: segmentId, authorizationRevision: 1, policyRevision: 1, addressVersion: 1 }).returning();
+  await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 1 });
+  await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: {} });
+  const stepId = `delete-helper-${attemptId}`;
+  await connection.db.insert(rotationSteps).values({ id: stepId, attemptId, sequence: 1, status: "applied", plan: { id: stepId, action: "linode.swap.delete", arguments: { linodeSwapReceipt: { after: { temporaryInstance: proof } } } } as never });
+  return { ...f, production, helper, proof, stepId };
+}
+
+it("purges historical deleted Linode helpers and prevents stale discovery from recreating them", async () => {
+  const f = await deletedLinodeHelperFixture();
+  // An old absent ordinary instance is still useful history and must not be purged.
+  const [ordinary] = await connection.db.insert(cloudInstances).values({ accountId: f.account.id, service: "linode", region: "us-east", externalId: "100", name: "ordinary", scanGeneration: 1, metadata: { present: false } }).returning();
+  f.adapter.discover.mockResolvedValue({ items: [f.production] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  expect(await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")))).toHaveLength(0);
+  expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.id, ordinary!.id))).toHaveLength(1);
+  // Discovery begun before deletion can arrive after its confirmed receipt.
+  f.adapter.discover.mockResolvedValue({ items: [f.production, f.helper] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  expect(await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")))).toHaveLength(0);
+  expect(await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, f.stepId))).toHaveLength(1);
+});
+
+it("keeps pending helpers and a new Linode incarnation with a reused numeric ID", async () => {
+  const f = await deletedLinodeHelperFixture();
+  await connection.db.update(rotationSteps).set({ status: "pending" }).where(eq(rotationSteps.id, f.stepId));
+  f.adapter.discover.mockResolvedValue({ items: [f.production, f.helper] });
+  await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter);
+  expect(await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")))).toHaveLength(1);
+  await connection.db.update(rotationSteps).set({ status: "applied" }).where(eq(rotationSteps.id, f.stepId));
+  const replacement = { ...f.helper, metadata: { instanceCreated: "2026-10-05T00:00:00Z" } };
+  f.adapter.discover.mockResolvedValue({ items: [f.production, replacement] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  expect((await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99"))))[0]!.metadata).toMatchObject({ present: true, providerMetadata: { instanceCreated: "2026-10-05T00:00:00Z" } });
+});
+
+it("does not erase a helper inventory record adopted for managed use", async () => {
+  const f = await deletedLinodeHelperFixture();
+  const [helper] = await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")));
+  await connection.db.insert(instanceAuthorizations).values({ instanceId: helper!.id, managed: true });
+  f.adapter.discover.mockResolvedValue({ items: [f.production] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.id, helper!.id))).toHaveLength(1);
+});
+
+it("does not prune helper inventory during a failed partial cloud scan", async () => {
+  const f = await deletedLinodeHelperFixture();
+  f.adapter.discover.mockResolvedValueOnce({ items: [f.production], cursor: "next" }).mockRejectedValueOnce(new Error("discovery unavailable"));
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "failed" });
+  expect(await connection.db.select().from(cloudInstances).where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")))).toHaveLength(1);
+});
+
+it("preserves a deleted helper with an explicitly configured health check", async () => {
+  const f = await deletedLinodeHelperFixture();
+  const [target] = await connection.db.select({ instanceId: cloudInstances.id, slotId: managedAddressSlots.id }).from(cloudInstances)
+    .innerJoin(cloudInterfaces, eq(cloudInterfaces.instanceId, cloudInstances.id))
+    .innerJoin(managedAddressSlots, eq(managedAddressSlots.interfaceId, cloudInterfaces.id))
+    .where(and(eq(cloudInstances.accountId, f.account.id), eq(cloudInstances.externalId, "99")));
+  const [config] = await connection.db.insert(healthCheckConfigs).values({ slotId: target!.slotId, checkerType: "tcp", config: { type: "tcp", port: 443, timeoutMs: 3000 } }).returning();
+  f.adapter.discover.mockResolvedValue({ items: [f.production] });
+  expect(await f.service.scanScope(f.account.id, "linode", "us-east", f.adapter as unknown as CloudAdapter)).toMatchObject({ scopeStatus: "complete" });
+  expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.id, target!.instanceId))).toHaveLength(1);
+  expect(await connection.db.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, config!.id))).toHaveLength(1);
 });

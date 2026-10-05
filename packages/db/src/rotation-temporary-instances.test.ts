@@ -17,8 +17,12 @@ describe("temporary rotation instance evidence", () => {
   });
   it("deduplicates helper observations and follows the matching original cleanup resource", () => {
     const receipt = { after: { temporaryInstance: { ...temporaryInstance, candidateAddress: "192.0.2.2" } } };
-    const result = publicRotationTemporaryInstances([{ attemptId: "attempt-1", receipt }, { attemptId: "attempt-1", receipt }], [{ attemptId: "attempt-1", role: "original", snapshot: { linodeSwapReceipt: receipt }, cleanupStatus: "released" }]);
+    const result = publicRotationTemporaryInstances([{ attemptId: "attempt-1", receipt }, { attemptId: "attempt-1", receipt }], [{ attemptId: "attempt-1", role: "original", snapshot: { linodeSwapReceipt: receipt }, cleanupStatus: "pending" }]);
     expect(result).toHaveLength(1);
-    expect(result[0]).toMatchObject({ id: "43", candidateAddress: "192.0.2.2", cleanupStatus: "released" });
+    expect(result[0]).toMatchObject({ id: "43", candidateAddress: "192.0.2.2", cleanupStatus: "pending" });
+  });
+  it("omits deleted helpers from the active temporary-instance list", () => {
+    const receipt = { after: { temporaryInstance } };
+    expect(publicRotationTemporaryInstances([{ attemptId: "attempt-1", receipt }], [{ attemptId: "attempt-1", role: "original", snapshot: { linodeSwapReceipt: receipt }, cleanupStatus: "released" }])).toEqual([]);
   });
 });

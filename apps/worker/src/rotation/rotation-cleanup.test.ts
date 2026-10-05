@@ -161,6 +161,24 @@ it("deletes the saved temporary Linode only after DNS publication and TTL grace,
   expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete" });
 });
 
+it("removes confirmed deleted Linode helper inventory while retaining the production machine and audit steps", async () => {
+  const f = await linodeSwapCleanupFixture();
+  const proof = f.receipt.after.temporaryInstance;
+  const [helper] = await f.d.insert(db.cloudInstances).values({ accountId: f.account.id, service: "linode", region: proof.region, externalId: proof.id, name: proof.label, scanGeneration: 1, metadata: { present: true, providerMetadata: { instanceCreated: proof.created } } }).returning();
+  const [iface] = await f.d.insert(db.cloudInterfaces).values({ instanceId: helper!.id, externalId: "public", scanGeneration: 1 }).returning();
+  const [address] = await f.d.insert(db.cloudAddresses).values({ interfaceId: iface!.id, kind: "host", family: "4", address: proof.originalAddress, origin: "user", scanGeneration: 1 }).returning();
+  await f.d.insert(db.managedAddressSlots).values({ interfaceId: iface!.id, family: "4", name: "primary", currentAddressId: address!.id });
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(await f.d.select().from(db.cloudInstances).where(eq(db.cloudInstances.id, helper!.id))).toHaveLength(1);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(await f.d.select().from(db.cloudInstances).where(eq(db.cloudInstances.id, helper!.id))).toHaveLength(0);
+  expect(await f.d.select().from(db.cloudInterfaces).where(eq(db.cloudInterfaces.id, iface!.id))).toHaveLength(0);
+  expect(await f.d.select().from(db.cloudAddresses).where(eq(db.cloudAddresses.id, address!.id))).toHaveLength(0);
+  expect(await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.interfaceId, iface!.id))).toHaveLength(0);
+  expect(await f.d.select().from(db.cloudInstances).where(eq(db.cloudInstances.id, f.instance.id))).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, f.swap.writes[0]!.id)))[0]!.status).toBe("applied");
+});
+
 it("retains the temporary Linode when cleanup authorization is revoked", async () => {
   const f = await linodeSwapCleanupFixture();
   await f.d.update(db.rotationPolicies).set({ linodeAllowTemporaryInstance: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));

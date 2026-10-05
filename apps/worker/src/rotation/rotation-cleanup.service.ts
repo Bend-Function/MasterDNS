@@ -30,6 +30,7 @@ import {
   recordCloudRotationThrottle,
   lockIdleIpAddress,
   linodeTemporaryInstanceProof,
+  forgetDeletedLinodeTemporaryInstance,
   type RotationContext,
   type RotationTransaction,
 } from "@masterdns/db";
@@ -483,8 +484,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (status === "applied" && !next && !historyAmbiguous) {
         if (step.plan.action === "linode.swap.delete") {
           const proof = linodeTemporaryInstanceProof(step.plan.arguments.linodeSwapReceipt);
-          if (proof) await tx.update(rotationLeases).set({ incidentId: null, updatedAt: new Date() })
-            .where(and(eq(rotationLeases.physicalKey, JSON.stringify(["linode", proof.externalAccountId, "linode", proof.region, proof.id])), eq(rotationLeases.incidentId, r.incidentId), isNull(rotationLeases.unresolvedStepId)));
+          if (proof) {
+            await tx.update(rotationLeases).set({ incidentId: null, updatedAt: new Date() })
+              .where(and(eq(rotationLeases.physicalKey, JSON.stringify(["linode", proof.externalAccountId, "linode", proof.region, proof.id])), eq(rotationLeases.incidentId, r.incidentId), isNull(rotationLeases.unresolvedStepId)));
+            await forgetDeletedLinodeTemporaryInstance(tx, proof);
+          }
         }
         const identity = cleanupIdentity(resource);
         if (identity) {
