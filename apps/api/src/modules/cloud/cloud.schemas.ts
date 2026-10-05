@@ -1,17 +1,11 @@
 import { z } from "zod";
-import { validCloudRegion } from "@masterdns/contracts";
-import { credentialsMatchProvider } from "@masterdns/cloud-providers";
+import { cloudCredentialsSchema, cloudProviderIds, credentialsMatchProvider, validCloudRegion } from "@masterdns/contracts";
+export { cloudCredentialsSchema } from "@masterdns/contracts";
 
-export const cloudCredentialsSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("access_key"), accessKeyId: z.string().trim().min(8).max(128), secretAccessKey: z.string().min(16).max(256), sessionToken: z.string().min(1).max(8192).optional() }).strict(),
-  z.object({ kind: z.literal("role"), roleArn: z.string().regex(/^arn:aws(?:-us-gov|-cn)?:iam::\d{12}:role\/.+$/).max(2048).optional(), externalId: z.string().min(1).max(1224).optional() }).strict(),
-  z.object({ kind: z.literal("azure_service_principal"), tenantId: z.string().uuid(), subscriptionId: z.string().uuid(), clientId: z.string().uuid(), clientSecret: z.string().min(1).max(8192) }).strict(),
-  z.object({ kind: z.literal("linode_token"), token: z.string().min(1).max(8192) }).strict(),
-]);
 export const cloudRegionsSchema = z.array(z.string().regex(/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/).max(80)).min(1).max(100).refine((regions) => new Set(regions).size === regions.length, "Regions must be unique").nullable();
 export const cloudRegionsUpdateSchema = z.object({ regions: cloudRegionsSchema }).strict();
 export const createCloudAccountSchema = z.object({
-  name: z.string().trim().min(1).max(120), regions: cloudRegionsSchema.optional(), provider: z.enum(["aws", "azure", "linode"]), ownerUserId: z.string().uuid().optional(), proxyProfileId: z.string().uuid().nullable().optional(), credentials: cloudCredentialsSchema,
+  name: z.string().trim().min(1).max(120), regions: cloudRegionsSchema.optional(), provider: z.enum(cloudProviderIds), ownerUserId: z.string().uuid().optional(), proxyProfileId: z.string().uuid().nullable().optional(), credentials: cloudCredentialsSchema,
 }).strict().superRefine((input, context) => {
   if (!credentialsMatchProvider(input.provider, input.credentials)) context.addIssue({ code: "custom", path: ["credentials"], message: "Credentials do not match provider" });
   if (input.regions?.some(region => !validCloudRegion(input.provider, region))) context.addIssue({ code: "custom", path: ["regions"], message: "Invalid provider region" });

@@ -32,6 +32,7 @@ it("serializes concurrent physical-instance claims and fences a stale holder aft
 
 import { vi } from "vitest";
 import { CloudError, Ec2CloudAdapter, LightsailCloudAdapter, type CloudAdapter, type CloudInventory, type CloudStepResult } from "@masterdns/cloud-providers";
+import * as cloudProviders from "@masterdns/cloud-providers";
 import { auditLogs, addressHealthPolicies, addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createRotationIncident, createScheduledRotationIncident, healthCheckConfigs, instanceAuthorizations, lockRotationContext, managedAddressSlots, probeGroups, resumeRotationIncident, rotationAttempts, rotationBudgetSegments, rotationIncidents, rotationPolicies, rotationPublications, rotationResources, rotationSchedules, rotationSteps, rotationStepObservations, users } from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32, 1).toString("base64") } }));
 import { RotationStore } from "./rotation-store.js";
@@ -82,6 +83,46 @@ async function fixture(family: "4" | "6" = "4", trigger: "health" | "scheduled" 
   return { owner: owner!, account: account!, instance: instance!, iface: iface!, address: address!, slot: slot!, config: config!, group: group!, healthPolicy: healthPolicy!, health: health!, incident, state, inventory, adapter, store, runtime, processor };
 }
 async function drive(f: Awaited<ReturnType<typeof fixture>>, turns = 5) { for (let n = 0; n < turns; n++) await f.processor.run(f.incident.id); }
+it("rejects an incomplete rotation capability before persisting a cloud attempt", async () => {
+  const f = await fixture();
+  // Inventory adapters may expose optional observations without implementing writes.
+  const { execute: _execute, ...readOnly } = f.adapter;
+  f.runtime.adapter = async () => readOnly as CloudAdapter;
+  await f.processor.run(f.incident.id);
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  expect(incident).toMatchObject({ status: "paused", errorCode: "rotation_unsupported", currentAttemptId: null });
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toEqual([]);
+});
+it.each([0, 1])("rejects missing workflow policy before mutation after %s prepared turns", async preparedTurns => {
+  const f = await fixture();
+  await drive(f, preparedTurns);
+  const registration = cloudProviders.getCloudServiceRegistration("ec2")!;
+  const { workflow: _workflow, ...withoutWorkflow } = registration;
+  const boundary = vi.spyOn(cloudProviders, "getCloudServiceRegistration").mockReturnValue(withoutWorkflow as cloudProviders.CloudServiceRegistration);
+  try {
+    await f.processor.run(f.incident.id);
+    const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+    expect(incident).toMatchObject({ status: "paused", errorCode: "rotation_unsupported" });
+    expect(f.state.writes).toEqual([]);
+    const attempts = await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id));
+    expect(attempts).toHaveLength(preparedTurns);
+    if (attempts[0]) expect(attempts[0].charged).toBe(false);
+  } finally { boundary.mockRestore(); }
+});
+it("keeps observing admitted steps when their workflow policy is unavailable", async () => {
+  const f = await fixture();
+  await drive(f, 2);
+  const registration = cloudProviders.getCloudServiceRegistration("ec2")!;
+  const { workflow: _workflow, ...withoutWorkflow } = registration;
+  const boundary = vi.spyOn(cloudProviders, "getCloudServiceRegistration").mockReturnValue(withoutWorkflow as cloudProviders.CloudServiceRegistration);
+  try {
+    await f.processor.run(f.incident.id);
+    expect(f.state.writes).toHaveLength(1);
+    expect(f.state.observations).toHaveLength(1);
+    const steps = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.attemptId, (await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id)))[0]!.id));
+    expect(steps.find(step => step.sequence === 0)?.status).toBe("applied");
+  } finally { boundary.mockRestore(); }
+});
 it("uses the same AWS cloud plan and policy budget for scheduled and health triggers", async () => {
   const health = await fixture("4", "health");
   const scheduled = await fixture("4", "scheduled");

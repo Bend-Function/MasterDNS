@@ -1,4 +1,5 @@
-import type { AllocationIdentity } from "../cloud/allocation-identity.js";
+import { getCloudServiceRegistration } from "@masterdns/cloud-providers";
+import { supportsRotationTrigger } from "@masterdns/contracts";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, inArray, isNull, ne, notExists, sql } from "drizzle-orm";
@@ -50,12 +51,8 @@ export function publicationAuthorizationError(c: RotationContext) {
   if (c.conflictingManager) return "conflicting_manager";
 }
 export function livePublicationMatches(c: RotationContext, live: CloudInventory) {
-  const metadata = c.address?.metadata;
-  const providerMetadata = metadata?.providerMetadata as Record<string, unknown> | undefined;
-  const identity = metadata?.allocationIdentity as AllocationIdentity | undefined;
-  // Missing Azure generation evidence cannot be replaced by a fresh scan.
-  if (c.instance.service === "azure_vm" && (identity || c.address?.origin === "system") &&
-      !(identity ? identity.resourceGuid : providerMetadata?.resourceGuid)) return false;
+  const policy = getCloudServiceRegistration(c.instance.service)?.workflow;
+  if (!c.address || !policy) return false;
   return (
     live.ref.accountId === c.account.id &&
     live.ref.instanceId === c.instance.externalId &&
@@ -67,11 +64,7 @@ export function livePublicationMatches(c: RotationContext, live: CloudInventory)
         i.addresses.some(
           (a) =>
             a.family === Number(c.slot.family) &&
-            a.address === c.address?.address &&
-            (!c.address.remoteAllocationId || a.allocationId === c.address.remoteAllocationId) &&
-            (!metadata?.resourceId || a.resourceId === metadata.resourceId) &&
-            (!providerMetadata?.resourceGuid || a.metadata?.resourceGuid === providerMetadata.resourceGuid) &&
-            (!identity || a.allocationId === identity.allocationId && a.resourceId === identity.resourceId && a.metadata?.resourceGuid === identity.resourceGuid),
+            policy.publicationAddressMatches(c.address!, a),
         ),
     )
   );
@@ -105,8 +98,7 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
       incident.policyRevision !== c.policy!.revision ||
       (manual ? !["publish", "cleanup", "complete"].includes(incident.phase) : !healthRevisionMatches(incident, h)))
       throw new Error("publication_incident_changed");
-    const manualSupported = (c.account.provider === "aws" && ["ec2", "lightsail"].includes(c.instance.service))
-      || (c.account.provider === "linode" && c.instance.service === "linode");
+    const manualSupported = supportsRotationTrigger(c.account.provider, c.instance.service, "manual");
     if (manual && (c.slot.family !== "4" || !manualSupported))
       throw new Error("manual_rotation_unsupported");
     // Once a manual operation is finished, configured health checks regain control.
@@ -506,7 +498,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
             const releasable =
               resource.address !== c.address!.address &&
               (resource.origin === "system" || releaseOldAddress || c.authorization?.allowReleaseAddress) &&
-              (resource.allocationId || (c.instance.service === "ec2" && c.slot.family === "6"));
+              (resource.allocationId || getCloudServiceRegistration(c.instance.service)?.workflow?.cleanupCanReleaseWithoutAllocation(Number(c.slot.family)));
             if (releasable && resource.cleanupStatus !== "released")
               await tx
                 .update(rotationResources)

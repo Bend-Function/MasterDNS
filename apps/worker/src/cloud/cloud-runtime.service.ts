@@ -3,7 +3,7 @@ import { Injectable } from "@nestjs/common";
 import { eq } from "drizzle-orm";
 import { cloudAccounts } from "@masterdns/db";
 import { decryptJson, parseEncryptionKey } from "@masterdns/crypto";
-import { CloudError, createCloudAdapter, credentialsMatchProvider, type CloudCredentials, type CloudAdapter } from "@masterdns/cloud-providers";
+import { CloudError, createCloudAdapter, credentialsMatchProvider, type CloudCredentials, type CloudProviderAdapter } from "@masterdns/cloud-providers";
 import { DatabaseService } from "../database.service.js";
 import { env } from "../env.js";
 
@@ -12,7 +12,7 @@ export class CloudRuntimeService {
   private readonly encryptionKey = parseEncryptionKey(env.MASTER_ENCRYPTION_KEY);
   constructor(private readonly database: DatabaseService) {}
 
-  async adapter(accountId: string, service: CloudService, options: { observation?: boolean } = {}): Promise<CloudAdapter> {
+  async adapter(accountId: string, service: CloudService, options: { observation?: boolean } = {}): Promise<CloudProviderAdapter> {
     const [account] = await this.database.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId)).limit(1);
     if (!account || (!options.observation && !account.enabled)) throw new CloudError("permission_denied", false);
     const credentials = decryptJson<CloudCredentials>({ ciphertext: account.credentialCiphertext, iv: account.credentialIv, tag: account.credentialTag, keyVersion: account.credentialKeyVersion }, this.encryptionKey);

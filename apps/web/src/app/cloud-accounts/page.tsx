@@ -1,6 +1,6 @@
 "use client";
 
-import { cloudProviderServices, type CloudProvider, type CloudService } from "@masterdns/contracts/cloud";
+import { cloudProviderIds, cloudProviderServices, type CloudProvider, type CloudService } from "@masterdns/contracts/cloud";
 import { cloudRotationLimitRules, type CloudRotationLimitStatus } from "@masterdns/contracts/cloud-rotation-limits";
 import { Gauge, KeyRound, Pause, Play, Plus, RefreshCw, SlidersHorizontal, Network } from "lucide-react";
 import Link from "next/link";
@@ -91,7 +91,7 @@ function CloudAccountsConsole() {
   const closeRotationLimits = () => { limitRequests.current.invalidate(); setSaving(false); setLimitLoading(false); setLimitTarget(null); setLimitStatus(null); setFormError(null); };
   const openCreate = () => { if (!me) return; mutations.current.invalidate(); createIntent.current = createIntentKey(); setDraft(emptyCredentialDraft()); setName(""); setRegions(""); setOwnerUserId(me.id); setSelectedProxyId(""); setFormError(null); setOpen(true); };
   const changeProvider = (provider: CloudProvider) => { mutations.current.invalidate(); createIntent.current = createIntentKey(); setDraft((current) => resetCredentialDraft(current, provider)); setRegions(""); setFormError(null); };
-  const changeKind = (awsKind: CredentialDraft["awsKind"]) => { setDraft((current) => ({ ...resetCredentialDraft(current), awsKind })); setFormError(null); };
+  const changeKind = (credentialKind: CredentialDraft["credentialKind"]) => { setDraft((current) => ({ ...resetCredentialDraft(current), credentialKind })); setFormError(null); };
 
   const create = async (event: FormEvent) => {
     event.preventDefault(); if (!me || saving) return; setSaving(true); setFormError(null);
@@ -211,7 +211,7 @@ function CloudAccountsConsole() {
     })}</tbody></table></div>}
     <Dialog open={open} title="接入云账号" onClose={closeCreate} footer={<><Button variant="secondary" onClick={closeCreate}>取消</Button><Button type="submit" form="cloud-account-form" disabled={saving}>{saving ? "正在验证" : "验证并接入"}</Button></>}>
       <form id="cloud-account-form" className="field-grid" onSubmit={create}>
-        <Field label="云 Provider"><select value={draft.provider} disabled={saving} onChange={(event) => changeProvider(event.target.value as CloudProvider)}>{(Object.keys(cloudProviderServices) as CloudProvider[]).map((provider) => <option key={provider} value={provider}>{cloudProviderLabels[provider]}</option>)}</select></Field>
+        <Field label="云 Provider"><select value={draft.provider} disabled={saving} onChange={(event) => changeProvider(event.target.value as CloudProvider)}>{cloudProviderIds.map((provider) => <option key={provider} value={provider}>{cloudProviderLabels[provider]}</option>)}</select></Field>
         <Field label="显示名称"><input value={name} disabled={saving} onChange={(event) => setName(event.target.value)} required maxLength={120} /></Field>
         {me?.role === "admin" && <Field label="资源所有者"><select value={ownerUserId} disabled={saving} onChange={(event) => { setOwnerUserId(event.target.value); setSelectedProxyId(""); }}>{users.filter((user) => user.status === "active").map((user) => <option key={user.id} value={user.id}>{user.username}</option>)}</select></Field>}
         <Field label="SOCKS 代理" hint="可在独立代理页面创建多个配置，同一所有者可复用"><select value={selectedProxyId} disabled={saving || proxiesResource.loading || !!proxiesResource.error} onChange={event => setSelectedProxyId(event.target.value)}><option value="">直连</option>{proxiesForOwner(profiles, ownerUserId || me?.id || "").map(profile => <option key={profile.id} value={profile.id}>{profile.name} · {profile.endpoint}</option>)}</select></Field>

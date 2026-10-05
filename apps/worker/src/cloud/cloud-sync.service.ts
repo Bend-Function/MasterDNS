@@ -1,7 +1,8 @@
+import { prepareInventoryPersistence, refreshedAddressMetadata } from "./inventory-persistence.js";
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { and, asc, eq, inArray, ne, or, sql } from "drizzle-orm";
-import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, getCloudTargetsForSlots, deletedLinodeTemporaryInstances, forgetDeletedLinodeTemporaryInstance, matchesLinodeTemporaryInstance, managedAddressSlots, resetHealthEvidence, rotationAttempts, rotationIncidents, rotationSteps } from "@masterdns/db";
-import { CloudError, type CloudAdapter, type CloudInventory } from "@masterdns/cloud-providers";
+import { addressHealthStates, cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, getCloudTargetsForSlots, managedAddressSlots, resetHealthEvidence, rotationAttempts, rotationIncidents, rotationSteps } from "@masterdns/db";
+import { CloudError, getCloudServiceRegistration, type CloudInventoryAdapter, type CloudInventory } from "@masterdns/cloud-providers";
 import { queueNames, cloudProviderServices, cloudServiceProvider, validCloudRegion, type CloudService, type CloudSyncJob } from "@masterdns/contracts";
 import { Worker } from "bullmq";
 import { DatabaseService } from "../database.service.js";
@@ -55,7 +56,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
     return results;
   }
 
-  async scanScope(accountId: string, service: Service, region: string, adapter: CloudAdapter, expectedAccount?: typeof cloudAccounts.$inferSelect): Promise<ScanResult> {
+  async scanScope(accountId: string, service: Service, region: string, adapter: CloudInventoryAdapter, expectedAccount?: typeof cloudAccounts.$inferSelect): Promise<ScanResult> {
     const [account] = await this.database.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId));
     if (!account?.enabled) return { scopeStatus: "failed", removedInstances: 0, errorCode: "account_unavailable" };
     if (cloudServiceProvider(service) !== account.provider || !validCloudRegion(account.provider, region)) return { scopeStatus: "failed", removedInstances: 0, errorCode: "invalid_scope" };
@@ -87,9 +88,10 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         if (currentScope?.generation !== scope.generation) throw new Error("Cloud scope already advanced");
         const generation = scope.generation + 1;
         const now = new Date();
-        const deletedHelpers = service === "linode" ? await deletedLinodeTemporaryInstances(tx, accountId, region) : [];
+        const persistence = await prepareInventoryPersistence(tx, service, accountId, region);
+        const workflow = getCloudServiceRegistration(service)?.workflow;
         for (const item of items) {
-          if (deletedHelpers.some(proof => matchesLinodeTemporaryInstance({ externalId: item.ref.instanceId, name: item.name, created: item.metadata?.instanceCreated }, proof))) continue;
+          if (!persistence.includes(item)) continue;
           const metadata = { present: true, providerMetadata: item.metadata ?? {}, ...(item.nativeName !== undefined ? { nativeName: item.nativeName } : {}), ...(item.ipv6Only !== undefined ? { ipv6Only: item.ipv6Only } : {}) };
           const [instance] = await tx.insert(cloudInstances).values({ accountId, service, region, externalId: item.ref.instanceId, name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now })
             .onConflictDoUpdate({ target: [cloudInstances.accountId, cloudInstances.service, cloudInstances.region, cloudInstances.externalId], set: { name: item.name, state: item.state, metadata, scanGeneration: generation, lastSeenAt: now, updatedAt: now } }).returning();
@@ -111,11 +113,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
               // Legacy GUIDs must be anchored BEFORE the first scan can overwrite them.
               // Receipt-backed UPSERT rows may still have origin=user, so origin alone
               // cannot identify trusted proof. Never derive it from incoming inventory.
-              const refreshedMetadata = service === "azure_vm" ? sql`${JSON.stringify(addressMetadata)}::jsonb || case
-                when ${cloudAddresses.metadata} ? 'allocationIdentity' then jsonb_build_object('allocationIdentity', ${cloudAddresses.metadata}->'allocationIdentity')
-                when ${cloudAddresses.origin} = 'system' or nullif(${cloudAddresses.metadata}->'providerMetadata'->>'resourceGuid', '') is not null
-                  then jsonb_build_object('allocationIdentity', jsonb_build_object('allocationId', ${cloudAddresses.remoteAllocationId}, 'resourceId', ${cloudAddresses.metadata}->'resourceId', 'resourceGuid', ${cloudAddresses.metadata}->'providerMetadata'->'resourceGuid'))
-                else '{}'::jsonb end` : addressMetadata;
+              const refreshedMetadata = refreshedAddressMetadata(service, addressMetadata);
               // Preserve known origin/attempt ownership; a scan never establishes system ownership.
               const [address] = await tx.insert(cloudAddresses).values(values).onConflictDoUpdate({
                 target: kind === "host" ? [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address] : [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address, cloudAddresses.prefixLength],
@@ -130,7 +128,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
                 )).limit(1);
                 if (existingSlot && (!observed.primary || (existingSlot.candidateAddressId ?? existingSlot.currentAddressId) === address.id)) continue;
                 let name = existingSlot?.name ?? (observed.primary ? "primary" : observed.address);
-                if (!existingSlot && observed.primary && family === "4" && (service === "ec2" || service === "lightsail")) {
+                if (!existingSlot && observed.primary && family === "4" && workflow?.inventoryAddressRole(observed.metadata)) {
                   const roleSlots = await tx.select({ name: managedAddressSlots.name, metadata: cloudAddresses.metadata, address: cloudAddresses.address }).from(managedAddressSlots)
                     .leftJoin(cloudAddresses, eq(managedAddressSlots.currentAddressId, cloudAddresses.id))
                     .where(and(eq(managedAddressSlots.interfaceId, iface.id), eq(managedAddressSlots.family, family)));
@@ -140,10 +138,10 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
                   const role = (row: typeof roleSlots[number]) => {
                     const currentObservation = remote.addresses.find(item => item.address === row.address);
                     const metadata = row.metadata?.providerMetadata;
-                    return currentObservation?.metadata?.awsAddressScope ?? (metadata && typeof metadata === "object" ? (metadata as Record<string, unknown>).awsAddressScope : undefined);
+                    return workflow?.inventoryAddressRole(currentObservation?.metadata) ?? workflow?.inventoryAddressRole(metadata && typeof metadata === "object" ? metadata as Record<string, unknown> : undefined);
                   };
-                  const observedScope = observed.metadata?.awsAddressScope;
-                  if (observedScope === "private" || observedScope === "public") {
+                  const observedScope = workflow?.inventoryAddressRole(observed.metadata);
+                  if (observedScope) {
                     const matchingRole = roleSlots.find(row => (row.name === "primary" || row.name.startsWith(`primary-${observedScope}`)) && role(row) === observedScope);
                     if (matchingRole) name = matchingRole.name;
                     else if (roleSlots.some(row => row.name === "primary")) {
@@ -184,14 +182,7 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
         const targets = await getCloudTargetsForSlots(tx, scopeSlots.map(slot => slot.id));
         const historical = [...targets.values()].filter(target => !target.available).map(target => target.slot.id);
         if (historical.length) await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(inArray(addressHealthStates.slotId, historical));
-        if (deletedHelpers.length) {
-          const retained = await tx.select({ externalId: cloudInstances.externalId }).from(cloudInstances)
-            .where(and(eq(cloudInstances.accountId, accountId), eq(cloudInstances.service, service), eq(cloudInstances.region, region)));
-          const retainedIds = new Set(retained.map(instance => instance.externalId));
-          for (const proof of deletedHelpers) {
-            if (retainedIds.has(proof.id) && await forgetDeletedLinodeTemporaryInstance(tx, proof)) retainedIds.delete(proof.id);
-          }
-        }
+        await persistence.complete(tx);
         return { scopeStatus: "complete", removedInstances: absent.length };
       });
     } catch (error) {

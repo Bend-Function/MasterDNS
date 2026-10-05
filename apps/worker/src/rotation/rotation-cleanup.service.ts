@@ -1,8 +1,11 @@
+import { persistedCleanupOptions, persistedRotationOptions, rotationPersistenceExtension } from "./rotation-persistence-extensions.js";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   CloudError,
+  getCloudServiceRegistration,
+  requireCloudRotation,
   planCloudRotationCleanup,
   type CloudInventory,
   type CloudObservation,
@@ -29,8 +32,6 @@ import {
   reserveCloudRotationWrite,
   recordCloudRotationThrottle,
   lockIdleIpAddress,
-  linodeTemporaryInstanceProof,
-  forgetDeletedLinodeTemporaryInstance,
   type RotationContext,
   type RotationTransaction,
 } from "@masterdns/db";
@@ -108,7 +109,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (identity && !r.cleanupStepId) {
         const aliases = (await tx.select().from(rotationResources).where(eq(rotationResources.incidentId, incident.id)).orderBy(asc(rotationResources.createdAt), asc(rotationResources.id)))
           .filter(other => cleanupIdentity(other) === identity);
-        const canonical = aliases.find(other => other.cleanupStepId) ?? aliases.find(other => linodeTemporaryInstanceProof(other.snapshot.linodeSwapReceipt)) ?? aliases[0]!;
+        const canonical = aliases.find(other => other.cleanupStepId) ?? aliases.find(other => rotationPersistenceExtension(c.instance.service).hasCleanupProof(other)) ?? aliases[0]!;
         if (canonical.id !== r.id) {
           await tx.update(rotationResources).set({ snapshot: { ...r.snapshot, cleanupCanonicalResourceId: canonical.id },
             cleanupStatus: canonical.cleanupStatus, cleanupError: canonical.cleanupError,
@@ -135,9 +136,9 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     try {
       const observing = initial.step && ["in_flight", "pending", "ambiguous"].includes(initial.step.status);
       if (!observing && c.lifecycleBlocked) { await this.waitForLifecycle(r, c.slot.id); return; }
-      const adapter = await this.runtime.adapter(c.account.id, c.instance.service, { observation: !!observing });
+      const adapter = requireCloudRotation(await this.runtime.adapter(c.account.id, c.instance.service, { observation: !!observing }));
+      if (!adapter.observeDetails) throw new Error("cleanup_observation_unavailable");
       if (observing) {
-        if (!adapter.observeDetails) throw new Error("cleanup_observation_unavailable");
         const step = initial.step!;
         const result = await adapter.observeDetails({
           ...step.plan,
@@ -170,16 +171,10 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         if (!livePublicationMatches(current, live)) throw new Error("cleanup_replacement_not_live");
         // IPv6 may remain on this exact ENI until unassignment. Allocations must be detached;
         // provider execute additionally reads the allocation's account-wide attachment/tags/ARN.
-        const oldLive = live.interfaces.flatMap((i) => i.addresses.map((a) => ({ i, a }))).find((x) => x.a.address === resource.address);
-        if (
-          oldLive &&
-          !(current.instance.service === "linode" && current.slot.family === "4" && oldLive.i.id === current.iface!.externalId &&
-            oldLive.i.addresses.some(a => a.family === 4 && a.address === current.address?.address && a.address !== resource.address)) &&
-          (current.slot.family !== "6" ||
-            current.instance.service !== "ec2" ||
-            oldLive.i.id !== current.iface!.externalId ||
-            oldLive.a.primary)
-        )
+        const cleanupSlot = { accountId: current.account.id, service: current.instance.service, region: current.instance.region,
+          instanceId: current.instance.externalId, interfaceId: current.iface!.externalId, slotId: current.slot.id,
+          address: current.address!.address, family: Number(current.slot.family) as 4 | 6 };
+        if (!getCloudServiceRegistration(current.instance.service)?.workflow?.cleanupAttachedAddressAllowed(cleanupSlot, resource.address, current.address!.address, live))
           throw new Error("cleanup_resource_attached");
         // A started chain owns the physical guest configuration until its last step settles.
         const siblings = await tx.select().from(rotationResources).where(and(eq(rotationResources.incidentId, incident.id), ne(rotationResources.id, resource.id), inArray(rotationResources.cleanupStatus, ["pending", "failed"])));
@@ -200,21 +195,13 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         const chain = await this.chain(tx, resource);
         const persisted = chain.find(s => s.id === stepId);
         if (!persisted || !["prepared", "not_applied", "rejected_no_effect"].includes(persisted.status)) return;
-        let companionPhysicalKey: string | undefined;
-        if (persisted.plan.action === "linode.swap.delete") {
-          if (!current.policy?.linodeAllowTemporaryInstance) throw new Error("rotation_temporary_instance_not_authorized");
-          const proof = linodeTemporaryInstanceProof(persisted.plan.arguments.linodeSwapReceipt);
-          const key = proof && JSON.stringify(["linode", current.account.externalAccountId, "linode", current.instance.region, proof.id]);
-          const [peer] = key ? await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, key)).for("update") : [];
-          if (!peer || peer.incidentId !== incident.id || peer.unresolvedStepId || (peer.holder && peer.expiresAt > now)) throw new Error("rotation_temporary_instance_busy");
-          companionPhysicalKey = key;
-        }
-        if (["linode.instance.reboot", "linode.instance.stop", "linode.instance.start"].includes(persisted.plan.action) && !current.authorization!.allowStopStart) throw new Error("stop_not_authorized");
+        const companionPhysicalKey = await rotationPersistenceExtension(current.instance.service).authorizeStep(tx, current, incident.id, persisted.plan, undefined, now);
         const applied = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, resource.attemptId)).orderBy(asc(rotationSteps.sequence));
         const prior = applied.filter(s => s.status === "applied" && (s.plan.arguments.phase === "rotation" || chain.some(member => member.id === s.id)));
         const allocation = prior.filter(s => s.plan.arguments.phase === "rotation" && s.plan.action.endsWith(".allocate")).at(-1);
+        const permissions = persistedRotationOptions(current);
         const plan = { ...persisted.plan, arguments: { ...persisted.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })),
-          ...(allocation ? { candidateReceipt: allocation.receipt } : {}), allowStop: current.authorization!.allowStopStart, allowTemporaryInstance: current.policy?.linodeAllowTemporaryInstance ?? false } };
+          ...(allocation ? { candidateReceipt: allocation.receipt } : {}), allowStop: permissions.allowStop, allowTemporaryInstance: permissions.allowTemporaryInstance } };
         const admission = await reserveCloudRotationWrite(tx, { accountId: current.account.id, service: current.instance.service, region: current.instance.region, stepId, action: plan.action });
         if (!admission.allowed) {
           await tx.update(rotationResources).set({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited", cleanupDueAt: admission.retryAt }).where(eq(rotationResources.id, resource.id));
@@ -315,7 +302,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, r.attemptId));
     if (!attempt) throw new Error("cleanup_attempt_missing");
     const [rotationStep] = await tx.select({ plan: rotationSteps.plan }).from(rotationSteps).where(eq(rotationSteps.attemptId, r.attemptId)).orderBy(asc(rotationSteps.sequence)).limit(1);
-    const linodeRestartMode = rotationStep?.plan.arguments.linodeRestartMode === "stop_start" ? "stop_start" : "reboot";
+    const serviceOptions = persistedCleanupOptions(c, rotationStep?.plan);
     const slot = r.snapshot.slot as SlotRef | undefined;
     if (
       !slot ||
@@ -328,18 +315,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     )
       throw new Error("cleanup_identity_changed");
     const before = structuredClone((r.snapshot.inventory ?? attempt.beforeInventory) as CloudInventory);
-    const swapReceipt = r.snapshot.linodeSwapReceipt as CloudStepResult | undefined;
-    if (swapReceipt) {
-      const proof = linodeTemporaryInstanceProof(swapReceipt);
-      if (r.role !== "original" || !proof || proof.originalAddress !== r.address || proof.attemptId !== r.attemptId || swapReceipt.after?.swapVerified !== true) throw new Error("cleanup_identity_changed");
-      const original = before.interfaces.find(iface => iface.id === slot.interfaceId)?.addresses.find(address => address.address === r.address && address.family === slot.family);
-      if (!original || !r.allocationId || original.allocationId !== r.allocationId || original.resourceId !== r.resourceId) throw new Error("resource_ownership_ambiguous");
-      return planCloudRotationCleanup({ ...slot, address: r.address }, before, { attemptId: r.attemptId, releaseAuthorized: true, publishedAddress: c.address!.address,
-        linodeIpv4Strategy: "instance_swap", linodeRestartMode, linodeSwapPlan: typeof rotationStep?.plan.arguments.linodeSwapPlan === "string" ? rotationStep.plan.arguments.linodeSwapPlan : "g6-nanode-1", linodeSwapReceipt: swapReceipt,
-        ownershipSnapshot: { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, address: r.address, allocationId: r.allocationId, ...(r.resourceId ? { resourceId: r.resourceId } : {}) },
-        allowStop: c.authorization!.allowStopStart, allowTemporaryInstance: c.policy?.linodeAllowTemporaryInstance ?? false,
-        ...(live ? { publishedInventory: live } : {}) });
-    }
+    const servicePlan = rotationPersistenceExtension(c.instance.service).cleanupPlan(c, r, slot, before, {
+      ...serviceOptions, attemptId: r.attemptId, releaseAuthorized: true, publishedAddress: c.address!.address,
+      ...(live ? { publishedInventory: live } : {}),
+    });
+    if (servicePlan) return servicePlan;
     const allocationReceipt = async (attemptId: string | null, address: string) => {
       if (!attemptId) return undefined;
       const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attemptId)).orderBy(asc(rotationSteps.sequence));
@@ -357,24 +337,15 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         (r.resourceId && receipt?.resourceId !== r.resourceId)
       )
         throw new Error("resource_ownership_ambiguous");
-      const previous = slot.service === "ec2" || slot.service === "lightsail" ? iface.addresses.find((a) => a.family === slot.family) : undefined;
-      iface.addresses = iface.addresses.filter((a) => slot.service === "linode" ? a.address !== r.address : a.family !== slot.family);
-      iface.addresses.push({
-        ...previous,
-        ...(receipt?.after?.addressMetadata && typeof receipt.after.addressMetadata === "object" ? { metadata: receipt.after.addressMetadata as Record<string, unknown> } : {}),
-        ...(typeof receipt?.after?.privateAddress === "string" ? { privateAddress: receipt.after.privateAddress } : {}),
-        address: r.address,
-        family: slot.family,
-        primary: slot.family === 4,
-        ...(r.allocationId ? { allocationId: r.allocationId } : {}),
-        ...(r.resourceId ? { resourceId: r.resourceId } : {}),
-      });
+      const workflow = getCloudServiceRegistration(slot.service)?.workflow;
+      if (!workflow) throw new Error("cleanup_plan_ambiguous");
+      iface.addresses = workflow.reconstructCleanupCandidate(slot, iface.addresses, r, receipt ?? {});
     }
     const original = iface.addresses.find((a) => a.address === r.address && a.family === slot.family);
     if (!original || original.allocationId !== (r.allocationId ?? undefined) || (r.resourceId && original.resourceId !== r.resourceId))
       throw new Error("resource_ownership_ambiguous");
     const ownershipSnapshot: CleanupOwnershipSnapshot | undefined =
-      (r.origin === "user" || slot.service === "azure_vm" || slot.service === "linode") && r.allocationId
+      getCloudServiceRegistration(slot.service)?.workflow?.cleanupNeedsOwnershipSnapshot(r.origin) && r.allocationId
         ? {
             accountId: slot.accountId,
             instanceId: slot.instanceId,
@@ -388,8 +359,8 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       attemptId: r.attemptId,
       releaseAuthorized: true,
       publishedAddress: c.address!.address,
-      allowStop: c.authorization!.allowStopStart,
-      linodeRestartMode,
+      allowStop: serviceOptions.allowStop,
+      linodeRestartMode: serviceOptions.linodeRestartMode,
       ...(live ? { publishedInventory: live } : {}),
       ...(publishedReceipt ? { publishedReceipt, publishedAttemptId: c.address!.attemptId! } : {}),
       ...(cleanupReceipt ? { cleanupReceipt } : {}),
@@ -466,7 +437,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       }
       const next = status === "applied" && !historyAmbiguous ? chain[chain.findIndex(member => member.id === stepId) + 1] : undefined;
       let snapshot = resource.snapshot;
-      if (status === "applied" && step.status !== "applied" && ["linode.instance.reboot", "linode.instance.start"].includes(step.plan.action)) {
+      if (status === "applied" && step.status !== "applied" && rotationPersistenceExtension(context.instance.service).invalidatesHealth(step.plan)) {
         const now = await databaseNow(tx);
         const [sequence] = await tx.select().from(probeRoundSequences).where(eq(probeRoundSequences.slotId, context.slot.id));
         const health = await lockRotationHealth(tx, context);
@@ -482,14 +453,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         ...(status === "applied" ? { attached: false, referenced: false } : {}),
       }).where(eq(rotationResources.id, r.id));
       if (status === "applied" && !next && !historyAmbiguous) {
-        if (step.plan.action === "linode.swap.delete") {
-          const proof = linodeTemporaryInstanceProof(step.plan.arguments.linodeSwapReceipt);
-          if (proof) {
-            await tx.update(rotationLeases).set({ incidentId: null, updatedAt: new Date() })
-              .where(and(eq(rotationLeases.physicalKey, JSON.stringify(["linode", proof.externalAccountId, "linode", proof.region, proof.id])), eq(rotationLeases.incidentId, r.incidentId), isNull(rotationLeases.unresolvedStepId)));
-            await forgetDeletedLinodeTemporaryInstance(tx, proof);
-          }
-        }
+        await rotationPersistenceExtension(context.instance.service).completeCleanup(tx, r.incidentId, step.plan);
         const identity = cleanupIdentity(resource);
         if (identity) {
           const aliases = await tx.select().from(rotationResources).where(and(eq(rotationResources.incidentId, r.incidentId), ne(rotationResources.id, r.id), isNull(rotationResources.cleanupStepId)));
@@ -573,10 +537,5 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
 /** Only known system allocation provenance can alias two historical resource rows. */
 function cleanupIdentity(resource: Resource): string | undefined {
   const slot = resource.snapshot.slot as SlotRef | undefined;
-  if (!slot || !["azure_vm", "linode"].includes(slot.service) || resource.origin !== "system" || !resource.ownershipAttemptId || !resource.allocationId || !resource.resourceId) return undefined;
-  const ownership = resource.snapshot.ownership as { metadata?: Record<string, unknown> } | undefined;
-  const receipt = resource.snapshot.receipt as CloudStepResult | undefined;
-  const receiptMetadata = receipt?.after?.addressMetadata as Record<string, unknown> | undefined;
-  const guid = ownership?.metadata?.resourceGuid ?? receiptMetadata?.resourceGuid ?? null;
-  return JSON.stringify([slot.accountId, slot.service, slot.region, slot.instanceId, slot.interfaceId, resource.address, resource.allocationId, resource.resourceId, resource.ownershipAttemptId, guid]);
+  return slot ? getCloudServiceRegistration(slot.service)?.workflow?.cleanupResourceIdentity(resource) : undefined;
 }

@@ -1,3 +1,4 @@
+import { rotationAuthorizationPrerequisiteError } from "@masterdns/contracts";
 import { and, eq, inArray, ne, sql } from "drizzle-orm";
 import { cloudAccounts, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, instanceAuthorizations, managedAddressSlots, rotationPolicies } from "./schema/index.js";
 import type { MasterDnsDatabase } from "./index.js";
@@ -39,7 +40,7 @@ export function rotationAuthorizationError(c: RotationContext, trigger: "health"
   if (!c.scope || (c.account.regions !== null && !c.account.regions.includes(c.instance.region))) return "region_excluded";
   if (!c.iface || !c.address?.inventoryPresent || c.instance.metadata.present === false || c.iface.scanGeneration !== c.instance.scanGeneration) return "resource_not_found";
   if (c.conflictingManager) return "conflicting_manager";
-  if (c.instance.service === "linode" && c.policy?.linodeIpv4Strategy === "instance_swap" && !c.policy.linodeAllowTemporaryInstance) return "rotation_temporary_instance_not_authorized";
+  return rotationAuthorizationPrerequisiteError(c.instance.service, c.policy ?? {});
 }
 
 /** Prelock the entire hierarchy before callers acquire any Pool lock. Sorting

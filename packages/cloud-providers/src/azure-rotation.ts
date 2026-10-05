@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
 import { isIP } from 'node:net';
 import type { CloudStep, SlotRef } from '@masterdns/contracts';
-import { azureCapabilities, azurePublicIpMetadata, nicSupported, pipSupported, type AzureCloudAdapter, type AzureRead, type AzureResource, type AzureSlotEvidence } from './azure.js';
+import { azureCapabilities, azurePublicIpMetadata, nicSupported, pipSupported } from './azure-capabilities.js';
+import type { AzureCloudAdapter, AzureRead, AzureResource, AzureSlotEvidence } from './azure.js';
 import { NETWORK_API, equalArmId, retryAfter, type AzureResponse } from './azure-http.js';
 import { CloudError } from './errors.js';
 import type { CloudInventory, CloudObservation, CloudStepResult } from './provider.js';
-import { makeRotationStep, rotationArguments, type CleanupPlanOptions, type RotationStepArguments } from './rotation-plan.js';
+import { makeRotationStep, rotationArguments, type CleanupPlanOptions, type RotationStepArguments } from './rotation-step.js';
 const ambiguous = (): never => { throw new CloudError('resource_ownership_ambiguous', false); };
 const selected = (a: RotationStepArguments) => a.before.interfaces.find(i => equalArmId(i.id, a.slot.interfaceId));
 function originalId(a: RotationStepArguments): string {

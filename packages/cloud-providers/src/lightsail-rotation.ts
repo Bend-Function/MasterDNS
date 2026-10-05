@@ -9,7 +9,7 @@ import { assertCleanup } from "./ec2-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
 import type { AwsSend, CloudObservation, CloudStepResult } from "./provider.js";
 import { hasCleanupOwnership, rotationResourceName } from "./resource-ownership.js";
-import { rotationArguments } from "./rotation-plan.js";
+import { rotationArguments } from "./rotation-step.js";
 
 const actions = new Set(["lightsail.static-ip.allocate", "lightsail.static-ip.detach", "lightsail.static-ip.attach", "lightsail.static-ip.release", "lightsail.ipv6.disable", "lightsail.ipv6.enable"]);
 

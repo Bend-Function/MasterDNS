@@ -1,3 +1,4 @@
+import { evaluateCapabilities } from "@masterdns/cloud-providers";
 import { createHash, randomUUID } from "node:crypto";
 import { eq, sql } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
@@ -75,6 +76,8 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
     .returning();
   const state = { writes: 0, observations: 0, observationStatus: "applied" as "applied" | "pending", lost: false, error: undefined as Error | undefined, attachedElsewhere: false, beforeInspect: undefined as (() => Promise<void>) | undefined };
   const adapter = {
+    capabilities: evaluateCapabilities,
+    observe: async () => state.observationStatus,
     inspect: async () => { await state.beforeInspect?.(); return f.live; },
     execute: async () => {
       state.writes++;
@@ -89,8 +92,18 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
     },
   };
   const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => adapter } as never);
-  return { ...f, resource: resource!, state, cleanup, incident: incident! };
+  return { ...f, resource: resource!, state, cleanup, incident: incident!, adapter };
 }
+
+it("refuses cleanup before dispatch when detailed observation is unavailable", async () => {
+  const f = await cleanupFixture();
+  const { observeDetails: _observeDetails, ...withoutDetailedObservation } = f.adapter;
+  const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => withoutDetailedObservation } as never);
+  await cleanup.run(f.resource.id, new Date());
+  expect(f.state.writes).toBe(0);
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource).toMatchObject({ cleanupStatus: "failed", cleanupError: "cleanup_observation_unavailable", cleanupStepId: null });
+});
 
 let linodeCleanupAddress = 100;
 async function linodeSwapCleanupFixture() {
@@ -126,6 +139,8 @@ async function linodeSwapCleanupFixture() {
   const swap = { writes: [] as Array<Parameters<import("@masterdns/cloud-providers").CloudAdapter["execute"]>[0]>, observations: 0, lost: false, pending: false };
   const deleteReceipt = { ...receipt, allocationId: f.resource.address, resourceId: `/linode/instances/42/ips/${f.resource.address}` };
   const adapter = {
+    capabilities: evaluateCapabilities,
+    observe: async () => swap.pending ? "pending" as const : "applied" as const,
     inspect: async () => f.live,
     execute: async (step: Parameters<import("@masterdns/cloud-providers").CloudAdapter["execute"]>[0]) => {
       swap.writes.push(step);
@@ -419,6 +434,8 @@ it("uses real EC2 cleanup preconditions to preserve an EIP reassociated to a for
     {
       adapter: async () => ({
         inspect: async () => f.live,
+        capabilities: adapter.capabilities.bind(adapter),
+        observe: adapter.observe.bind(adapter),
         execute: adapter.execute.bind(adapter),
         observeDetails: adapter.observeDetails.bind(adapter),
       }),
@@ -464,6 +481,8 @@ it("unassigns only the old non-primary IPv6 from the original ENI while the repl
     {
       adapter: async () => ({
         inspect: async () => f.live,
+        capabilities: adapter.capabilities.bind(adapter),
+        observe: adapter.observe.bind(adapter),
         execute: adapter.execute.bind(adapter),
         observeDetails: adapter.observeDetails.bind(adapter),
       }),

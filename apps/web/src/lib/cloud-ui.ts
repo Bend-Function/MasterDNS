@@ -1,3 +1,4 @@
+import { supportsRotationTrigger, cloudProviderDefinitions, cloudProviderIds, cloudServiceDefinitions, type CloudProvider } from "@masterdns/contracts/cloud";
 import { ApiError } from "./api";
 import type { CloudTargetSummary } from "./cloud-types";
 import type { AddressSlot, AuthorizationPayload, CloudAccount, CloudAddress, CloudAuthorization, CloudInstance, CloudInstanceRow, CloudScope } from "./cloud-types";
@@ -104,10 +105,10 @@ function sameIpAddress(left: string, right: string) {
 
 const errorMessage = (value: unknown) => value instanceof Error ? value.message : "加载失败";
 
-export const cloudProviderLabels = { aws: "AWS", azure: "Microsoft Azure", linode: "Linode / Akamai Cloud" } as const;
-export const cloudScopeExamples = { aws: "ap-southeast-2, us-west-2", azure: "australiaeast, westus2", linode: "us-east, ap-south" } as const;
+export const cloudProviderLabels = Object.fromEntries(cloudProviderIds.map(provider => [provider, cloudProviderDefinitions[provider].label])) as Record<CloudProvider, string>;
+export const cloudScopeExamples = Object.fromEntries(cloudProviderIds.map(provider => [provider, cloudProviderDefinitions[provider].regionExample])) as Record<CloudProvider, string>;
 export function cloudServiceLabel(service: import("@masterdns/contracts/cloud").CloudService) {
-  return { ec2: "Amazon EC2", lightsail: "Amazon Lightsail", azure_vm: "Azure Virtual Machine", linode: "Linode" }[service];
+  return cloudServiceDefinitions[service].label;
 }
 export function capabilityReason(reason?: string) {
   return ({
@@ -163,8 +164,7 @@ type ManualIpv4RotationContext = {
 };
 
 export function manualIpv4RotationEligibility(slot: AddressSlot, context: ManualIpv4RotationContext): { visible: boolean; reason: string | null } {
-  const visible = ((context.provider === "aws" && ["ec2", "lightsail"].includes(context.service))
-    || (context.provider === "linode" && context.service === "linode"))
+  const visible = supportsRotationTrigger(context.provider, context.service, "manual")
     && slot.slot.family === "4"
     && (slot.observedCapability ?? slot.capability)?.reason !== "private_ipv4_unsupported";
   if (!visible) return { visible: false, reason: null };

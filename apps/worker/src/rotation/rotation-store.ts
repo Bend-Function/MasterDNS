@@ -1,16 +1,14 @@
-import { allocationIdentity } from "../cloud/allocation-identity.js";
 import { isIP } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { nextRotationAction, type RotationSnapshot, type RotationStepSnapshot, type RotationCloudRejection } from "@masterdns/automation";
-import { planCloudRotation, type CloudInventory, type CloudObservation, type CloudStepResult } from "@masterdns/cloud-providers";
+import { getCloudServiceRegistration, planCloudRotation, type CloudInventory, type CloudObservation, type CloudStepResult } from "@masterdns/cloud-providers";
 import { cloudAddresses, databaseNow, healthRevisionMatches, lockRotationContext, lockRotationHealth, resetHealthEvidence, addressHealthStates, managedAddressSlots, rotationAttempts, rotationAudit, rotationBudgetSegments, rotationIncidents, rotationLeases, rotationPublications, rotationResources, rotationSteps, rotationStepObservations, rotationAuthorizationError, type RotationContext, type RotationTransaction } from "@masterdns/db";
 import { DatabaseService } from "../database.service.js";
 import { reserveCloudRotationWrite, recordCloudRotationThrottle } from "@masterdns/db";
 import { acquireRotationLease, releaseRotationLease, verifyRotationLease, type RotationLease } from "./rotation-lock.js";
-import { linodeTemporaryInstanceProof } from "@masterdns/db";
-import { recordLinodeSwapState } from "./linode-swap-state.js";
+import { persistedRotationOptions, rotationPersistenceExtension } from "./rotation-persistence-extensions.js";
 
 type Incident = typeof rotationIncidents.$inferSelect;
 type Step = typeof rotationSteps.$inferSelect;
@@ -91,8 +89,7 @@ export class RotationStore {
       if (!c.address || !c.iface) return false;
       const attemptId = randomUUID();
       const slot = { accountId: c.account.id, service: c.instance.service, region: c.instance.region, instanceId: c.instance.externalId, interfaceId: c.iface.externalId, slotId: c.slot.id, address: c.address.address, family: c.slot.family === "4" ? 4 as const : 6 as const };
-      const plan = planCloudRotation(slot, inventory, { allowStop: c.authorization!.allowStopStart, attemptId, linodeRestartMode: c.policy?.linodeRestartMode ?? "reboot",
-        linodeIpv4Strategy: c.policy?.linodeIpv4Strategy ?? "additional_ipv4", linodeSwapPlan: c.policy?.linodeSwapPlan ?? "g6-nanode-1", allowTemporaryInstance: c.policy?.linodeAllowTemporaryInstance ?? false });
+      const plan = planCloudRotation(slot, inventory, { ...persistedRotationOptions(c), attemptId });
       const previous = await tx.select({ sequence: rotationAttempts.sequence }).from(rotationAttempts).where(eq(rotationAttempts.incidentId, id));
       const failed = await tx.select({ address: rotationResources.address }).from(rotationResources).where(and(eq(rotationResources.incidentId, id), eq(rotationResources.role, "candidate")));
       if (run.attempt && incident.phase === "candidate") await tx.update(rotationAttempts).set({ status: "candidate_failed" }).where(eq(rotationAttempts.id, run.attempt.id));
@@ -111,21 +108,11 @@ export class RotationStore {
       if (run.action.kind !== "execute" || run.action.operation !== "cloud_step" || run.action.stepId !== stepId || !run.attempt || !run.physical || run.physical.unresolvedStepId || run.physical.incidentId !== id) return;
       const error = rotationAuthorizationError(c, incident.trigger); if (error) throw new Error(error);
       const step = run.steps.find(s => s.id === stepId)!;
-      if (["linode.instance.reboot", "linode.instance.stop", "linode.instance.start"].includes(step.plan.action) && !c.authorization!.allowStopStart) throw new Error("stop_not_authorized");
       const prior = run.steps.filter(s => s.status === "applied" && s.plan.arguments.phase === "rotation" && s.sequence < step.sequence);
       const allocation = prior.filter(s => s.plan.action.endsWith(".allocate")).at(-1);
-      let companionPhysicalKey: string | undefined;
-      if (step.plan.arguments.linodeIpv4Strategy === "instance_swap") {
-        if (!c.policy?.linodeAllowTemporaryInstance) throw new Error("rotation_temporary_instance_not_authorized");
-        if (step.plan.action !== "linode.swap.allocate") {
-          const proof = linodeTemporaryInstanceProof(allocation?.receipt);
-          const key = proof && JSON.stringify(["linode", c.account.externalAccountId, "linode", c.instance.region, proof.id]);
-          const [peer] = key ? await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, key)).for("update") : [];
-          if (!peer || peer.incidentId !== id || peer.unresolvedStepId || (peer.holder && peer.expiresAt > run.h.now)) throw new Error("rotation_temporary_instance_busy");
-          companionPhysicalKey = key;
-        }
-      }
-      const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: c.authorization!.allowStopStart, allowTemporaryInstance: c.policy?.linodeAllowTemporaryInstance ?? false, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
+      const companionPhysicalKey = await rotationPersistenceExtension(c.instance.service).authorizeStep(tx, c, id, step.plan, allocation?.receipt, run.h.now);
+      const permissions = persistedRotationOptions(c);
+      const plan = { ...step.plan, arguments: { ...step.plan.arguments, priorReceipts: prior.map(s => ({ action: s.plan.action, receipt: s.receipt })), allowStop: permissions.allowStop, allowTemporaryInstance: permissions.allowTemporaryInstance, ...(allocation ? { candidateReceipt: allocation.receipt } : {}) } };
       const admission = await reserveCloudRotationWrite(tx, {
         accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: plan.action,
         remainingSteps: run.steps.filter(s => s.sequence >= step.sequence && s.plan.arguments.phase === "rotation" && ["prepared", "not_applied", "rejected_no_effect"].includes(s.status)).map(s => ({ id: s.id, action: s.plan.action })),
@@ -159,8 +146,7 @@ export class RotationStore {
         return;
       }
       const now = await databaseNow(tx); const old = step.receipt ?? {};
-      const oldHelper = linodeTemporaryInstanceProof(old), newHelper = linodeTemporaryInstanceProof(result);
-      const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]) || !!(oldHelper && newHelper && oldHelper.id !== newHelper.id);
+      const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]) || rotationPersistenceExtension(c.instance.service).receiptsConflict(old, result);
       const receipt = { ...old, ...(step.status === "applied" ? {} : result), ...(old.resourceId ? { resourceId: old.resourceId } : {}), ...(old.allocationId ? { allocationId: old.allocationId } : {}) };
       const status = conflict ? "ambiguous" : step.status === "ambiguous" ? "ambiguous" : step.status === "applied" ? "applied" : observation ? (result as CloudObservation).status : "pending";
       await tx.update(rotationSteps).set({ receipt, status, updatedAt: now }).where(eq(rotationSteps.id, stepId));
@@ -169,8 +155,8 @@ export class RotationStore {
       if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.incidentId, id), eq(rotationLeases.unresolvedStepId, stepId)));
       if (status === "applied" && !incident.pausedByUserId && ["rotation_runtime_failed", "cloud_convergence_timeout", "temporary_cloud_error"].includes(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null }).where(eq(rotationIncidents.id, id));
       if (status === "ambiguous") await this.pauseIn(tx, incident, "resource_ownership_ambiguous", now);
-      if (!conflict && step.status !== "applied" && step.plan.arguments.linodeIpv4Strategy === "instance_swap" && receipt.after?.temporaryInstance) {
-        const reserved = await recordLinodeSwapState(tx, c, id, step.attemptId, receipt, step.plan.action === "linode.ipv4.swap" && status === "applied", now, stepId);
+      if (!conflict && step.status !== "applied") {
+        const reserved = await rotationPersistenceExtension(c.instance.service).recordReceipt(tx, c, id, step.attemptId, receipt as CloudStepResult, step.plan, status === "applied", now, stepId);
         if (!reserved) { await this.pauseIn(tx, incident, "rotation_temporary_instance_busy", now); return; }
       }
       const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, step.attemptId)).orderBy(asc(rotationSteps.sequence));
@@ -261,10 +247,9 @@ export class RotationStore {
     if (c.addressVersion !== incident.addressVersion || c.physicalKey !== incident.physicalKey) { await this.pauseIn(tx, incident, "address_version_changed", now); return; }
     const [attempt] = await tx.select().from(rotationAttempts).where(eq(rotationAttempts.id, steps[0]!.attemptId));
     if (!attempt) throw new Error("rotation_attempt_missing");
-    const providerMetadata = result.after?.addressMetadata;
-    const metadata = { ...(c.instance.service === "azure_vm" ? { allocationIdentity: allocationIdentity(result) } : {}), providerMetadata: providerMetadata && typeof providerMetadata === "object" && !Array.isArray(providerMetadata) ? providerMetadata : {},
-      ...(typeof result.after?.privateAddress === "string" ? { privateAddress: result.after.privateAddress } : {}),
-      ...(result.resourceId ? { resourceId: result.resourceId } : {}) };
+    const workflow = getCloudServiceRegistration(c.instance.service)?.workflow;
+    if (!workflow) { await this.pauseIn(tx, incident, "rotation_unsupported", now); return; }
+    const metadata = workflow.candidateAddressMetadata(result);
     const [address] = await tx.insert(cloudAddresses).values({ interfaceId: c.slot.interfaceId, family: c.slot.family, kind: "host", address: result.candidateAddress, remoteAllocationId: result.allocationId, metadata, origin: "system", attemptId: attempt.id, inventoryPresent: true, scanGeneration: c.instance.scanGeneration, lastSeenAt: now }).onConflictDoUpdate({ target: [cloudAddresses.interfaceId, cloudAddresses.family, cloudAddresses.address], targetWhere: sql`${cloudAddresses.kind} = 'host'`, set: { lastSeenAt: now, inventoryPresent: true, scanGeneration: c.instance.scanGeneration, metadata } }).returning();
     const version = Math.max(c.slot.currentVersion, c.slot.candidateVersion) + 1;
     await tx.update(managedAddressSlots).set({ candidateAddressId: address!.id, candidateVersion: version, updatedAt: now }).where(eq(managedAddressSlots.id, c.slot.id));

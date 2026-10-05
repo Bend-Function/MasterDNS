@@ -17,7 +17,7 @@ import { GetCallerIdentityCommand, STSClient } from "@aws-sdk/client-sts";
 import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudPowerState, CloudRef, CloudStep, SlotRef } from "@masterdns/contracts";
 
 import { createAwsClientOptions, createAwsCredentialSource } from "./aws-credentials.js";
-import { evaluateCapabilities } from "./capabilities.js";
+import { awsCapabilities } from "./aws-capabilities.js";
 import { decodeCursor, encodeCursor, mapLightsailInstance } from "./discovery.js";
 import { executeLightsailRotation, observeLightsailRotation } from "./lightsail-rotation.js";
 import { CloudError, normalizeAwsError } from "./errors.js";
@@ -364,7 +364,7 @@ export class LightsailCloudAdapter implements CloudAdapter {
   }
 
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability {
-    return evaluateCapabilities(slot, inventory);
+    return awsCapabilities(slot, inventory);
   }
 
   async execute(step: CloudStep): Promise<CloudStepResult> {

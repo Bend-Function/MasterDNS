@@ -1,3 +1,4 @@
+import { supportsRotationTrigger, manualRotationServicePrerequisiteError, rotationPrivateIpv4Error } from "@masterdns/contracts";
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { and, eq, ne } from "drizzle-orm";
@@ -46,12 +47,9 @@ export async function createScheduledRotationIncident(tx: RotationTransaction, c
 export function scheduledRotationPrerequisiteError(c: RotationContext): string | undefined {
   if (c.slot.candidateAddressId && c.slot.candidateAddressId !== c.slot.currentAddressId) return "rotation_candidate_exists";
   if (c.slot.family !== "4" || c.slot.currentAddressId !== c.address?.id || isIP(c.address.address) !== 4) return "rotation_public_ipv4_required";
-  const providerMetadata = record(c.address.metadata.providerMetadata);
-  if (providerMetadata?.awsAddressScope === "private" || isPrivateIpv4(c.address.address)) return "rotation_private_ipv4_unsupported";
-  const supported = (c.account.provider === "aws" && (c.instance.service === "ec2" || c.instance.service === "lightsail"))
-    || (c.account.provider === "azure" && c.instance.service === "azure_vm")
-    || (c.account.provider === "linode" && c.instance.service === "linode");
-  if (!supported) return "rotation_provider_service_unsupported";
+  const privateAddressError = rotationPrivateIpv4Error(c.address.address, c.address.metadata.providerMetadata);
+  if (privateAddressError) return privateAddressError;
+  if (!supportsRotationTrigger(c.account.provider, c.instance.service, "scheduled")) return "rotation_provider_service_unsupported";
 }
 async function createCrossCloudRotationIncident(tx: RotationTransaction, c: RotationContext, trigger: "health" | "scheduled", sourceEventId: string, actorUserId?: string) {
   const [existing] = await tx.select().from(rotationIncidents).where(and(eq(rotationIncidents.slotId, c.slot.id), ne(rotationIncidents.status, "complete"))).for("update");
@@ -133,31 +131,18 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
 }
 
 function manualRotationCapabilityError(c: RotationContext): string | undefined {
-  const supported = (c.account.provider === "aws" && (c.instance.service === "ec2" || c.instance.service === "lightsail"))
-    || (c.account.provider === "linode" && c.instance.service === "linode");
-  if (!supported) return "rotation_provider_service_unsupported";
+  if (!supportsRotationTrigger(c.account.provider, c.instance.service, "manual")) return "rotation_provider_service_unsupported";
   if (c.slot.family !== "4" || c.slot.currentAddressId !== c.address?.id || isIP(c.address.address) !== 4) return "rotation_public_ipv4_required";
-  const providerMetadata = record(c.address.metadata.providerMetadata);
-  if (providerMetadata?.awsAddressScope === "private" || isPrivateIpv4(c.address.address)) return "rotation_private_ipv4_unsupported";
-  if (c.instance.service === "linode" && !c.authorization?.allowStopStart) return "rotation_stop_start_not_authorized";
+  const privateAddressError = rotationPrivateIpv4Error(c.address.address, c.address.metadata.providerMetadata);
+  if (privateAddressError) return privateAddressError;
   const primaryAddresses = Array.isArray(c.iface?.metadata.primaryAddresses) ? c.iface.metadata.primaryAddresses : [];
-  const primary = primaryAddresses.includes(c.address.address);
-  if (c.instance.service === "ec2") {
-    if (!c.address.remoteAllocationId && !primary) return "rotation_capability_unavailable";
-    if (c.address.remoteAllocationId && !primary && typeof c.address.metadata.privateAddress !== "string") return "rotation_capability_unavailable";
-    if (!c.address.remoteAllocationId && c.iface?.metadata.deviceIndex !== 0) return "rotation_capability_unavailable";
-  }
-  if (c.instance.service === "lightsail" && c.instance.metadata.ipv6Only !== false) return "rotation_capability_unavailable";
+  return manualRotationServicePrerequisiteError(c.instance.service, {
+    allowStopStart: c.authorization?.allowStopStart ?? false, allocationId: c.address.remoteAllocationId,
+    primary: primaryAddresses.includes(c.address.address), privateAddress: c.address.metadata.privateAddress,
+    deviceIndex: c.iface?.metadata.deviceIndex, ipv6Only: c.instance.metadata.ipv6Only,
+  });
 }
 
-function record(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function isPrivateIpv4(address: string): boolean {
-  const [first = 0, second = 0] = address.split(".").map(Number);
-  return first === 10 || first === 127 || first === 0 || first >= 224 || (first === 172 && second >= 16 && second <= 31) || (first === 192 && second === 168) || (first === 169 && second === 254) || (first === 100 && second >= 64 && second <= 127);
-}
 export async function rotationAudit(tx: RotationTransaction, incident: typeof rotationIncidents.$inferSelect, action: string, actorUserId?: string, afterSnapshot?: unknown) {
   await tx.insert(auditLogs).values({ ownerUserId: incident.ownerUserId, actorUserId, source: actorUserId ? "user" : "failover", action, resourceType: "rotation", resourceId: incident.id, afterSnapshot });
 }

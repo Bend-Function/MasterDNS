@@ -9,7 +9,7 @@ import type { CloudStep } from "@masterdns/contracts";
 import { CloudError } from "./errors.js";
 import type { AwsSend, CloudObservation, CloudStepResult } from "./provider.js";
 import { hasCleanupOwnership, ownsRotationAddress, rotationTags } from "./resource-ownership.js";
-import { rotationArguments } from "./rotation-plan.js";
+import { rotationArguments } from "./rotation-step.js";
 
 const actions = new Set(["ec2.auto-ipv4.disable", "ec2.auto-ipv4.enable", "ec2.eip.allocate", "ec2.eip.associate", "ec2.eip.release", "ec2.ipv6.assign", "ec2.ipv6.unassign"]);
 

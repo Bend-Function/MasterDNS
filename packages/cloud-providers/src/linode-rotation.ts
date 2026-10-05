@@ -1,11 +1,11 @@
 import type { CloudStep, SlotRef } from "@masterdns/contracts";
 import { CloudError } from "./errors.js";
-import { linodeCapabilities, linodeIpResource, publicLinodeAddress } from "./linode.js";
+import { linodeCapabilities, linodeIpResource, publicLinodeAddress } from "./linode-capabilities.js";
 import type { LinodeCloudAdapter, LinodeIp } from "./linode.js";
 import type { CloudInventory, CloudObservation, CloudStepResult } from "./provider.js";
-import { makeRotationStep, rotationArguments } from "./rotation-plan.js";
-import type { CleanupPlanOptions, RotationStepArguments } from "./rotation-plan.js";
-import type { LinodeSwapOptions } from "./rotation-plan.js";
+import { makeRotationStep, rotationArguments } from "./rotation-step.js";
+import type { CleanupPlanOptions, RotationStepArguments } from "./rotation-step.js";
+import type { LinodeSwapOptions } from "./rotation-step.js";
 import { executeLinodeSwap, observeLinodeSwap, planLinodeSwap, planLinodeSwapCleanup } from "./linode-swap.js";
 
 const actions = new Set(["linode.ipv4.allocate", "linode.instance.reboot", "linode.instance.stop", "linode.instance.start", "linode.ipv4.release"]);

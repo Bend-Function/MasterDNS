@@ -1,6 +1,6 @@
 # MasterDNS 系统架构
 
-本文描述截至 2026-10-05 的实际实现，包含运行时修复与 Linode 临时实例清理行为。功能实现、自动化测试、真实云验收和生产部署是不同状态；本文不替代[验收计划](TEST_PLAN.md)和 `validation/` 中按提交记录的证据。
+本文描述截至 2026-10-05 的实际实现，包含运行时修复、Linode 临时实例清理及云厂商扩展边界整理。功能实现、自动化测试、真实云验收和生产部署是不同状态；本文不替代[验收计划](TEST_PLAN.md)和 `validation/` 中按提交记录的证据。
 
 ## 1. 系统定位与边界
 
@@ -55,7 +55,7 @@ packages/
   automation       Pool 策略、健康/换址状态机、探测共识；另含 Redis 锁辅助
   db               schema、迁移、数据库连接、共享事务与领域状态操作
   providers        DNS 适配器：Cloudflare / 阿里云
-  cloud-providers  云资源、能力检查、换址计划、执行与观察
+  cloud-providers  服务注册、按能力拆分的适配器、厂商策略、换址计划与观察
   checkers         HTTP / TCP 检查与网络目标策略
   crypto           密码、Token、凭证加解密和签名工具
 ```
@@ -63,6 +63,24 @@ packages/
 `web` 的内部包依赖是 `contracts`；API 和 Worker 都依赖其余领域/基础包。`contracts` 位于依赖底部。`automation` 中的决策函数只消费传入快照，但整个包并非完全无基础设施代码，因为还导出 DNS Zone/Redis 锁工具。
 
 这是按模块组织的服务层架构，并非严格的六边形架构：API、Worker Service 直接通过 Drizzle 查询共享表；`db` 已承载换址上下文、健康证据、预算和生命周期事务规则。理解一条写路径通常需要同时阅读 Service、共享事务函数和适配器。
+
+### 3.1 云厂商注册与能力边界
+
+云服务通过两层静态注册组织：
+
+| 入口 | 内容与消费者 |
+| --- | --- |
+| contracts `cloud-catalog.ts` / `cloud-credentials.ts` | 厂商/服务对应关系、区域规则、标签、触发方式和严格凭证 schema；API 与 Web 共用，不导入服务端 SDK |
+| cloud-providers `registry.ts` / `registrations/` | 适配器工厂、能力判断、换址/清理计划和纯工作流策略；仅服务端使用 |
+| cloud-providers `provider.ts` / `adapter-capabilities.ts` | 最小清单接口及换址、生命周期、流量、空闲地址能力；调用方显式检查能力 |
+| contracts `cloud-rotation-policy.ts` | 数据库准入使用的厂商前置条件；触发支持矩阵来自共享目录 |
+| Worker 库存/换址持久扩展 | 需要事务的厂商特殊处理，如临时实例归属、租约和库存清理 |
+
+`CloudInventoryAdapter` 只要求账号、区域、清单和精确查询。工厂返回 `CloudProviderAdapter`，其其他能力可选；只读实现不需要提供虚假的换址方法。`CloudAdapter` 保留为明确支持换址的兼容组合，执行器通过能力守卫后才进入副作用路径。
+
+现有 `createCloudAdapter`、`evaluateCapabilities`、`planCloudRotation`、`planCloudRotationCleanup` 继续存在，但统一委托注册项。具体适配器和纯规划器不反向导入汇总注册表。规范化字段之外的厂商资源身份、地址角色和清理条件通过 `CloudWorkflowPolicy` 处理，通用执行层保留权限、版本、预算与事务边界。
+
+注册能力只描述技术支持，不授予写权限。已有持久步骤、错误码和凭证 discriminator 保持兼容。数据库枚举、特有配置和厂商限流协议仍需显式扩展，并非运行时安装一个插件即可完成接入。具体步骤见[新增厂商指南](providers/ADDING_PROVIDER.md)。
 
 ## 4. 领域对象与状态归属
 
@@ -220,7 +238,7 @@ Operation/Delivery 持久状态、Reconcile Outbox、Rotation 的 `next_run_at` 
 
 ## 10. 维护边界与后续方向
 
-当前主要耦合集中在 Pool Service、Reconcile、Operation、Rotation Publication/Cleanup，以及 `db` 中的共享领域事务。整理时应先明确“谁写哪个状态、哪个版本授权下一步”，再决定是否拆包或拆服务。
+当前主要耦合集中在 Pool Service、Reconcile、Operation、Rotation Publication/Cleanup，以及 `db` 中的共享领域事务。云厂商工厂、规划和纯策略已集中注册，厂商专属持久副作用保持独立扩展。整理时应先明确“谁写哪个状态、哪个版本授权下一步”，再决定是否拆包或拆服务。
 
 后续可评估的方向包括：把纯决策和锁工具分开；明确 `db` 的基础设施与领域事务职责；为扫描任务建立统一监控和扩容规则；补全事件刷新；集成 Ansible 的部署执行与验收结果。这些是维护方向，不是已交付功能或本次架构重构。
 

@@ -11,3 +11,7 @@ export * from "./rotation-plan.js";
 export * from "./resource-ownership.js";
 export * from "./azure.js";
 export * from "./linode.js";
+export * from "./adapter-capabilities.js";
+export * from "./service-registry.js";
+export * from "./registry.js";
+export * from "./workflow-policy.js";

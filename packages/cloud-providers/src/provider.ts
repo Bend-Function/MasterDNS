@@ -1,17 +1,13 @@
-import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudProvider, CloudRef, CloudStep, SlotRef, MonthlyTraffic } from "@masterdns/contracts";
+import type { CloudLifecycleAction, CloudLifecycleReceipt, CloudLifecycleSnapshot, CloudRef, CloudStep, SlotRef, MonthlyTraffic } from "@masterdns/contracts";
 
-export type AwsCredentials =
-  | { kind: "access_key"; accessKeyId: string; secretAccessKey: string; sessionToken?: string; proxyUrl?: string }
-  | { kind: "role"; roleArn?: string; externalId?: string; proxyUrl?: string };
+import type { CloudCredentialInput } from "@masterdns/contracts";
+export { credentialsMatchProvider } from "@masterdns/contracts";
 
-export type AzureCredentials = { kind: "azure_service_principal"; tenantId: string; subscriptionId: string; clientId: string; clientSecret: string; proxyUrl?: string };
-export type LinodeCredentials = { kind: "linode_token"; token: string; proxyUrl?: string };
-export type CloudCredentials = AwsCredentials | AzureCredentials | LinodeCredentials;
-export function credentialsMatchProvider(provider: CloudProvider, credentials: { kind: string }): boolean {
-  return provider === "aws" ? credentials.kind === "access_key" || credentials.kind === "role"
-    : provider === "azure" ? credentials.kind === "azure_service_principal"
-      : provider === "linode" && credentials.kind === "linode_token";
-}
+/** Proxy injection is runtime-only; account input validation belongs to contracts. */
+export type CloudCredentials = CloudCredentialInput & { proxyUrl?: string };
+export type AwsCredentials = Extract<CloudCredentials, { kind: "access_key" | "role" }>;
+export type AzureCredentials = Extract<CloudCredentials, { kind: "azure_service_principal" }>;
+export type LinodeCredentials = Extract<CloudCredentials, { kind: "linode_token" }>;
 
 export type CloudAddress = {
   address: string;
@@ -77,22 +73,40 @@ export type CloudStepResult = {
 
 export type CloudObservation = CloudStepResult & { status: CloudObservationStatus };
 
-export interface CloudAdapter {
+/** Minimum contract: inventory providers need no mutation methods. */
+export interface CloudInventoryAdapter {
   verifyIdentity(): Promise<{ externalAccountId: string }>;
   listScopes(): Promise<string[]>;
   discover(region: string, cursor?: string): Promise<CloudPage>;
   inspect(ref: CloudRef): Promise<CloudInventory>;
-  inspectLifecycle?(ref: CloudRef): Promise<CloudLifecycleSnapshot>;
-  mutateLifecycle?(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt>;
-  monthlyTraffic?(ref: CloudRef, now?: Date): Promise<MonthlyTraffic>;
-  listIdleStaticIps?(region: string): Promise<IdleStaticIp[]>;
-  releaseIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
-  observeIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
+}
+
+export interface CloudRotationAdapter {
   capabilities(slot: SlotRef, inventory: CloudInventory): Capability;
   execute(step: CloudStep): Promise<CloudStepResult>;
   observe(step: CloudStep): Promise<CloudObservationStatus>;
   observeDetails?(step: CloudStep): Promise<CloudObservation>;
 }
+
+export interface CloudLifecycleAdapter {
+  inspectLifecycle(ref: CloudRef): Promise<CloudLifecycleSnapshot>;
+  mutateLifecycle(action: CloudLifecycleAction, snapshot: CloudLifecycleSnapshot): Promise<CloudLifecycleReceipt>;
+}
+
+export interface CloudTrafficAdapter {
+  monthlyTraffic(ref: CloudRef, now?: Date): Promise<MonthlyTraffic>;
+}
+
+export interface CloudIdleIpAdapter {
+  listIdleStaticIps(region: string): Promise<IdleStaticIp[]>;
+  releaseIdleStaticIp(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
+  observeIdleStaticIp?(target: IdleStaticIp): Promise<IdleStaticIpReleaseResult>;
+}
+
+/** Factory result: consumers must narrow capabilities before performing mutations. */
+export type CloudProviderAdapter = CloudInventoryAdapter & Partial<CloudRotationAdapter & CloudLifecycleAdapter & CloudTrafficAdapter & CloudIdleIpAdapter>;
+/** Compatibility contract for existing implementations that explicitly support rotation. */
+export type CloudAdapter = CloudProviderAdapter & CloudRotationAdapter;
 
 export type AwsSend = (command: any) => Promise<any>;
 

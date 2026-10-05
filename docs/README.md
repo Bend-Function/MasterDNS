@@ -13,8 +13,11 @@
 
 ## 厂商能力与验证记录
 
+- [云厂商扩展边界验证](validation/2026-10-05-cloud-provider-extensibility.md)。
+
 - [运行时修复与临时实例清理验证](validation/2026-10-05-runtime-fixes.md)。
 
+- [新增云厂商指南](providers/ADDING_PROVIDER.md)：注册目录、能力接口、持久扩展和验收步骤。
 - [Azure](providers/azure.md)、[Linode](providers/linode.md)：支持拓扑、授权、换址与恢复限制。
 - [AWS 控制平面验收入口](validation/aws-control-plane.md)。
 - [多云换址闭环验证](validation/multicloud-ip-rotation.md)、[Probe 二进制联调](validation/probe-binary-integration.md)、[Azure/Linode 验证记录](validation/azure-linode.md)。

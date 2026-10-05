@@ -1,11 +1,11 @@
 import { createHash } from "node:crypto";
 import type { CloudStep, SlotRef } from "@masterdns/contracts";
 import { CloudError } from "./errors.js";
-import { linodeCapabilities, linodeIpResource, publicLinodeAddress } from "./linode.js";
+import { linodeCapabilities, linodeIpResource, publicLinodeAddress } from "./linode-capabilities.js";
 import type { LinodeCloudAdapter, LinodeIp } from "./linode.js";
 import type { CloudInventory, CloudObservation, CloudStepResult } from "./provider.js";
-import { makeRotationStep, rotationArguments } from "./rotation-plan.js";
-import type { CleanupPlanOptions, LinodeSwapOptions, RotationAction, RotationStepArguments } from "./rotation-plan.js";
+import { makeRotationStep, rotationArguments } from "./rotation-step.js";
+import type { CleanupPlanOptions, LinodeSwapOptions, RotationAction, RotationStepArguments } from "./rotation-step.js";
 
 type TemporaryInstance = {
   id: string; label: string; created: string; region: string; attemptId: string; targetInstanceId: string;

@@ -19,3 +19,7 @@ it.each([
 it.each(["http://proxy.example:8080", "socks5h://proxy.example:1080/path", "socks5h:///missing-host"])("rejects invalid proxy credentials: %s", proxyUrl => {
   expect(() => cloud.createCloudAdapter({ accountId: "account", service: "ec2", provider: "aws", credentials: { kind: "access_key", accessKeyId: "key", secretAccessKey: "secret", proxyUrl } })).toThrow("Invalid SOCKS proxy URL");
 });
+
+it("preserves the public factory error for an unknown service", () => {
+  expect(() => cloud.createCloudAdapter({ accountId: "account", service: "unknown", credentials: { kind: "role" } } as never)).toThrow("unsupported_cloud_service");
+});

@@ -3,7 +3,7 @@ import { RotationCleanupService } from "./rotation-cleanup.service.js";
 import { Injectable, Optional, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
 import { Worker } from "bullmq";
 import { queueNames, type RotationJob } from "@masterdns/contracts";
-import { CloudError } from "@masterdns/cloud-providers";
+import { CloudError, getCloudServiceRegistration, requireCloudRotation } from "@masterdns/cloud-providers";
 import { CloudRuntimeService } from "../cloud/cloud-runtime.service.js";
 import { QueueRuntimeService } from "../queue-runtime.service.js";
 import { RotationStore } from "./rotation-store.js";
@@ -46,8 +46,12 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
         await this.store.defer(incidentId); return;
       }
       if (action.kind !== "execute" && action.kind !== "observe") { await this.store.settle(incidentId, lease); return; }
+      if (action.kind === "execute") {
+        const registration = getCloudServiceRegistration(run.c.instance.service);
+        if (!registration?.rotation || !registration.workflow) throw new CloudError("rotation_unsupported", false);
+      }
       const identity = { credentialCiphertext: run.c.account.credentialCiphertext, externalAccountId: run.c.account.externalAccountId };
-      const adapter = await this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" });
+      const adapter = requireCloudRotation(await this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" }));
       if (!adapter.observeDetails) throw new CloudError("rotation_unsupported", false);
       if (action.kind === "observe") {
         const step = run.steps.find(s => s.id === action.stepId)!;

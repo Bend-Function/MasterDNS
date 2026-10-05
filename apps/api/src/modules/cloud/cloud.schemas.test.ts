@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createCloudAccountSchema, cloudRegionsSchema } from "./cloud.schemas.js";
+import { createCloudAccountSchema, cloudCredentialsUpdateSchema, cloudRegionsSchema } from "./cloud.schemas.js";
 
 const azure = { kind: "azure_service_principal", tenantId: "11111111-1111-4111-8111-111111111111", subscriptionId: "22222222-2222-4222-8222-222222222222", clientId: "33333333-3333-4333-8333-333333333333", clientSecret: "test-secret" };
 describe("cloud account provider contracts", () => {
@@ -17,4 +17,18 @@ describe("cloud account provider contracts", () => {
   it("retains AWS credentials and strict AWS scopes", () => {
     expect(createCloudAccountSchema.safeParse({ name: "AWS", provider: "aws", regions: ["us-east-1", "us-gov-west-1"], credentials: { kind: "role" } }).success).toBe(true);
   });
+});
+
+it("rejects runtime-only proxy fields and hidden fields on every credential input", () => {
+  for (const [provider, credentials] of [
+    ["aws", { kind: "access_key", accessKeyId: "AKIATESTONLY", secretAccessKey: "fake-secret-for-unit-tests" }],
+    ["aws", { kind: "role" }], ["azure", azure], ["linode", { kind: "linode_token", token: "test-token" }],
+  ] as const) {
+    expect(createCloudAccountSchema.safeParse({ name: "Test", provider, credentials }).success).toBe(true);
+    for (const extra of [{ proxyUrl: "socks5://example.invalid:1080" }, { hiddenField: "must-not-pass" }]) {
+      expect(createCloudAccountSchema.safeParse({ name: "Test", provider, credentials: { ...credentials, ...extra } }).success).toBe(false);
+      expect(cloudCredentialsUpdateSchema.safeParse({ credentials: { ...credentials, ...extra } }).success).toBe(false);
+    }
+  }
+  for (const provider of ["unknown", "constructor", "__proto__"]) expect(createCloudAccountSchema.safeParse({ name: "Test", provider, credentials: { kind: "role" } }).success).toBe(false);
 });

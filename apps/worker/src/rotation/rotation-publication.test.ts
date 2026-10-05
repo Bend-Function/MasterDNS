@@ -1,3 +1,4 @@
+import { evaluateCapabilities } from "@masterdns/cloud-providers";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
@@ -527,6 +528,8 @@ it.each(["system", "user"] as const)("runs one allocation and cleans the old %s 
   let allocations = 0;
   const receipt = { candidateAddress: "198.51.100.33", allocationId: "eipalloc-new" };
   const adapter = {
+    capabilities: evaluateCapabilities,
+    observe: async () => "applied" as const,
     inspect: async () => structuredClone(f.live),
     execute: async (step: any) => {
       if (step.action.endsWith("allocate")) allocations++;

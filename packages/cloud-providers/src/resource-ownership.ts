@@ -1,7 +1,7 @@
 import type { Address } from "@aws-sdk/client-ec2";
 import type { CloudStep } from "@masterdns/contracts";
 
-import { rotationArguments } from "./rotation-plan.js";
+import { rotationArguments } from "./rotation-step.js";
 
 export function rotationTags(step: CloudStep): Array<{ Key: string; Value: string }> {
   const { slot, attemptId } = rotationArguments(step);

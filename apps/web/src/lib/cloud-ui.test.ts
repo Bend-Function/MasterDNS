@@ -1,3 +1,4 @@
+import { cloudServiceDefinitions } from "@masterdns/contracts/cloud";
 import { describe, expect, it, vi } from "vitest";
 import type { AddressSlot, CloudAuthorization, CloudTargetSummary } from "./cloud-types";
 import { authorizationPayload, cloudAddressView, cloudInstanceMatches, cloudInventoryNotice, cloudTargetLabel, cloudTargetAddresses, loadCloudScopes, loadVisibleInstanceAddresses, manualIpv4RotationEligibility, selectableCloudSlots, slotsMatchingExistingRecord, submitCloudIntent } from "./cloud-ui";
@@ -207,6 +208,31 @@ describe("manual IPv4 eligibility", () => {
     allowStopStart: false,
     allowReleaseAddress: false,
   };
+
+  it.each([
+    ["aws", "ec2", true], ["aws", "lightsail", true], ["azure", "azure_vm", false], ["linode", "linode", true],
+    ["aws", "azure_vm", false], ["aws", "linode", false], ["azure", "ec2", false], ["azure", "lightsail", false],
+    ["azure", "linode", false], ["linode", "ec2", false], ["linode", "lightsail", false], ["linode", "azure_vm", false],
+  ] as const)("checks service ownership before offering %s/%s manual rotation", (provider, service, visible) => {
+    const grant = { ...authorization, allowStopStart: true };
+    expect(manualIpv4RotationEligibility(slot(), {
+      accountEnabled: true, provider, service, instancePresent: true,
+      savedAuthorization: grant, draftAuthorization: grant,
+    })).toEqual({ visible, reason: null });
+  });
+
+  it("hides manual rotation when the shared catalog removes that trigger", () => {
+    const original = cloudServiceDefinitions.ec2.supportedRotationTriggers;
+    try {
+      Object.defineProperty(cloudServiceDefinitions.ec2, "supportedRotationTriggers", { value: ["health", "scheduled"], configurable: true });
+      expect(manualIpv4RotationEligibility(slot(), {
+        accountEnabled: true, provider: "aws", service: "ec2", instancePresent: true,
+        savedAuthorization: authorization, draftAuthorization: authorization,
+      })).toEqual({ visible: false, reason: null });
+    } finally {
+      Object.defineProperty(cloudServiceDefinitions.ec2, "supportedRotationTriggers", { value: original, configurable: true });
+    }
+  });
 
   it("offers an authorized public EC2 IPv4 slot without requiring an automatic policy", () => {
     expect(manualIpv4RotationEligibility(slot(), {
