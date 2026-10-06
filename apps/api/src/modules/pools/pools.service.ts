@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
-import { BadRequestException, ConflictException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, Injectable, NotFoundException, Optional } from "@nestjs/common";
 import { healthCheckConfigSchema, type HealthCheckConfig, type HealthCheckJob, type PoolReconcileJob } from "@masterdns/contracts";
 import {
   captureCloudPolicyLinks,
@@ -43,6 +43,7 @@ import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import { cloudRequestKey, withCloudRequest } from "../cloud/cloud-idempotency.js";
+import { BindingReadbackService, type BindingDeleteTarget } from "../dns/binding-readback.service.js";
 import type {
   CreateBindingInput,
   CreateEndpointInput,
@@ -144,7 +145,8 @@ export function validateRestorablePolicySnapshot(snapshot: PolicySnapshot, poolI
 
 @Injectable()
 export class PoolsService {
-  constructor(private readonly database: DatabaseService, private readonly queues: QueueService) {}
+  constructor(private readonly database: DatabaseService, private readonly queues: QueueService,
+    @Optional() private readonly bindingReadback: BindingReadbackService = new BindingReadbackService()) {}
 
   async list(actor: AuthUser) {
     const pools = await this.database.db.select().from(endpointPools)
@@ -741,22 +743,22 @@ export class PoolsService {
         inArray(operationSteps.status, ["pending", "running"]),
       )).limit(1);
       if (pending) throw new ConflictException("该绑定的 DNS 变更正在排队或执行，请等待操作完成后再删除");
-      const [uncertain] = await tx.select({ id: operationSteps.id }).from(operationSteps).where(and(
+      const uncertain = await tx.select().from(operationSteps).where(and(
         eq(operationSteps.zoneId, binding.zoneId),
         sql`${operationSteps.input}->>'bindingId' = ${binding.id}`,
         inArray(operationSteps.status, ["failed", "skipped"]),
         inArray(operationSteps.action, ["create", "update"]),
         sql`${operationSteps.attempts} > 0`,
-      )).limit(1);
-      // A remote write can succeed before verification or persistence fails. No
-      // local assignment does not establish that the provider has no record.
-      if (uncertain) throw new ConflictException("DNS 写入结果尚未确认，请先恢复或核对失败的 DNS 操作");
+      ));
       lease.assertOwned();
       const published = await tx.select({ assignment: bindingAssignments, record: dnsRecords })
         .from(bindingAssignments).innerJoin(dnsRecords, eq(bindingAssignments.dnsRecordId, dnsRecords.id))
         .where(and(eq(bindingAssignments.domainBindingId, bindingId), eq(bindingAssignments.applied, true)));
-      if (unpublishedOnly && published.length > 0) throw new ConflictException("该绑定已完成发布，请刷新页面并在 Pool 中确认删除已发布记录");
-      if (published.length === 0) {
+      const targets: BindingDeleteTarget[] = uncertain.length > 0
+        ? await this.bindingReadback.resolveDeletion(tx, pool, binding, uncertain, lease, unpublishedOnly)
+        : published.map(({ assignment, record }) => ({ record, endpointId: assignment.endpointId }));
+      if (unpublishedOnly && targets.length > 0) throw new ConflictException("该绑定已完成发布，请刷新页面并在 Pool 中确认删除已发布记录");
+      if (targets.length === 0) {
         await tx.delete(domainBindings).where(eq(domainBindings.id, bindingId));
         await this.recordPolicyChange(actor, poolId, "binding.delete", binding, undefined, pool.ownerUserId, tx);
         lease.assertOwned();
@@ -772,11 +774,13 @@ export class PoolsService {
         resourceId: binding.id, policyRevision: pool.policyRevision, beforeSnapshot: binding,
       }).returning();
       if (!operation) throw new Error("Binding delete operation insert returned no row");
-      await tx.insert(operationSteps).values(published.map(({ assignment, record }, index) => ({
+      await tx.insert(operationSteps).values(targets.map(({ endpointId, record }, index) => ({
         operationId: operation.id, sequence: index + 1, providerAccountId: zone.providerAccountId,
         zoneId: zone.zone.id, dnsRecordId: record.id, action: "delete" as const,
         input: { zoneExternalId: zone.zone.externalId, recordExternalId: record.externalId, management: "managed",
-          poolId, bindingId, endpointId: assignment.endpointId,
+          poolId, bindingId, endpointId,
+          ...(uncertain.length > 0 ? { record: { type: record.type, name: record.name, content: record.content,
+            ttl: record.ttl, ...(record.priority !== null ? { priority: record.priority } : {}), providerMetadata: record.providerMetadata } } : {}),
           assignmentMode: pool.strategy === "healthy_set" ? "set" : "single", deleteBinding: true },
       })));
       await tx.update(domainBindings).set({ state: "switching", updatedAt: new Date() }).where(eq(domainBindings.id, bindingId));

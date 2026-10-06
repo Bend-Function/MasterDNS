@@ -3,6 +3,7 @@ import type { DnsRecordInput, OperationJob, ProviderRecord } from "@masterdns/co
 import { ProviderError, queueNames } from "@masterdns/contracts";
 import { and, eq, inArray, ne, or, sql } from "drizzle-orm";
 import {
+  getDeletingBindingIds,
   rotationLeases,
   idleIpAddressReleasing,
   rotationPublications,
@@ -234,8 +235,13 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     return this.database.db.transaction(async (tx) => {
       if (cloud) await lockRotationContext(tx, cloud.slot.id);
       if (step.action !== "delete" && input.record && ["A", "AAAA"].includes(input.record.type) && await idleIpAddressReleasing(tx, input.record.content)) throw new ProviderError("Address cleanup is in progress", "transient_failure", adapter.provider);
+      let publicationPoolId = operation.resourceType === "endpoint_pool" ? operation.resourceId : input.poolId;
+      if (!publicationPoolId && input.bindingId) {
+        const [binding] = await tx.select({ poolId: domainBindings.poolId }).from(domainBindings).where(eq(domainBindings.id, input.bindingId)).limit(1);
+        publicationPoolId = binding?.poolId;
+      }
+      if (publicationPoolId) await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${publicationPoolId}))`);
       if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
-        await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
         const [pool] = await tx.select({
           policyRevision: endpointPools.policyRevision,
           decisionRevision: endpointPools.decisionRevision,
@@ -251,6 +257,15 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
       if (!await this.lockActiveOperation(tx, operation.id)) return false;
       const [currentStep] = await tx.select({ status: operationSteps.status }).from(operationSteps).where(eq(operationSteps.id, step.id)).for("update");
       if (currentStep?.status !== "running") return false;
+      if (input.bindingId && step.action !== "delete") {
+        const [binding] = await tx.select({ id: domainBindings.id }).from(domainBindings).where(eq(domainBindings.id, input.bindingId)).limit(1);
+        const deleting = await getDeletingBindingIds(tx, [input.bindingId]);
+        if (!binding || deleting.has(input.bindingId)) {
+          await tx.update(operationSteps).set({ status: "skipped", errorCode: binding ? "binding_deleting" : "binding_missing", finishedAt: new Date(), updatedAt: new Date() }).where(eq(operationSteps.id, step.id));
+          // Only this binding is fenced; other admitted steps remain valid.
+          return true;
+        }
+      }
       if (cloud) {
         const c = await lockRotationContext(tx, cloud.slot.id);
         const [physical] = await tx.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, c.physicalKey)).for("share");
@@ -405,7 +420,7 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     failed: number;
   }> {
     return this.database.db.transaction(async (tx) => {
-      if (operation.resourceType === "endpoint_pool" && operation.resourceId && operation.policyRevision !== null) {
+      if (operation.resourceType === "endpoint_pool" && operation.resourceId) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${operation.resourceId}))`);
       }
       if (!await this.lockActiveOperation(tx, operation.id)) return { superseded: true, status: "failed", succeeded: 0, failed: 0 };
@@ -439,8 +454,10 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
         const parsed = stepInputSchema.safeParse(step.input);
         return parsed.success && parsed.data.bindingId ? [parsed.data.bindingId] : [];
       }))];
+      const deletingBindingIds = await getDeletingBindingIds(tx, bindingIds);
       for (const bindingId of bindingIds) {
         const related = finalSteps.filter((step) => stepInputSchema.safeParse(step.input).data?.bindingId === bindingId);
+        if (deletingBindingIds.has(bindingId) && !related.some(step => stepInputSchema.safeParse(step.input).data?.deleteBinding === true)) continue;
         const state = related.some((step) => step.status === "failed") ? "failed" : related.every((step) => ["succeeded", "skipped"].includes(step.status)) ? "healthy" : "switching";
         const shouldDelete = state === "healthy" && related.some((step) => stepInputSchema.safeParse(step.input).data?.deleteBinding === true);
         if (shouldDelete) {

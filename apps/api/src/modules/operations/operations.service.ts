@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
 import { dnsRecordInputSchema, type DnsRecordInput, type OperationSource } from "@masterdns/contracts";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
-import { endpointPools, dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones, instanceLifecycleAddressDeleting } from "@masterdns/db";
+import { endpointPools, dnsRecords, domainBindings, operationSteps, operations, providerAccounts, zones, instanceLifecycleAddressDeleting, getDeletingBindingIds } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -190,6 +190,12 @@ export class OperationsService {
         if (!pool || (operation.policyRevision !== null && pool.policyRevision !== operation.policyRevision) || (operation.decisionRevision !== null && pool.decisionRevision !== operation.decisionRevision)) throw new ConflictException("该操作已被新策略或地址决策替代，请重新协调 Pool");
       }
       const retrySteps = await tx.select().from(operationSteps).where(and(eq(operationSteps.operationId, id), eq(operationSteps.status, "failed")));
+      const publishingBindingIds = [...new Set(retrySteps.flatMap(step => step.action !== "delete" && typeof step.input.bindingId === "string" ? [step.input.bindingId] : []))];
+      if (publishingBindingIds.length > 0) {
+        const bindings = await tx.select({ id: domainBindings.id }).from(domainBindings).where(inArray(domainBindings.id, publishingBindingIds));
+        const deleting = await getDeletingBindingIds(tx, publishingBindingIds);
+        if (bindings.length !== publishingBindingIds.length || deleting.size > 0) throw new ConflictException("域名绑定正在删除或已不存在，不能重试历史发布");
+      }
       for (const step of retrySteps) {
         const record = (step.input as { record?: DnsRecordInput }).record;
         if (step.action !== "delete" && record && ["A", "AAAA"].includes(record.type) && await instanceLifecycleAddressDeleting(tx, record.content)) throw new ConflictException("云实例正在删除，不能重试其地址发布");

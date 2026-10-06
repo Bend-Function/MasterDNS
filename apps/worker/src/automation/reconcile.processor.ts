@@ -3,6 +3,7 @@ import { evaluateStrategy } from "@masterdns/automation";
 import type { DnsRecordInput, NotificationEvent, PoolReconcileJob, StrategyDecision } from "@masterdns/contracts";
 import { queueNames } from "@masterdns/contracts";
 import {
+  getDeletingBindingIds,
   instanceLifecycleAddressDeleting,
   cloudEndpointLinks,
   rotationPublications,
@@ -86,7 +87,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         .where(eq(operations.idempotencyKey, idempotencyKey)).limit(1);
       if (existingOperation) return { operationId: existingOperation.id };
 
-      const [poolEndpoints, bindings, assignments, addresses, bindingHealthRows, bindingCheckRows] = await Promise.all([
+      const [poolEndpoints, poolBindings, assignments, addresses, bindingHealthRows, bindingCheckRows] = await Promise.all([
         tx.select().from(endpoints).where(eq(endpoints.poolId, pool.id)),
         tx.select().from(domainBindings).where(eq(domainBindings.poolId, pool.id)),
         tx.select().from(bindingAssignments)
@@ -104,7 +105,9 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           .innerJoin(domainBindings, eq(healthCheckConfigs.domainBindingId, domainBindings.id))
           .where(and(eq(domainBindings.poolId, pool.id), eq(healthCheckConfigs.enabled, true))),
       ]);
-      const assignmentRows = assignments.map((row) => row.binding_assignments);
+      const deletingBindingIds = await getDeletingBindingIds(tx, poolBindings.map(binding => binding.id));
+      const bindings = poolBindings.filter(binding => !deletingBindingIds.has(binding.id));
+      const assignmentRows = assignments.map((row) => row.binding_assignments).filter(assignment => !deletingBindingIds.has(assignment.domainBindingId));
       const bindingsWithHealthOverrides = new Set(bindingCheckRows.flatMap((row) => row.domainBindingId ? [row.domainBindingId] : []));
       // Manual eligibility is an explicit publication decision for one exact
       // address version, not a stored successful health observation.
