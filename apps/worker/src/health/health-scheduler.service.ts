@@ -36,6 +36,7 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
           poolId: endpoints.poolId,
           intervalSeconds: endpointPools.checkIntervalSeconds,
           addressId: endpointAddresses.id,
+          addressSource: endpointAddresses.source,
           family: endpointAddresses.family,
         }).from(endpointAddresses)
           .innerJoin(endpoints, eq(endpointAddresses.endpointId, endpoints.id))
@@ -71,6 +72,7 @@ export class HealthSchedulerService implements OnModuleInit, OnModuleDestroy {
 
 type ScheduledTarget = {
   addressMode?: "static" | "ddns" | "cloud";
+  addressSource?: "static" | "ddns" | "cloud";
   endpointId: string;
   poolId: string;
   intervalSeconds: number;
@@ -105,7 +107,7 @@ export function buildScheduledHealthJobs(
 
   for (const target of targets) {
     const policy = policies.find(p => p.endpointId === target.endpointId && p.family === target.family);
-    const base = target.addressMode === "cloud" ? [] : selectLocalHealthCheckConfigs([
+    const base = (target.addressSource ?? target.addressMode) === "cloud" ? [] : selectLocalHealthCheckConfigs([
       ...(endpointConfigs.get(target.endpointId) ?? []),
       ...(poolConfigs.get(target.poolId) ?? []),
     ], target, policy);

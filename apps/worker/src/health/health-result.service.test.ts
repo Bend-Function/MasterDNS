@@ -3,6 +3,7 @@ import { eq } from "drizzle-orm";
 import { addressHealthPolicies, endpoints, endpointAddresses, reconcileIntents } from "@masterdns/db";
 import { fixture, testDatabase } from "../probes/probe-test-utils.js";
 import { HealthResultService } from "./health-result.service.js";
+import { HealthProcessor } from "./health.processor.js";
 let connection: Awaited<ReturnType<typeof testDatabase>>;
 beforeAll(async () => { connection = await testDatabase(); }, 30000);
 afterAll(async () => { await connection?.dispose(); });
@@ -26,6 +27,16 @@ it("never applies a base local result to a cloud endpoint", async () => {
   const service = new HealthResultService({ db: connection.db } as never);
   await service.apply({ addressId: f.address.id, addressVersion: 1, configId: f.config.id, configVersion: 1, decision: "success", checkedAt: new Date() });
   expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, f.address.id)))[0]).toMatchObject({ healthState: "unknown", consecutiveSuccesses: 0 });
+});
+it("accepts local health for a retained static family on a cloud endpoint", async () => {
+  const f = await fixture(connection.db);
+  await connection.db.update(endpoints).set({ addressMode: "cloud" }).where(eq(endpoints.id, f.endpoint.id));
+  const service = new HealthResultService({ db: connection.db } as never);
+  const processor = new HealthProcessor({ db: connection.db } as never, {} as never, service);
+  const loaded = await (processor as unknown as { loadTarget(job: unknown): Promise<unknown> }).loadTarget({ endpointId: f.endpoint.id, configId: f.config.id, addressId: f.address.id });
+  expect(loaded).not.toBeNull();
+  await service.apply({ addressId: f.address.id, addressVersion: 1, configId: f.config.id, configVersion: 1, decision: "success", checkedAt: new Date() });
+  expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, f.address.id)))[0]).toMatchObject({ consecutiveSuccesses: 1 });
 });
 it("uses an explicit local policy threshold while keeping pool defaults for unassigned addresses", async () => {
   const f = await fixture(connection.db);

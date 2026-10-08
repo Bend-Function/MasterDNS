@@ -3,7 +3,7 @@ import { eq } from "drizzle-orm";
 import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { Redis } from "ioredis";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { createDatabase, dnsRecords, domainBindings, endpointPools, operationSteps, operations, providerAccounts, users, zones } from "@masterdns/db";
+import { createDatabase, dnsRecords, domainBindings, endpointPools, endpoints, operationSteps, operations, providerAccounts, users, zones } from "@masterdns/db";
 vi.mock("../env.js", () => ({ env: { MASTER_ENCRYPTION_KEY: Buffer.alloc(32).toString("base64") } }));
 import { OperationProcessor } from "./operation.processor.js";
 
@@ -39,7 +39,7 @@ async function fixture(action: "create" | "update" | "delete", managedOperation 
   let writes = 0;
   const adapter = { provider: "cloudflare", createRecord: async () => { writes++; return remote; }, updateRecord: async () => { writes++; return remote; }, deleteRecord: async () => { writes++; }, getRecord: async () => remote };
   const processor = new OperationProcessor({ db: connection.db } as never, { redis, notifications: { add: async () => ({}) } } as never, { forAccount: async () => ({ adapter }) } as never);
-  return { run: () => (processor as unknown as { process(job: unknown): Promise<void> }).process({ data: { operationId: operation!.id }, attemptsMade: 0, opts: { attempts: 1 } }), operationId: operation!.id, writes: () => writes };
+  return { run: () => (processor as unknown as { process(job: unknown): Promise<void> }).process({ data: { operationId: operation!.id }, attemptsMade: 0, opts: { attempts: 1 } }), operationId: operation!.id, pool: pool!, writes: () => writes };
 }
 
 describe("final DNS worker ownership guard", () => {
@@ -54,5 +54,14 @@ describe("final DNS worker ownership guard", () => {
     const [operation] = await connection.db.select().from(operations).where(eq(operations.id, f.operationId));
     expect(operation!.status).toBe("succeeded");
     expect(f.writes()).toBe(1);
+  });
+  it("refuses an old cloud publication after its endpoint was detached to static", async () => {
+    const f = await fixture("create", true);
+    const [endpoint] = await connection.db.insert(endpoints).values({ poolId: f.pool.id, name: "Detached endpoint", addressMode: "static" }).returning();
+    const [step] = await connection.db.select().from(operationSteps).where(eq(operationSteps.operationId, f.operationId));
+    await connection.db.update(operationSteps).set({ input: { ...step!.input, endpointId: endpoint!.id, cloud: { slotId: randomUUID(), publicationId: randomUUID() } } }).where(eq(operationSteps.id, step!.id));
+    await f.run();
+    expect(f.writes()).toBe(0);
+    expect((await connection.db.select().from(operationSteps).where(eq(operationSteps.id, step!.id)))[0]!.status).toBe("failed");
   });
 });

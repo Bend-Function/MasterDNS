@@ -137,6 +137,17 @@ async function poolFixture(recoveryMode: "automatic" | "keep_current" = "automat
   return { ...primary, pool, backup, policies, v6slot: v6slot!, bindings, service, round, reconcile, reconcileDns, observePublications, remote, writes, manualIncident };
 }
 
+it("reconciles retained static IPv4 while IPv6 remains managed by a cloud slot", async () => {
+  const f = await poolFixture();
+  await f.d.delete(db.cloudEndpointLinks).where(eq(db.cloudEndpointLinks.slotId, f.slot.id));
+  await f.d.update(db.endpointAddresses).set({ source: "static", address: "192.0.2.99" }).where(and(eq(db.endpointAddresses.endpointId, f.endpoints[0]!.id), eq(db.endpointAddresses.family, "4")));
+  const [pool] = await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pool.id));
+  await (f.reconcile as unknown as { process(job: unknown): Promise<void> }).process({ data: { poolId: f.pool.id, eventId: randomUUID(), trigger: "configuration", source: "user", policyRevision: pool!.policyRevision } });
+  await f.reconcileDns();
+  expect(f.remote.get("zone-0:A")?.content).toBe("192.0.2.99");
+  expect(f.remote.get("zone-0:AAAA")?.content).toBe("2001:db8::10");
+});
+
 it.each(["automatic", "keep_current"] as const)("fails over two providers' domains using external cloud health and respects %s recovery", async recoveryMode => {
   const f = await poolFixture(recoveryMode);
   for (const zone of ["zone-0", "zone-1"]) {

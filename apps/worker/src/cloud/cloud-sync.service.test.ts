@@ -53,6 +53,27 @@ async function awsInventory(accountId: string, service: "ec2" | "lightsail", pri
 }
 
 describe("complete cloud scope sync", () => {
+  it("does not recreate discovery errors when the account was deleted during a cloud read", async () => {
+    const f = await fixture();
+    f.adapter.listScopes.mockImplementation(async () => {
+      await connection.db.delete(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+      throw new Error("account deleted during discovery");
+    });
+    await expect(f.service.sync(f.account.id)).resolves.toEqual([]);
+    expect(await connection.db.select().from(cloudScanScopes).where(eq(cloudScanScopes.accountId, f.account.id))).toEqual([]);
+  });
+
+  it("discards inventory returned after the account was deleted", async () => {
+    const f = await fixture();
+    f.adapter.discover.mockImplementation(async () => {
+      await connection.db.delete(cloudAccounts).where(eq(cloudAccounts.id, f.account.id));
+      return { items: [f.item] };
+    });
+    await expect(f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter)).resolves.toMatchObject({ scopeStatus: "failed" });
+    expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.accountId, f.account.id))).toEqual([]);
+    expect(await connection.db.select().from(cloudScanScopes).where(eq(cloudScanScopes.accountId, f.account.id))).toEqual([]);
+  });
+
   it("restores explicitly absent address presence when a complete scan observes the same IP", async () => {
     const f = await fixture();
     await f.service.scanScope(f.account.id, "ec2", "us-east-1", f.adapter as unknown as CloudAdapter);

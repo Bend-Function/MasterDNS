@@ -83,7 +83,7 @@ export class HealthProcessor implements OnModuleInit, OnModuleDestroy {
     const address = addressRows[0];
     if (!pool || !config || !address) return null;
     if (!binding) {
-      if (endpoint.addressMode === "cloud") return null;
+      if (endpoint.addressMode === "cloud" && address.source !== "static") return null;
       const [policy] = await this.database.db.select().from(addressHealthPolicies).where(and(eq(addressHealthPolicies.endpointId, endpoint.id), eq(addressHealthPolicies.family, address.family)));
       if (policy && policy.mode !== "local") return null;
     }

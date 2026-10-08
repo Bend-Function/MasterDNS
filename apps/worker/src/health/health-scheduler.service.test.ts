@@ -41,6 +41,13 @@ it("uses the selected local policy config and interval", () => {
   const jobs = buildScheduledHealthJobs([{ endpointId: "e", poolId: "p", addressId: "a", family: "4", intervalSeconds: 15 }], [{ id: "pool", poolId: "p", endpointId: null, domainBindingId: null }, { id: "endpoint", poolId: null, endpointId: "e", domainBindingId: null }], [], [{ endpointId: "e", family: "4", mode: "local", configId: "pool", checkIntervalSeconds: 30 }]);
   expect(jobs).toEqual([{ data: { endpointId: "e", configId: "pool", addressId: "a" }, intervalSeconds: 30 }]);
 });
+it("schedules the detached static family while the other family still uses cloud health", () => {
+  const jobs = buildScheduledHealthJobs([
+    { endpointId: "e", poolId: "p", addressId: "a4", family: "4", intervalSeconds: 15, addressMode: "cloud", addressSource: "static" },
+    { endpointId: "e", poolId: "p", addressId: "a6", family: "6", intervalSeconds: 15, addressMode: "cloud", addressSource: "cloud" },
+  ], [{ id: "pool-check", poolId: "p", endpointId: null, domainBindingId: null }], []);
+  expect(jobs).toEqual([{ data: { endpointId: "e", configId: "pool-check", addressId: "a4" }, intervalSeconds: 15 }]);
+});
 it("keeps local policy selection scoped to its family and falls back for the other family", () => {
   const jobs = buildScheduledHealthJobs([
     { endpointId: "e", poolId: "p", addressId: "a4", family: "4", intervalSeconds: 15 },

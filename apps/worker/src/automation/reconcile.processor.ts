@@ -272,6 +272,8 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         if (endpoint?.addressMode !== "cloud") continue;
         const family = (step.input.record as DnsRecordInput).type === "AAAA" ? "6" : "4";
         const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, endpoint.id), eq(cloudEndpointLinks.family, family)));
+        if (!link && addresses.some(row => row.endpoint_addresses.endpointId === endpoint.id && row.endpoint_addresses.family === family
+          && row.endpoint_addresses.source === "static" && row.endpoint_addresses.address === (step.input.record as DnsRecordInput).content)) continue;
         if (!link) throw new Error("cloud_endpoint_link_missing");
         const c = cloudContexts.get(link.slotId);
         if (!c) throw new Error("cloud_endpoint_links_changed");

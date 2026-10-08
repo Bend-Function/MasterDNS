@@ -226,8 +226,18 @@ export class OperationProcessor implements OnModuleInit, OnModuleDestroy {
     }
     const cloud = input.endpointId && step.action !== "delete" ? await this.database.db.transaction(async tx => {
       const [endpoint] = await tx.select().from(endpoints).where(eq(endpoints.id, input.endpointId!));
-      if (endpoint?.addressMode !== "cloud") return;
+      if (endpoint?.addressMode !== "cloud") {
+        if (input.cloud) throw new ProviderError("Cloud publication is no longer linked to its endpoint", "validation_failed", adapter.provider);
+        return;
+      }
       const [link] = await tx.select().from(cloudEndpointLinks).where(and(eq(cloudEndpointLinks.endpointId, endpoint.id), eq(cloudEndpointLinks.family, input.record?.type === "AAAA" ? "6" : "4")));
+      if (!link && !input.cloud && input.record) {
+        const [retained] = await tx.select({ id: endpointAddresses.id }).from(endpointAddresses).where(and(
+          eq(endpointAddresses.endpointId, endpoint.id), eq(endpointAddresses.family, input.record.type === "AAAA" ? "6" : "4"),
+          eq(endpointAddresses.state, "current"), eq(endpointAddresses.source, "static"), eq(endpointAddresses.address, input.record.content),
+        ));
+        if (retained) return;
+      }
       if (!link || !input.cloud || input.cloud.slotId !== link.slotId) throw new ProviderError("Cloud publication identity is missing", "validation_failed", adapter.provider);
       return lockRotationContext(tx, link.slotId);
     }) : undefined;

@@ -6,6 +6,8 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { cloudAccounts, cloudProxyProfiles, cloudAddresses, cloudInstances, cloudInterfaces, cloudScanScopes, createDatabase, auditLogs, bindingAssignments, endpoints, dnsRecords, domainBindings, endpointAddresses, endpointPools, instanceAuthorizations, managedAddressSlots, providerAccounts, rotationIncidents, rotationAttempts, rotationBudgetSegments, rotationSteps, users, zones } from "@masterdns/db";
 import { decryptJson, encryptJson } from "@masterdns/crypto";
+import { cloudEndpointLinks, cloudIdleIpCleanups, cloudLifecycleOperations, cloudRotationBuckets, cloudRotationLimitPolicies, cloudRotationReservations, cloudTrafficStopPolicies, rotationLeases, rotationPolicies, rotationPublications, rotationResources, rotationSchedules, rotationStepObservations, operations, operationSteps, reconcileIntents } from "@masterdns/db";
+import { addressHealthPolicies, addressHealthStates, healthCheckConfigs, probeAgents, probeRounds, probeTasks } from "@masterdns/db";
 import type { AuthUser } from "../../auth/auth.types.js";
 
 const identityHook = vi.hoisted(() => ({ run: undefined as (() => Promise<void>) | undefined }));
@@ -69,6 +71,160 @@ async function fixture(managed = false) {
   if (managed) await service.authorize(actor, instance!.id, { managed: true, revision: 0 });
   return { actor, account, instance: instance!, iface: iface!, address: address!, slot: slot!, zone: zone!, scope: scope! };
 }
+
+describe("cloud account deletion", () => {
+  it("clears the entire local inventory and workflows while preserving DNS, static endpoint IPs and remote budgets", async () => {
+    const f = await fixture(true);
+    const other = await fixture();
+    const [historical] = await connection.db.insert(cloudInstances).values({ accountId: f.account.id, service: "lightsail", region: "us-west-2", externalId: "old-machine", scanGeneration: 1, metadata: { present: false } }).returning();
+    const [pool] = await connection.db.insert(endpointPools).values({ ownerUserId: f.actor.id, name: "Preserved pool", strategy: "primary_backup", decisionRevision: 1 }).returning();
+    const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool!.id, name: "Cloud endpoint", addressMode: "cloud" }).returning();
+    await connection.db.insert(cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId: f.slot.id, family: "4" });
+    const [endpointAddress] = await connection.db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: "4", address: "192.0.2.10", source: "cloud", state: "current" }).returning();
+    const [binding] = await connection.db.insert(domainBindings).values({ poolId: pool!.id, zoneId: f.zone.id, fqdn: "keep.example.com", recordType: "A", originalEndpointId: endpoint!.id }).returning();
+    const [healthConfig] = await connection.db.insert(healthCheckConfigs).values({ slotId: f.slot.id, checkerType: "tcp", config: { port: 443 } }).returning();
+    await connection.db.insert(addressHealthPolicies).values({ slotId: f.slot.id, family: "4", configId: healthConfig!.id });
+    await connection.db.insert(addressHealthStates).values({ slotId: f.slot.id, family: "4", addressId: f.address.id });
+    const [probe] = await connection.db.insert(probeAgents).values({ ownerUserId: f.actor.id, name: "Preserved probe" }).returning();
+    const [round] = await connection.db.insert(probeRounds).values({ slotId: f.slot.id, configId: healthConfig!.id, sequence: 1, addressVersion: 1, configVersion: 1, address: f.address.address, family: "4", config: { type: "tcp", port: 443, timeoutMs: 1000 }, memberIds: [probe!.id], consensus: { mode: "majority", minimumValid: 1 }, deadline: new Date(), resultExpiresAt: new Date(Date.now() + 60_000) }).returning();
+    await connection.db.insert(probeTasks).values({ roundId: round!.id, probeId: probe!.id, status: "leased" });
+    const segmentId = randomUUID(), attemptId = randomUUID(), stepId = randomUUID(), physicalKey = randomUUID();
+    const [incident] = await connection.db.insert(rotationIncidents).values({ ownerUserId: f.actor.id, slotId: f.slot.id, family: "4", physicalKey, sourceEventId: randomUUID(), trigger: "manual", currentSegmentId: segmentId, currentAttemptId: attemptId, authorizationRevision: 1, policyRevision: 1, addressVersion: 0 }).returning();
+    await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 1 });
+    await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: {} });
+    await connection.db.insert(rotationSteps).values({ id: stepId, attemptId, sequence: 1, status: "applied", plan: { id: stepId, action: "ec2.eip.associate", resourceKey: f.instance.externalId, arguments: {}, destructive: true } });
+    await connection.db.insert(rotationStepObservations).values({ stepId, observation: true, result: { status: "pending" } });
+    await connection.db.insert(rotationLeases).values({ physicalKey, incidentId: incident!.id, holder: randomUUID(), revision: 3 });
+    await connection.db.insert(rotationResources).values({ incidentId: incident!.id, attemptId, address: "192.0.2.10", origin: "system", role: "candidate", snapshot: {}, cleanupStepId: stepId });
+    await connection.db.insert(rotationPolicies).values({ slotId: f.slot.id });
+    await connection.db.insert(rotationSchedules).values({ slotId: f.slot.id, activeIncidentId: incident!.id });
+    const identityKey = randomUUID(), bucketKey = randomUUID();
+    await connection.db.insert(cloudRotationReservations).values({ stepId, identityKey, consumedAt: new Date() });
+    await connection.db.insert(cloudRotationBuckets).values({ key: bucketKey, identityKey, ruleId: "test", debt: 1, events: [Date.now()] });
+    await connection.db.insert(cloudRotationLimitPolicies).values({ accountId: f.account.id, service: "ec2" });
+    await connection.db.insert(cloudTrafficStopPolicies).values({ instanceId: f.instance.id, actorUserId: f.actor.id });
+    const [lifecycle] = await connection.db.insert(cloudLifecycleOperations).values({ instanceId: f.instance.id, physicalKey: randomUUID(), ownerUserId: f.actor.id, actorUserId: f.actor.id, action: "stop", source: "user", externalAccountId: "123456789012", credentialFingerprint: "test" }).returning();
+    const [cleanup] = await connection.db.insert(cloudIdleIpCleanups).values({ accountId: f.account.id, ownerUserId: f.actor.id, actorUserId: f.actor.id, externalAccountId: "123456789012", credentialFingerprint: "test", regions: [], items: [], expiresAt: new Date() }).returning();
+    const eventId = randomUUID();
+    const [operation] = await connection.db.insert(operations).values({ ownerUserId: f.actor.id, source: "failover", idempotencyKey: `pool:${pool!.id}:revision:1:event:${eventId}`, resourceType: "pool", resourceId: pool!.id }).returning();
+    const [operationStep] = await connection.db.insert(operationSteps).values({ operationId: operation!.id, providerAccountId: f.zone.providerAccountId, zoneId: f.zone.id, sequence: 1, action: "update", status: "running", input: {} }).returning();
+    await connection.db.insert(reconcileIntents).values({ poolId: pool!.id, eventId, policyRevision: 1, decisionRevision: 1, trigger: "configuration", source: "failover" });
+    await connection.db.insert(rotationPublications).values({ slotId: f.slot.id, addressVersion: 1, addressId: f.address.id, incidentId: incident!.id, children: [{ poolId: pool!.id, eventId, policyRevision: 1, decisionRevision: 1 }] });
+    const [survivingPublication] = await connection.db.insert(rotationPublications).values({ slotId: other.slot.id, addressVersion: 1, addressId: other.address.id, status: "in_flight", promotedAt: new Date(), children: [{ poolId: pool!.id, eventId, policyRevision: 1, decisionRevision: 1 }] }).returning();
+
+    expect(await service.remove(f.actor, f.account.id)).toMatchObject({ deleted: true, deletedInstances: 2 });
+    expect(await connection.db.select().from(cloudAccounts).where(eq(cloudAccounts.id, f.account.id))).toEqual([]);
+    expect(await connection.db.select().from(cloudInstances).where(eq(cloudInstances.id, historical!.id))).toEqual([]);
+    for (const [table, column, id] of [
+      [cloudInstances, cloudInstances.id, f.instance.id], [cloudInterfaces, cloudInterfaces.id, f.iface.id],
+      [cloudAddresses, cloudAddresses.id, f.address.id], [managedAddressSlots, managedAddressSlots.id, f.slot.id],
+      [instanceAuthorizations, instanceAuthorizations.instanceId, f.instance.id], [cloudScanScopes, cloudScanScopes.id, f.scope.id],
+      [rotationIncidents, rotationIncidents.id, incident!.id], [rotationAttempts, rotationAttempts.id, attemptId],
+      [rotationSteps, rotationSteps.id, stepId], [rotationResources, rotationResources.incidentId, incident!.id],
+      [rotationStepObservations, rotationStepObservations.stepId, stepId], [rotationBudgetSegments, rotationBudgetSegments.id, segmentId],
+      [rotationPolicies, rotationPolicies.slotId, f.slot.id], [rotationSchedules, rotationSchedules.slotId, f.slot.id],
+      [rotationPublications, rotationPublications.slotId, f.slot.id], [cloudEndpointLinks, cloudEndpointLinks.slotId, f.slot.id],
+      [cloudTrafficStopPolicies, cloudTrafficStopPolicies.instanceId, f.instance.id], [cloudLifecycleOperations, cloudLifecycleOperations.id, lifecycle!.id],
+      [cloudIdleIpCleanups, cloudIdleIpCleanups.id, cleanup!.id], [cloudRotationReservations, cloudRotationReservations.stepId, stepId],
+      [healthCheckConfigs, healthCheckConfigs.id, healthConfig!.id], [addressHealthPolicies, addressHealthPolicies.slotId, f.slot.id],
+      [addressHealthStates, addressHealthStates.slotId, f.slot.id], [probeRounds, probeRounds.id, round!.id], [probeTasks, probeTasks.roundId, round!.id],
+    ] as const) expect(await connection.db.select().from(table).where(eq(column, id))).toEqual([]);
+    expect((await service.instance(other.actor, other.instance.id)).instance.id).toBe(other.instance.id);
+    expect((await connection.db.select().from(endpoints).where(eq(endpoints.id, endpoint!.id)))[0]!.addressMode).toBe("static");
+    expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.id, endpointAddress!.id)))[0]).toMatchObject({ address: "192.0.2.10", source: "static" });
+    expect(await connection.db.select().from(domainBindings).where(eq(domainBindings.id, binding!.id))).toHaveLength(1);
+    expect((await connection.db.select().from(operations).where(eq(operations.id, operation!.id)))[0]!.status).toBe("superseded");
+    expect((await connection.db.select().from(operationSteps).where(eq(operationSteps.id, operationStep!.id)))[0]!.status).toBe("skipped");
+    expect((await connection.db.select().from(reconcileIntents).where(eq(reconcileIntents.eventId, eventId)))[0]!.completedAt).not.toBeNull();
+    const [currentPool] = await connection.db.select().from(endpointPools).where(eq(endpointPools.id, pool!.id));
+    expect(currentPool!.decisionRevision).toBe(2);
+    expect(await connection.db.select().from(reconcileIntents).where(and(eq(reconcileIntents.poolId, pool!.id), eq(reconcileIntents.decisionRevision, 2)))).toMatchObject([{ completedAt: null, trigger: "configuration" }]);
+    expect(await connection.db.select().from(rotationPublications).where(eq(rotationPublications.id, survivingPublication!.id))).toHaveLength(1);
+    expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.physicalKey, physicalKey)))[0]).toMatchObject({ incidentId: null, unresolvedStepId: null, holder: null, revision: 4 });
+    expect((await connection.db.select().from(cloudRotationBuckets).where(eq(cloudRotationBuckets.key, bucketKey)))[0]!.debt).toBe(1);
+    expect(await connection.db.select().from(probeAgents).where(eq(probeAgents.id, probe!.id))).toHaveLength(1);
+    const logs = await connection.db.select().from(auditLogs).where(eq(auditLogs.action, "cloud_account.delete"));
+    const log = logs.find(row => row.resourceId === f.account.id)!;
+    expect(log).toMatchObject({ actorUserId: f.actor.id, ownerUserId: f.actor.id, afterSnapshot: { deleted: true, deletedInstances: 2 } });
+    expect(JSON.stringify(log)).not.toMatch(/credentialCiphertext|credentialIv|credentialTag|secretAccessKey/);
+  });
+
+  it("hides another owner's account from users and permits administrators to delete it", async () => {
+    const f = await fixture(), other = await fixture();
+    await expect(service.remove(other.actor, f.account.id)).rejects.toMatchObject({ status: 404 });
+    expect(await service.instances(f.actor, f.account.id)).toHaveLength(1);
+    expect(await service.remove({ ...other.actor, role: "admin" }, f.account.id)).toMatchObject({ deleted: true });
+    await expect(service.remove(f.actor, f.account.id)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("deletes an account with no inventory", async () => {
+    const f = await fixture();
+    const account = await create(f.actor, { name: "Empty", provider: "aws", credentials: { kind: "access_key", accessKeyId: "test-access-key", secretAccessKey: "test-secret-access-key" } });
+    expect(await service.remove(f.actor, account.id)).toEqual({ deleted: true, deletedInstances: 0 });
+  });
+
+  it("refuses deletion while a previously dispatched cloud mutation remains unresolved", async () => {
+    const f = await fixture();
+    const [operation] = await connection.db.insert(cloudLifecycleOperations).values({ instanceId: f.instance.id, physicalKey: randomUUID(), ownerUserId: f.actor.id, actorUserId: f.actor.id, action: "stop", source: "user", status: "unknown", externalAccountId: "123456789012", credentialFingerprint: "test" }).returning();
+    await expect(service.remove(f.actor, f.account.id)).rejects.toMatchObject({ status: 409 });
+    await connection.db.update(cloudLifecycleOperations).set({ status: "succeeded" }).where(eq(cloudLifecycleOperations.id, operation!.id));
+    const segmentId = randomUUID(), attemptId = randomUUID(), stepId = randomUUID();
+    const [incident] = await connection.db.insert(rotationIncidents).values({ ownerUserId: f.actor.id, slotId: f.slot.id, family: "4", physicalKey: randomUUID(), sourceEventId: randomUUID(), trigger: "manual", currentSegmentId: segmentId, authorizationRevision: 1, policyRevision: 1, addressVersion: 0 }).returning();
+    await connection.db.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: incident!.id, maxAttempts: 1 });
+    await connection.db.insert(rotationAttempts).values({ id: attemptId, incidentId: incident!.id, segmentId, sequence: 1, beforeInventory: {} });
+    await connection.db.insert(rotationSteps).values({ id: stepId, attemptId, sequence: 1, status: "pending", plan: { id: stepId, action: "ec2.eip.associate", resourceKey: f.instance.externalId, arguments: {}, destructive: true } });
+    await expect(service.remove(f.actor, f.account.id)).rejects.toMatchObject({ status: 409 });
+    await connection.db.update(rotationSteps).set({ status: "applied" }).where(eq(rotationSteps.id, stepId));
+    const [cleanup] = await connection.db.insert(cloudIdleIpCleanups).values({ accountId: f.account.id, ownerUserId: f.actor.id, actorUserId: f.actor.id, externalAccountId: "123456789012", credentialFingerprint: "test", regions: ["us-east-1"], items: [{ region: "us-east-1", name: "idle", address: "192.0.2.11", arn: "arn:test", createdAt: "2026-10-08T00:00:00Z", status: "in_flight" }], expiresAt: new Date() }).returning();
+    await expect(service.remove(f.actor, f.account.id)).rejects.toMatchObject({ status: 409 });
+    await connection.db.delete(cloudIdleIpCleanups).where(eq(cloudIdleIpCleanups.id, cleanup!.id));
+    expect(await service.remove(f.actor, f.account.id)).toMatchObject({ deleted: true });
+  });
+
+  it("retries the entire local transaction after PostgreSQL selects deletion as a deadlock victim", async () => {
+    const f = await fixture();
+    let interrupted = false;
+    const retryService = new CloudService({ db: { transaction: (action: Parameters<typeof connection.db.transaction>[0]) => connection.db.transaction(async tx => {
+      const result = await action(tx);
+      if (!interrupted) { interrupted = true; throw new Error("deadlock victim", { cause: { code: "40P01" } }); }
+      return result;
+    }) } } as never, queue as never);
+    expect(await retryService.remove(f.actor, f.account.id)).toMatchObject({ deleted: true });
+    expect(await connection.db.select().from(auditLogs).where(and(eq(auditLogs.resourceId, f.account.id), eq(auditLogs.action, "cloud_account.delete")))).toHaveLength(1);
+  });
+
+  it("rolls back inventory and endpoint changes when writing the audit log fails", async () => {
+    const f = await fixture();
+    const [pool] = await connection.db.insert(endpointPools).values({ ownerUserId: f.actor.id, name: "Rollback pool", strategy: "primary_backup" }).returning();
+    const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool!.id, name: "Rollback endpoint", addressMode: "cloud" }).returning();
+    await connection.db.insert(cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId: f.slot.id, family: "4" });
+    await connection.client.unsafe(`create function reject_account_delete_audit() returns trigger language plpgsql as $$ begin if NEW.action = 'cloud_account.delete' then raise exception 'audit unavailable'; end if; return NEW; end $$`);
+    await connection.client.unsafe(`create trigger reject_account_delete_audit before insert on audit_logs for each row execute function reject_account_delete_audit()`);
+    try {
+      await expect(service.remove(f.actor, f.account.id)).rejects.toThrow();
+      expect(await service.instances(f.actor, f.account.id)).toHaveLength(1);
+      expect(await connection.db.select().from(managedAddressSlots).where(eq(managedAddressSlots.id, f.slot.id))).toHaveLength(1);
+      expect((await connection.db.select().from(endpoints).where(eq(endpoints.id, endpoint!.id)))[0]!.addressMode).toBe("cloud");
+      expect(await connection.db.select().from(cloudEndpointLinks).where(eq(cloudEndpointLinks.endpointId, endpoint!.id))).toHaveLength(1);
+    } finally {
+      await connection.client.unsafe(`drop trigger reject_account_delete_audit on audit_logs`);
+      await connection.client.unsafe(`drop function reject_account_delete_audit()`);
+    }
+  });
+
+  it("keeps another account's cloud link on a shared dual-stack endpoint", async () => {
+    const f = await fixture(), other = await fixture();
+    const [ipv6Slot] = await connection.db.insert(managedAddressSlots).values({ interfaceId: other.iface.id, family: "6", name: "ipv6" }).returning();
+    const [pool] = await connection.db.insert(endpointPools).values({ ownerUserId: f.actor.id, name: "Dual-stack pool", strategy: "primary_backup" }).returning();
+    const [endpoint] = await connection.db.insert(endpoints).values({ poolId: pool!.id, name: "Dual-stack", addressMode: "cloud" }).returning();
+    await connection.db.insert(cloudEndpointLinks).values([{ endpointId: endpoint!.id, slotId: f.slot.id, family: "4" }, { endpointId: endpoint!.id, slotId: ipv6Slot!.id, family: "6" }]);
+    await connection.db.insert(endpointAddresses).values({ endpointId: endpoint!.id, family: "6", address: "2001:db8::10", source: "cloud", state: "current" });
+    await service.remove(f.actor, f.account.id);
+    expect((await connection.db.select().from(endpoints).where(eq(endpoints.id, endpoint!.id)))[0]!.addressMode).toBe("cloud");
+    expect(await connection.db.select().from(cloudEndpointLinks).where(eq(cloudEndpointLinks.endpointId, endpoint!.id))).toMatchObject([{ slotId: ipv6Slot!.id, family: "6" }]);
+    expect((await connection.db.select().from(endpointAddresses).where(eq(endpointAddresses.endpointId, endpoint!.id)))[0]!.source).toBe("cloud");
+  });
+});
 
 describe("cloud account and authorization API", () => {
   it("uses a selected owned proxy during account creation and retains it through credential rotation", async () => {
@@ -517,7 +673,7 @@ describe("cloud request idempotency", () => {
   });
 });
 
-import { policyVersions, cloudEndpointLinks, reconcileIntents } from "@masterdns/db";
+import { policyVersions } from "@masterdns/db";
 import { PoolsService } from "../pools/pools.service.js";
 it("restores a cloud policy through saved slot identity and current address retesting without replaying snapshot IPs", async () => {
  const f=await fixture();f.instance.externalId=`i-${randomUUID()}`;await connection.db.update(cloudInstances).set({externalId:f.instance.externalId}).where(eq(cloudInstances.id,f.instance.id));await service.authorize(f.actor,f.instance.id,{managed:true,revision:0});

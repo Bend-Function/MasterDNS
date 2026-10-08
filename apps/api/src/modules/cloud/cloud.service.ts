@@ -12,6 +12,7 @@ import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
 import { cloudRequestKey, withCloudRequest } from "./cloud-idempotency.js";
 import type { CloudAuthorizationInput, CloudCredentialsUpdateInput, CreateCloudAccountInput } from "./cloud.schemas.js";
+import { removeCloudAccount } from "./cloud-account-deletion.js";
 
 type Account = typeof cloudAccounts.$inferSelect;
 export function publicCloudAccount(account: Account) {
@@ -28,6 +29,10 @@ export class CloudService {
   async list(actor: AuthUser) {
     const accounts = await this.database.db.select().from(cloudAccounts).where(actor.role === "admin" ? undefined : eq(cloudAccounts.ownerUserId, actor.id)).orderBy(asc(cloudAccounts.createdAt));
     return accounts.map(publicCloudAccount);
+  }
+
+  async remove(actor: AuthUser, id: string) {
+    return removeCloudAccount(this.database.db, actor, id);
   }
 
   async rotationLimits(actor: AuthUser, id: string, serviceName: string) {

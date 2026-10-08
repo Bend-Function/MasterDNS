@@ -1,4 +1,4 @@
-import { Controller, Get, Headers, Param, ParseUUIDPipe, Patch, Query, Post } from "@nestjs/common";
+import { Controller, Delete, Get, Headers, Param, ParseUUIDPipe, Patch, Query, Post } from "@nestjs/common";
 import { CurrentUser } from "../../auth/auth.decorators.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { ZodBody } from "../../common/zod-body.decorator.js";
@@ -13,6 +13,7 @@ import { cloudRotationLimitPolicySchema } from "@masterdns/contracts";
 export class CloudController {
   constructor(private readonly cloud: CloudService, private readonly bindings: CloudBindingsService) {}
   @Get("cloud-accounts") list(@CurrentUser() actor: AuthUser) { return this.cloud.list(actor); }
+  @Delete("cloud-accounts/:id") remove(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string) { return this.cloud.remove(actor, id); }
   @Post("cloud-accounts") create(@CurrentUser() actor: AuthUser, @ZodBody(createCloudAccountSchema) input: CreateCloudAccountInput, @Headers("idempotency-key") key: string | undefined) { return this.cloud.create(actor, input, cloudRequestKey(key)); }
   @Patch("cloud-accounts/:id/credentials") credentials(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @ZodBody(cloudCredentialsUpdateSchema) input: CloudCredentialsUpdateInput) { return this.cloud.rotateCredentials(actor, id, input); }
   @Patch("cloud-accounts/:id/status") status(@CurrentUser() actor: AuthUser, @Param("id", ParseUUIDPipe) id: string, @ZodBody(cloudEnabledSchema) input: { enabled: boolean }) { return this.cloud.setEnabled(actor, id, input.enabled); }

@@ -67,8 +67,9 @@ export class HealthResultService {
       await tx.execute(sql`select id from endpoints where id = ${target.endpoint.id} for update`);
       await tx.execute(sql`select id from endpoint_addresses where id = ${target.address.id} for update`);
       const [current] = await tx.select().from(endpoints).where(eq(endpoints.id, target.endpoint.id)).limit(1);
-      if (!current || (current.addressMode === "cloud" && !target.binding && !cloud) || (cloud && current.addressMode !== "cloud")) return null;
+      if (!current || (cloud && current.addressMode !== "cloud")) return null;
       const [currentAddress] = await tx.select().from(endpointAddresses).where(eq(endpointAddresses.id, target.address.id)).limit(1);
+      if (current.addressMode === "cloud" && !target.binding && !cloud && currentAddress?.source !== "static") return null;
       if (!currentAddress || !isAddressStillIntended(target.address, currentAddress, current.addressMode)) return null;
       const [currentConfig] = await tx.select().from(healthCheckConfigs).where(eq(healthCheckConfigs.id, target.config.id)).limit(1);
       if (!isHealthCheckDefinitionCurrent(target.config, currentConfig)) return null;
@@ -261,7 +262,7 @@ export function isAddressStillIntended(
     || observed.family !== current.family
     || observed.source !== current.source) return false;
   if (observed.state === "candidate") return endpointMode === "ddns" && current.state === "candidate" && current.source === "ddns";
-  return current.state === "current" && current.source === endpointMode;
+  return current.state === "current" && (current.source === endpointMode || (endpointMode === "cloud" && current.source === "static"));
 }
 
 export function isHealthCheckDefinitionCurrent(

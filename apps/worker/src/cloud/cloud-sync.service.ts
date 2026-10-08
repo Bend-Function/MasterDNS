@@ -49,7 +49,13 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
       } catch (error) {
         // '*' is a service-level discovery error, never an inventory scan generation.
         const code = safeCloudError(error);
-        await this.database.db.insert(cloudScanScopes).values({ accountId, service, region: "*", lastError: code }).onConflictDoUpdate({ target: [cloudScanScopes.accountId, cloudScanScopes.service, cloudScanScopes.region], set: { lastError: code, updatedAt: new Date() } });
+        const recorded = await this.database.db.transaction(async tx => {
+          const [current] = await tx.select({ id: cloudAccounts.id }).from(cloudAccounts).where(eq(cloudAccounts.id, accountId)).for("update");
+          if (!current) return false;
+          await tx.insert(cloudScanScopes).values({ accountId, service, region: "*", lastError: code }).onConflictDoUpdate({ target: [cloudScanScopes.accountId, cloudScanScopes.service, cloudScanScopes.region], set: { lastError: code, updatedAt: new Date() } });
+          return true;
+        });
+        if (!recorded) break;
         results.push({ service, region: "*", scopeStatus: "failed", removedInstances: 0, errorCode: code });
       }
     }
@@ -61,9 +67,14 @@ export class CloudSyncService implements OnModuleInit, OnModuleDestroy {
     if (!account?.enabled) return { scopeStatus: "failed", removedInstances: 0, errorCode: "account_unavailable" };
     if (cloudServiceProvider(service) !== account.provider || !validCloudRegion(account.provider, region)) return { scopeStatus: "failed", removedInstances: 0, errorCode: "invalid_scope" };
     if (account.regions !== null && !account.regions.includes(region)) return { scopeStatus: "failed", removedInstances: 0, errorCode: "region_excluded" };
-    const [scope] = await this.database.db.insert(cloudScanScopes).values({ accountId, service, region, lastStartedAt: new Date() })
-      .onConflictDoUpdate({ target: [cloudScanScopes.accountId, cloudScanScopes.service, cloudScanScopes.region], set: { lastStartedAt: new Date(), updatedAt: new Date() } }).returning();
-    if (!scope) throw new Error("Cloud scope insert returned no row");
+    const scope = await this.database.db.transaction(async tx => {
+      const [current] = await tx.select().from(cloudAccounts).where(eq(cloudAccounts.id, accountId)).for("update");
+      if (!current?.enabled) return undefined;
+      const [started] = await tx.insert(cloudScanScopes).values({ accountId, service, region, lastStartedAt: new Date() })
+        .onConflictDoUpdate({ target: [cloudScanScopes.accountId, cloudScanScopes.service, cloudScanScopes.region], set: { lastStartedAt: new Date(), updatedAt: new Date() } }).returning();
+      return started;
+    });
+    if (!scope) return { scopeStatus: "failed", removedInstances: 0, errorCode: "account_unavailable" };
     try {
       const items: CloudInventory[] = [];
       const cursors = new Set<string>();
