@@ -6,6 +6,10 @@
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
+    "./zones": {
+      "types": "./dist/zones.d.ts",
+      "default": "./dist/zones.js"
+    },
     "./cloud-lifecycle": {
       "types": "./dist/cloud-lifecycle.d.ts",
       "default": "./dist/cloud-lifecycle.js"

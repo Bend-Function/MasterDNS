@@ -1,5 +1,5 @@
 import { Body, Controller, Delete, Get, Headers, Param, Patch, Post } from "@nestjs/common";
-import { dnsRecordInputSchema } from "@masterdns/contracts";
+import { createZoneInputSchema, createZonesInputSchema, dnsRecordInputSchema } from "@masterdns/contracts";
 import { CurrentUser } from "../../auth/auth.decorators.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { parseIdempotencyKey } from "../../common/idempotency.js";
@@ -11,6 +11,12 @@ export class DnsController {
 
   @Get()
   zones(@CurrentUser() actor: AuthUser) { return this.dns.listZones(actor); }
+
+  @Post()
+  createZone(@CurrentUser() actor: AuthUser, @Body() body: unknown) { return this.dns.createZone(actor, createZoneInputSchema.parse(body)); }
+
+  @Post("batch")
+  createZones(@CurrentUser() actor: AuthUser, @Body() body: unknown) { return this.dns.createZones(actor, createZonesInputSchema.parse(body)); }
 
   @Get(":zoneId/records")
   records(@CurrentUser() actor: AuthUser, @Param("zoneId") zoneId: string) { return this.dns.listRecords(actor, zoneId); }

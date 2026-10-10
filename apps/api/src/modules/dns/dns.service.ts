@@ -1,8 +1,11 @@
-import { ConflictException, Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, ConflictException, HttpException, Injectable, Logger, NotFoundException } from "@nestjs/common";
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import type { DnsRecordInput } from "@masterdns/contracts";
-import { addressHealthPolicies, addressHealthStates, cloudAccounts, cloudEndpointLinks, cloudInstances, cloudInterfaces, dnsRecords, domainBindings, endpointPools, endpoints, getCloudTargetsForSlots, healthCheckConfigs, managedAddressSlots, operationSteps, probeGroups, providerAccounts, rotationPublications, zones } from "@masterdns/db";
+import { createZoneInputSchema, createZonesInputSchema, ProviderError, type CreateZoneInput, type CreateZonesInput, type DnsRecordInput, type ZoneCreationResult, type ZoneCreationSuccess } from "@masterdns/contracts";
+import { decryptJson, parseEncryptionKey } from "@masterdns/crypto";
+import { CloudflareDnsAdapter, type ProviderCredentials } from "@masterdns/providers";
+import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudEndpointLinks, cloudInstances, cloudInterfaces, dnsRecords, domainBindings, endpointPools, endpoints, getCloudTargetsForSlots, healthCheckConfigs, managedAddressSlots, operationSteps, probeGroups, providerAccounts, rotationPublications, zones } from "@masterdns/db";
 import { randomUUID } from "node:crypto";
+import { env } from "../../config/env.js";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { QueueService } from "../../infrastructure/queue.module.js";
@@ -11,6 +14,7 @@ import { normalizeRecordName } from "./dns-name.js";
 
 @Injectable()
 export class DnsService {
+  private readonly logger = new Logger(DnsService.name);
   constructor(
     private readonly database: DatabaseService,
     private readonly queues: QueueService,
@@ -18,10 +22,75 @@ export class DnsService {
   ) {}
 
   async listZones(actor: AuthUser) {
-    return this.database.db.select({ zone: zones, accountName: providerAccounts.name, provider: providerAccounts.provider, ownerUserId: providerAccounts.ownerUserId })
+    const rows = await this.database.db.select({ zone: zones, accountName: providerAccounts.name, provider: providerAccounts.provider, ownerUserId: providerAccounts.ownerUserId })
       .from(zones).innerJoin(providerAccounts, eq(zones.providerAccountId, providerAccounts.id))
       .where(actor.role === "admin" ? undefined : eq(providerAccounts.ownerUserId, actor.id))
       .orderBy(asc(zones.nameAscii));
+    // The stored status governs local availability. Activation is remote state.
+    return rows.map(row => ({ ...row, zone: { ...row.zone, status: row.zone.status === "active" && ["pending", "initializing", "moved"].includes(String(row.zone.providerMetadata.zoneStatus)) ? "pending" : row.zone.status } }));
+  }
+
+  async createZone(actor: AuthUser, input: CreateZoneInput): Promise<ZoneCreationSuccess> {
+    const parsed = createZoneInputSchema.parse(input);
+    const account = await this.findZoneCreationAccount(actor, parsed.providerAccountId);
+    const credentials = decryptJson<ProviderCredentials>({ ciphertext: account.credentialCiphertext, iv: account.credentialIv, tag: account.credentialTag, keyVersion: account.credentialKeyVersion }, parseEncryptionKey(env.MASTER_ENCRYPTION_KEY));
+    if (credentials.provider !== "cloudflare") throw new ConflictException("DNS 账号凭据类型不匹配，请重新接入账号");
+    const adapter = new CloudflareDnsAdapter(credentials.apiToken);
+    const target = { name: parsed.name, accountId: parsed.cloudflareAccountId };
+    let remote = await adapter.findZone(target);
+    let status: ZoneCreationSuccess["status"] = "existing";
+    if (!remote) {
+      try {
+        remote = await adapter.createZone(target);
+        status = "created";
+      } catch (error) {
+        // A duplicate or timed-out POST may already have created the zone.
+        // Only a scoped read can establish that; never replay the POST here.
+        if (!(error instanceof ProviderError) || !["transient_failure", "conflict", "validation_failed"].includes(error.code)) throw error;
+        try { remote = await adapter.findZone(target); } catch { throw error; }
+        if (!remote) throw error;
+      }
+    }
+    if (remote.name !== parsed.name || remote.providerMetadata.accountId !== parsed.cloudflareAccountId) throw new ConflictException("Cloudflare 返回的域名或账号不匹配，请核对 Account ID");
+    const result = await this.database.db.transaction(async tx => {
+      const [current] = await tx.select().from(providerAccounts).where(eq(providerAccounts.id, account.id)).for("share");
+      if (!current || current.ownerUserId !== account.ownerUserId || current.status !== "active" || current.provider !== account.provider || current.credentialCiphertext !== account.credentialCiphertext || current.credentialIv !== account.credentialIv || current.credentialTag !== account.credentialTag || current.credentialKeyVersion !== account.credentialKeyVersion) {
+        throw new ConflictException("DNS 账号在添加期间发生变化，域名可能已在 Cloudflare 创建，请同步账号后重试");
+      }
+      const values = { providerAccountId: account.id, externalId: remote.externalId, nameAscii: remote.name, providerMetadata: remote.providerMetadata };
+      const [zone] = await tx.insert(zones).values(values).onConflictDoUpdate({ target: [zones.providerAccountId, zones.externalId], set: { nameAscii: values.nameAscii, providerMetadata: values.providerMetadata, updatedAt: new Date() } }).returning();
+      if (!zone) throw new Error("Zone insert returned no row");
+      const nameServers = Array.isArray(remote.providerMetadata.nameServers) ? remote.providerMetadata.nameServers.filter((name): name is string => typeof name === "string") : [];
+      const created: ZoneCreationSuccess = { name: parsed.name, status, zoneId: zone.id, zoneStatus: remote.status, nameServers };
+      await tx.insert(auditLogs).values({ ownerUserId: account.ownerUserId, actorUserId: actor.id, source: "user", action: status === "created" ? "zone.create" : "zone.import", resourceType: "zone", resourceId: zone.id, afterSnapshot: created });
+      return created;
+    });
+    // Redis may keep an offline producer request pending indefinitely. The
+    // optional record sync must not hold the durable domain response open.
+    const syncFailed = () => { this.logger.warn(`Zone ${result.zoneId} added; record sync could not be queued`); };
+    try {
+      void this.queues.sync.add("sync-zone", { providerAccountId: account.id, zoneId: result.zoneId }, { jobId: `zone-sync-${result.zoneId}-${Date.now()}`, removeOnComplete: 100, removeOnFail: 500 }).catch(syncFailed);
+    } catch { syncFailed(); }
+    return result;
+  }
+
+  async createZones(actor: AuthUser, input: CreateZonesInput): Promise<{ results: ZoneCreationResult[] }> {
+    const parsed = createZonesInputSchema.parse(input);
+    await this.findZoneCreationAccount(actor, parsed.providerAccountId);
+    const results: ZoneCreationResult[] = [];
+    for (const name of parsed.names) {
+      try { results.push(await this.createZone(actor, { providerAccountId: parsed.providerAccountId, cloudflareAccountId: parsed.cloudflareAccountId, name })); }
+      catch (error) { results.push({ name, status: "failed", error: zoneCreationError(error) }); }
+    }
+    return { results };
+  }
+
+  private async findZoneCreationAccount(actor: AuthUser, id: string) {
+    const [account] = await this.database.db.select().from(providerAccounts).where(and(eq(providerAccounts.id, id), actor.role === "admin" ? undefined : eq(providerAccounts.ownerUserId, actor.id))).limit(1);
+    if (!account) throw new NotFoundException("DNS 账号不存在");
+    if (account.provider !== "cloudflare") throw new BadRequestException("新增域名目前仅支持 Cloudflare");
+    if (account.status !== "active") throw new ConflictException("DNS 账号已停用或存在错误，请先恢复账号");
+    return account;
   }
 
   async listRecords(actor: AuthUser, zoneId: string) {
@@ -180,4 +249,10 @@ export class DnsService {
     if (!record || record.deletedAt) throw new NotFoundException("解析记录不存在");
     return record;
   }
+}
+
+function zoneCreationError(error: unknown): { code: string; message: string } {
+  if (error instanceof ProviderError) return { code: error.code, message: error.message };
+  if (error instanceof HttpException) return { code: error.getStatus() === 404 ? "not_found" : error.getStatus() === 409 ? "conflict" : "request_failed", message: error.message };
+  return { code: "internal_error", message: "添加失败，域名可能已在 Cloudflare 创建，请同步账号后重试" };
 }

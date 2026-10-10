@@ -220,12 +220,19 @@ export default function ZoneRecordsPage() {
 
   const zoneName = zone?.zone.nameAscii ?? data?.[0]?.name ?? zoneId;
   const provider = zone?.provider;
+  const nameServers = zone?.zone.providerMetadata?.nameServers;
+  const cloudflareNameServers = provider === "cloudflare" && Array.isArray(nameServers) ? nameServers.filter((server): server is string => typeof server === "string") : [];
 
   return <ConsoleLayout>
     <div className="detail-header">
       <div className="detail-title"><Link className="icon-button" href="/zones" aria-label="返回 Zone"><ArrowLeft size={17} /></Link><div><h1>{zoneName}</h1><p>DNS 记录 · {records.length} 条</p></div></div>
       <div className="detail-actions"><Button variant="secondary" icon={<RefreshCw size={14} />} disabled={syncing} onClick={() => void sync()}>{syncing ? "已入队" : "同步云端"}</Button><Button icon={<Plus size={15} />} onClick={() => openEditor()}>添加记录</Button></div>
     </div>
+    {cloudflareNameServers.length > 0 && <section className="inline-notice" aria-label="Cloudflare NS 服务器">
+      <strong>{zone?.zone.status === "pending" ? "等待域名激活" : "Cloudflare NS 服务器"}</strong>
+      {zone?.zone.status === "pending" && <p>请在域名注册商处将 NS 改为下方服务器，生效后同步账号以更新激活状态。</p>}
+      <div className="zone-name-servers">{cloudflareNameServers.map(server => <code key={server}>{server}</code>)}</div>
+    </section>}
     {actionError && <div className="inline-error" role="alert">{actionError}</div>}
     {actionNotice && <div className="inline-notice" role="status">{actionNotice}{createdPoolId && <> <Link href={`/pools/${createdPoolId}`}>打开对应 Pool 管理绑定</Link></>}</div>}
     {bindingsResource.error && <div className="surface"><ErrorState message={bindingsResource.error} onRetry={() => void bindingsResource.reload()} /></div>}

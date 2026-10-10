@@ -5,6 +5,7 @@ import type {
   ProviderRecord,
   ProviderType,
   ProviderZone,
+  ProviderZoneInput,
 } from "@masterdns/contracts";
 
 export type CloudflareCredentials = { provider: "cloudflare"; apiToken: string };
@@ -15,6 +16,8 @@ export interface DnsProviderAdapter {
   readonly provider: ProviderType;
   verifyCredentials(): Promise<CredentialCapabilities>;
   listZones(cursor?: string): Promise<Page<ProviderZone>>;
+  findZone?(input: ProviderZoneInput): Promise<ProviderZone | null>;
+  createZone?(input: ProviderZoneInput): Promise<ProviderZone>;
   listRecords(zoneExternalId: string, cursor?: string): Promise<Page<ProviderRecord>>;
   getRecord(zoneExternalId: string, recordExternalId: string): Promise<ProviderRecord | null>;
   createRecord(zoneExternalId: string, input: DnsRecordInput): Promise<ProviderRecord>;

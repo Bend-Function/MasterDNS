@@ -5,6 +5,7 @@ import type {
   Page,
   ProviderRecord,
   ProviderZone,
+  ProviderZoneInput,
 } from "@masterdns/contracts";
 import { ProviderError } from "@masterdns/contracts";
 import type { DnsProviderAdapter } from "./provider.js";
@@ -25,6 +26,7 @@ type CloudflareRecordShape = {
 };
 
 const PAGE_SIZE = 100;
+const ZONE_PAGE_SIZE = 50;
 
 export class CloudflareDnsAdapter implements DnsProviderAdapter {
   readonly provider = "cloudflare" as const;
@@ -38,7 +40,7 @@ export class CloudflareDnsAdapter implements DnsProviderAdapter {
     return this.wrap(async () => {
       const token = await this.client.user.tokens.verify();
       if (token.status !== "active") throw new ProviderError(`Cloudflare token is ${token.status}`, "authentication_failed", this.provider);
-      await this.client.zones.list({ page: 1, per_page: 1 });
+      await this.client.zones.list({ page: 1, per_page: 5 });
       return { canReadZones: true, canReadRecords: true, canWriteRecords: true };
     });
   }
@@ -46,14 +48,25 @@ export class CloudflareDnsAdapter implements DnsProviderAdapter {
   async listZones(cursor?: string): Promise<Page<ProviderZone>> {
     return this.wrap(async () => {
       const pageNumber = parseCursor(cursor);
-      const page = await this.client.zones.list({ page: pageNumber, per_page: PAGE_SIZE, order: "name", direction: "asc" });
-      const items = page.result.map((zone) => ({
-        externalId: zone.id,
-        name: zone.name,
-        status: zone.status === "active" ? "active" as const : "pending" as const,
-        providerMetadata: { accountId: zone.account.id, accountName: zone.account.name, type: zone.type, nameServers: zone.name_servers },
-      }));
+      const page = await this.client.zones.list({ page: pageNumber, per_page: ZONE_PAGE_SIZE, order: "name", direction: "asc" });
+      const items = page.result.map(normalizeCloudflareZone);
       return { items, ...(page.hasNextPage() ? { nextCursor: String(pageNumber + 1) } : {}) };
+    });
+  }
+
+  async findZone(input: ProviderZoneInput): Promise<ProviderZone | null> {
+    return this.wrap(async () => {
+      const page = await this.client.zones.list({ account: { id: input.accountId }, name: input.name, page: 1, per_page: 5 });
+      const zone = page.result[0];
+      return zone ? normalizeCloudflareZone(zone) : null;
+    });
+  }
+
+  async createZone(input: ProviderZoneInput): Promise<ProviderZone> {
+    return this.wrap(async () => {
+      // Reconcile uncertain POST results before allowing a caller to retry.
+      const zone = await this.client.zones.create({ account: { id: input.accountId }, name: input.name, type: "full" }, { maxRetries: 0 });
+      return normalizeCloudflareZone(zone);
     });
   }
 
@@ -107,6 +120,15 @@ export class CloudflareDnsAdapter implements DnsProviderAdapter {
       throw mapCloudflareError(error);
     }
   }
+}
+
+function normalizeCloudflareZone(zone: { id: string; name: string; status?: string; type?: string; account: { id?: string | null; name?: string | null }; name_servers?: string[] }): ProviderZone {
+  return {
+    externalId: zone.id,
+    name: zone.name,
+    status: zone.status === "active" ? "active" : "pending",
+    providerMetadata: { accountId: zone.account.id, accountName: zone.account.name, type: zone.type, nameServers: zone.name_servers ?? [], zoneStatus: zone.status },
+  };
 }
 
 export function normalizeCloudflareRecord(record: CloudflareRecordShape, zoneExternalId: string): ProviderRecord {

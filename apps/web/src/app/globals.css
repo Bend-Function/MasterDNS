@@ -264,6 +264,13 @@ tbody tr:hover { background: #fafcfb; }
 .danger-summary dt { color: var(--muted); background: var(--surface-muted); }
 .danger-summary dt:last-of-type, .danger-summary dd:last-of-type { border-bottom: 0; }
 .dialog-inline-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.zone-creation-form { display: grid; gap: 16px; }
+.zone-creation-results { margin-top: 20px; }
+.zone-creation-results ul { margin: 12px 0 0; padding: 0; list-style: none; display: grid; gap: 10px; }
+.zone-creation-results li { padding: 12px; border: 1px solid var(--border); border-radius: 5px; }
+.zone-creation-results p { margin: 8px 0; font-size: 12px; }
+.zone-creation-result-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; overflow-wrap: anywhere; }
+.zone-name-servers { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 12px; overflow-wrap: anywhere; }
 .lifecycle-control > .inline-error, .lifecycle-control > .inline-notice { margin: 12px 16px 0; }
 .lifecycle-actions { display: grid; gap: 10px; border-bottom: 1px solid var(--border); }
 .lifecycle-actions p { margin: 0; line-height: 1.5; }

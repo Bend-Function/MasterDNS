@@ -13,6 +13,8 @@
 
 ## 厂商能力与验证记录
 
+- [Cloudflare 域名单个与批量添加](providers/cloudflare-dns.md)：账号权限、Account ID、NS 激活、API 及本地测试。
+
 - [云厂商扩展边界验证](validation/2026-10-05-cloud-provider-extensibility.md)。
 
 - [运行时修复与临时实例清理验证](validation/2026-10-05-runtime-fixes.md)。
