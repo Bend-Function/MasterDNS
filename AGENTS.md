@@ -35,6 +35,18 @@ Use Vitest with colocated `*.test.ts` or `*.test.tsx` files. Target one workspac
 
 Follow history’s Conventional Commit style: `feat(web): …`, `fix(cloud): …`, or `docs: …`. Keep commits focused. PRs should explain behavior changes, link related issues, report validation commands/results, and include screenshots for UI changes. Describe migration or configuration impacts.
 
+## Documentation Requirements
+
+Every subsequent change must include corresponding documentation updates in the same change set. This applies to features, bug fixes, refactors, APIs, data models, dependencies, configuration, deployment scripts, and tests. Documentation is part of the implementation; do not defer it to a later task or declare the work complete before it is synchronized.
+
+- Update `README.md` and `docs/README.md` when capabilities, project status, navigation, or documented dates and code baselines change. Only state a baseline that was actually checked.
+- Update `docs/ARCHITECTURE.md` for module boundaries, interfaces, data flows, scheduling, concurrency, and recovery changes; update `docs/DATA_MODEL.md` for schema, state, and persistence changes.
+- Update `docs/DEPLOYMENT.md` for environment variables, installation, upgrades, rollback, backups, and operational procedures; update the relevant `docs/providers/` guide for provider capabilities and restrictions.
+- Update `docs/TEST_PLAN.md` when validation commands or acceptance requirements change. Record meaningful implementation and validation details in `docs/validation/`, including internal refactors or test changes with no user-visible behavior change.
+- A design or validation record does not replace updating the affected user or architecture documentation. Preserve historical validation scope; do not present earlier test results as checks of newer code.
+
+Before committing, pushing, or handing off a change, check the documentation against the final implementation, remove obsolete claims, and verify changed links. Include the affected documentation and validation scope in the commit or PR description. This requirement also applies to changes made by agents and delegated contributors.
+
 ## Security & Configuration
 
 Never commit credentials, `.env`, or secrets in snapshots. Supply cloud credentials through environment variables or the console. Back up `MASTER_ENCRYPTION_KEY` independently of the database. Preserve explicit authorization checks for cloud rotation and destructive lifecycle actions.
