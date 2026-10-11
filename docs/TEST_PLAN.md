@@ -156,3 +156,13 @@
 - `rotation-temporary-instances` 的数据库投影与 Web 渲染测试：已释放临时实例不再展示，未清理实例仍显示计费提醒。
 
 以上测试不调用真实云接口，不代替真实 Linode 建机、换址或删除验收。
+
+## 9. 地址健康策略删除（2026-10-11）
+
+- 在隔离 PostgreSQL 设置 `MASTERDNS_TEST_DATABASE_URL` 后，执行 `pnpm --filter @masterdns/api exec vitest run src/modules/probes/health-policy-deletion.test.ts src/modules/probes/health-policies.test.ts src/modules/probes/probe-api.test.ts src/modules/probes/health-policies.schemas.test.ts`。
+- 覆盖所有者/管理员删除与越权隐藏、真实会话鉴权、必填版本及非法输入、版本冲突、IPv4/IPv6 隔离、证据重置、pending 轮次/任务失效、迟到结果不被接收、历史/config/stat/序号保留、重建策略继续递增轮次。
+- 云槽位覆盖故障自动轮换、启用的定时轮换（含暂停计划）和 active/paused/exhausted 事件阻止删除；关闭开关或事件 complete 后允许删除。持有任务锁的并发处理不能阻塞删除，旧上下文仍须失效。
+- Worker `notification-state-scanner.service.test.ts`：删除策略后保留的 unknown 状态不产生新的探测不足告警，其他健康阈值、通知恢复与去重行为继续回归。使用隔离 PostgreSQL 和 `MASTERDNS_TEST_REDIS_URL` 指定的隔离 Redis，不向外部收件人发送通知。
+- `pnpm --filter @masterdns/web exec vitest run src/app/health/page.test.tsx`：以真实 React 页面与受控 fetch 验证普通用户入口、取消无请求、版本化确认、重复点击隔离、失败重试、成功移除与卸载后的迟到响应。
+- 浏览器检查桌面/移动端的删除按钮、确认目标和地址族、云/普通节点影响说明、加载与错误反馈。React/happy-dom 测试不替代浏览器视觉验收。
+- 对此变更执行全仓库类型检查、Web lint 和构建；不把这些离线验证记为真实云/DNS 写入或生产升级验收。详细执行范围见[专题记录](validation/2026-10-11-health-policy-deletion.md)。

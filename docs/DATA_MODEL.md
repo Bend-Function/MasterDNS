@@ -2,6 +2,8 @@
 
 本文按 2026-10-05、代码基线 `cc4b90d` 更新，描述实际持久对象及关键字段，不逐项复制完整 DDL。精确列、默认值、外键和索引以 [Drizzle schema](../packages/db/src/schema/index.ts) 与 [SQL 迁移](../packages/db/drizzle/) 为准；运行流程见[系统架构](ARCHITECTURE.md)。
 
+2026-10-11 增量补充第 13 节的策略删除持久语义，不新增表、列或迁移；验证范围见[专题记录](validation/2026-10-11-health-policy-deletion.md)。
+
 ## 1. 设计原则
 
 - 多数业务实体使用 UUID 内部主键；关联表、换址步骤、物理资源锁等使用复合键或稳定文本键，厂商 ID 作为独立身份字段保存。
@@ -352,6 +354,10 @@ schema 位于 [probes.ts](../packages/db/src/schema/probes.ts)。健康目标可
 任务、轮次、观测分表的原因：一次网络回传可能重复、迟到或来自旧租约，不能收到结果就直接改变节点健康。接收和应用流程需判断身份、任务归属、版本、轮次顺序与时效。
 
 聚合状态可能保留上一结果；`latest_decision=unknown` 或证据过期不等于新的失败，也不能作为新的成功发布依据。地址、检查配置、策略和探针组版本将健康证据绑定到特定上下文。
+
+单独删除地址健康策略时，仅删除对应 `address_health_policies` 行，不删除检查配置及其他地址族策略。该目标/地址族的健康状态重置为 unknown、连续计数归零，清空证据有效期、最近检查时间与下轮时间；`last_applied_sequence` 和历史上下文保留。pending 轮次变为 superseded/unknown，未被并发处理锁定的 pending/leased 任务变为 stale；已完成轮次、观测与按目标聚合的统计继续遵循既有保留期限。
+
+`probe_rounds.policy_id`、`address_health_states.policy_id` 及轮换事件捕获的健康策略 ID 不以外键级联删除，因而旧上下文可保留审计意义。`probe_round_sequences` 属于实际目标，单独删除策略不重置序号；重新创建策略得到新 UUID，并继续递增轮次。审计记录保存策略删除前快照及空删除后快照，不包含检查配置中的自定义 header。
 
 ## 14. 换址、发布与清理
 

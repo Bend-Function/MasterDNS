@@ -1,10 +1,11 @@
 "use client";
 
 import type { HealthCheckConfig } from "@masterdns/contracts";
-import { Activity, ExternalLink, Plus, RefreshCw } from "lucide-react";
+import { Activity, ExternalLink, Plus, RefreshCw, Trash2 } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ConsoleLayout } from "../../components/console-layout";
+import { HealthPolicyDeleteDialog } from "../../components/health-policy-delete-dialog";
 import { ProbePolicyForm } from "../../components/probe-policy-form";
 import { RelativeTime } from "../../components/relative-time";
 import { useSession } from "../../components/session-context";
@@ -33,6 +34,7 @@ export default function HealthPage() {
   const [error, setError] = useState<string | null>(null);
   const [targetPickerOpen, setTargetPickerOpen] = useState(false);
   const [editing, setEditing] = useState<PolicyTarget | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<AddressHealthPolicy | null>(null);
   const [saving, setSaving] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
   const [evidence, setEvidence] = useState<{ policy: AddressHealthPolicy; rounds: ProbeRound[]; stats: ProbeObservationStat[] } | null>(null);
@@ -87,6 +89,14 @@ export default function HealthPage() {
     finally { if (evidenceGeneration.current.isCurrent(generation)) setEvidenceLoading(false); }
   };
 
+  const policyDeleted = (id: string) => {
+    loadGeneration.current.invalidate();
+    setPolicies(current => current?.filter(policy => policy.id !== id) ?? null);
+    setDeleteTarget(null);
+    if (evidence?.policy.id === id) { evidenceGeneration.current.invalidate(); setEvidence(null); }
+    if (!UI_PREVIEW) void load();
+  };
+
   const visiblePolicies = policies?.filter(policy => showHistory || policy.cloudTarget?.inventoryCurrent !== false || policy.cloudTarget.currentAddressObserved || policy.cloudTarget.candidateAddressObserved || policy.cloudTarget.activeCandidate);
   const configured = visiblePolicies?.length ?? 0;
   const [now, setNow] = useState(() => Date.now());
@@ -106,11 +116,12 @@ export default function HealthPage() {
         <td><button className="table-link" onClick={() => beginEdit(policy)}><strong>{policy.cloudTarget ? cloudTargetLabel(policy.cloudTarget) : policy.slotId ? "云地址槽位" : "普通节点"}</strong><small className="mono">{policy.cloudTarget ? cloudTargetAddresses(policy.cloudTarget) : shortId(policy.slotId ?? policy.endpointId!)}</small></button></td>
         <td>IPv{policy.family}</td><td><div className="table-primary"><StatusBadge value={display.status} />{display.reason && <small>{display.reason}</small>}</div></td><td><StatusBadge value={display.decision} /></td>
         <td><div className="table-primary"><strong>{group?.name ?? (policy.mode === "local" ? "本地" : "探测组不可用")}</strong><small>{size} 票 · Q={policy.consensus.minimumValid}{preview.failureVotesRequired === null ? " · 指定点" : ` · F>=${preview.failureVotesRequired} · S>=${preview.successVotesRequired}`}</small></div></td>
-        <td>{policy.failureThreshold} 次失败 / {policy.successThreshold} 次成功</td><td><RelativeTime value={policy.state?.evidenceExpiresAt} future /></td><td><div className="row-actions"><Button variant="ghost" onClick={() => void openEvidence(policy)}>投票明细</Button><IconButton label="编辑策略" onClick={() => beginEdit(policy)}><ExternalLink size={15} /></IconButton></div></td>
+        <td>{policy.failureThreshold} 次失败 / {policy.successThreshold} 次成功</td><td><RelativeTime value={policy.state?.evidenceExpiresAt} future /></td><td><div className="row-actions"><Button variant="ghost" onClick={() => void openEvidence(policy)}>投票明细</Button><IconButton label="编辑策略" onClick={() => beginEdit(policy)}><ExternalLink size={15} /></IconButton><IconButton label="删除策略" onClick={() => setDeleteTarget(policy)}><Trash2 size={15} /></IconButton></div></td>
       </tr>;
     })}</tbody></table></div>}</section>
       <section className="surface"><header className="surface-header"><div><h2>Pool 检查概览</h2><p>按 Pool 实际采用的本地或外部探测结果汇总</p></div></header><div className="table-wrap"><table><thead><tr><th>Pool</th><th>状态</th><th>健康节点</th><th>间隔</th><th>最近协调</th><th aria-label="操作" /></tr></thead><tbody>{pools.map((pool) => <tr key={pool.id}><td><Link className="table-primary" href={`/pools/${pool.id}`}><strong>{pool.name}</strong><small>{pool.strategy}</small></Link></td><td><StatusBadge value={pool.enabled ? pool.state : "disabled"} /></td><td>{pool.healthyEndpointCount ?? 0} / {pool.endpointCount ?? 0}</td><td>{pool.checkIntervalSeconds}s</td><td><RelativeTime value={pool.lastReconciledAt} /></td><td><Link className="icon-button" href={`/pools/${pool.id}`} aria-label="打开 Pool"><ExternalLink size={15} /></Link></td></tr>)}</tbody></table></div></section></>}
     <HealthTargetPicker open={targetPickerOpen} accounts={accounts} pools={pools} policies={policies ?? []} onClose={() => setTargetPickerOpen(false)} onSelected={(target) => { setTargetPickerOpen(false); setEditing(target); }} />
+    {deleteTarget && <HealthPolicyDeleteDialog key={deleteTarget.id} policy={deleteTarget} onClose={() => setDeleteTarget(null)} onDeleted={policyDeleted} />}
     <Dialog open={editing !== null} title={editing ? `${editing.policy ? "编辑" : "配置"} ${editing.label} / IPv${editing.family}` : "配置健康策略"} size="large" onClose={closeEditor} footer={<><Button variant="secondary" disabled={saving} onClick={closeEditor}>取消</Button><Button type="submit" form="health-policy-form" disabled={saving}>{saving ? "保存中" : "保存配置"}</Button></>}>{editing && <ProbePolicyForm key={`${editing.kind}:${editing.id}:${editing.family}:${editing.policy?.revision ?? 0}`} formId="health-policy-form" targetKind={editing.kind} targetId={editing.id} family={editing.family} policy={editing.policy} config={editing.config} groups={groups} probes={probes} isAdmin={user?.role === "admin"} onSubmit={save} />}</Dialog>
     <Dialog open={evidence !== null} title="固定 Cohort 投票明细" size="large" onClose={() => { evidenceGeneration.current.invalidate(); setEvidence(null); }} footer={<Button variant="secondary" onClick={() => setEvidence(null)}>关闭</Button>}>{evidenceLoading ? <LoadingState /> : evidence && <EvidenceView evidence={evidence} probes={probes} />}</Dialog>
   </ConsoleLayout>;

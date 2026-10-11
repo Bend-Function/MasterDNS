@@ -1,5 +1,8 @@
 import { z } from "zod";
 
+export const healthPolicyDeleteSchema = z.object({ expectedRevision: z.number().int().min(1) }).strict();
+export type HealthPolicyDeleteInput = z.infer<typeof healthPolicyDeleteSchema>;
+
 export type ConsensusPolicy = {
   mode: "any" | "majority" | "all" | "at_least" | "specified";
   minimumValid: number;

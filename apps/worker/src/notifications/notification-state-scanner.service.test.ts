@@ -127,6 +127,17 @@ describe("durable notification state scanning", () => {
     expect(queues.events).toMatchObject([{ eventType: "health.insufficient_probes", payload: { decision: "unknown", healthState: "unhealthy" } }]);
   });
 
+  it("does not emit insufficient probe notifications for a deleted policy", async () => {
+    const f = await healthFixture({ decision: "unknown", healthState: "unknown" });
+    const [state] = await connection.db.select().from(addressHealthStates).where(eq(addressHealthStates.id, f.stateId));
+    await connection.db.delete(addressHealthPolicies).where(eq(addressHealthPolicies.id, state!.policyId!));
+    const queues = fakeQueues();
+
+    await new NotificationStateScannerService({ db: connection.db } as never, queues as never).scanOnce();
+
+    expect(queues.events).toEqual([]);
+  });
+
   it("enqueues a durable state event through actual BullMQ with a colon-free producer ID", async () => {
     const redisUrl = process.env.MASTERDNS_TEST_REDIS_URL;
     if (!redisUrl) throw new Error("MASTERDNS_TEST_REDIS_URL is required");

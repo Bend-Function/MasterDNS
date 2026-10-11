@@ -169,8 +169,8 @@ function healthEvent(
   poolIds: string[],
   address: typeof endpointAddresses.$inferSelect | null,
 ): NotificationEvent | undefined {
-  const currentPolicy = !!policy
-    && policy.revision === state.policyRevision
+  if (!policy) return undefined;
+  const currentPolicy = policy.revision === state.policyRevision
     && policy.configId === state.configId
     && policy.family === state.family
     && (state.slotId ? policy.slotId === state.slotId : policy.endpointId === state.endpointId);

@@ -1,9 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 import { getCloudTargetsForSlots } from "@masterdns/db";
 import { BadRequestException, ConflictException, ForbiddenException, Injectable, NotFoundException } from "@nestjs/common";
-import { externalHealthCheckConfigSchema, healthCheckConfigSchema } from "@masterdns/contracts";
-import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, resetHealthEvidence, type HealthTargetIdentity, type ProbeTransaction } from "@masterdns/db";
-import { and, desc, eq, ne, sql } from "drizzle-orm";
+import { externalHealthCheckConfigSchema, healthCheckConfigSchema, healthPolicyDeleteSchema } from "@masterdns/contracts";
+import { addressHealthPolicies, addressHealthStates, auditLogs, cloudAccounts, cloudInstances, cloudInterfaces, databaseNow, endpointAddresses, endpointPools, endpoints, healthCheckConfigs, healthTargetWhere, lockRotationContext, managedAddressSlots, probeAgents, probeGroupMembers, probeGroups, probeObservations, probeObservationStats, probeRounds, probeTasks, resetHealthEvidence, rotationIncidents, rotationSchedules, type ProbeTransaction } from "@masterdns/db";
+import { and, desc, eq, inArray, ne, sql } from "drizzle-orm";
 import type { AuthUser } from "../../auth/auth.types.js";
 import { DatabaseService } from "../../infrastructure/database.module.js";
 import { healthPolicyInputSchema, slotHealthConfigSchema } from "./health-policies.schemas.js";
@@ -47,6 +47,43 @@ export class HealthPoliciesService {
     if (!owner || (actor.role !== "admin" && owner.id !== actor.id)) throw new NotFoundException("Slot not found");
     const [config] = await this.database.db.select().from(healthCheckConfigs).where(and(eq(healthCheckConfigs.slotId, slotId), eq(healthCheckConfigs.enabled, true)));
     return config ?? null;
+  }
+  async remove(actor: AuthUser, policyId: string, body: unknown) {
+    const input = healthPolicyDeleteSchema.parse(body);
+    return this.database.db.transaction(async tx => {
+      const [snapshot] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId));
+      const initialOwner = snapshot ? await this.owner(tx, snapshot) : undefined;
+      if (!snapshot || !initialOwner || (actor.role !== "admin" && initialOwner.id !== actor.id)) throw new NotFoundException("Health policy not found");
+
+      // Rotation admission uses account -> instance -> slot. Hold the same locks
+      // so enabling a switch or starting an incident cannot race deletion.
+      const context = snapshot.slotId ? await lockRotationContext(tx, snapshot.slotId) : undefined;
+      const owner = context ? { id: context.account.ownerUserId } : await this.lockOwner(tx, actor, { endpointId: snapshot.endpointId!, family: snapshot.family });
+      if (actor.role !== "admin" && owner.id !== actor.id) throw new NotFoundException("Health policy not found");
+      const [policy] = await tx.select().from(addressHealthPolicies).where(eq(addressHealthPolicies.id, policyId)).for("update");
+      if (!policy) throw new NotFoundException("Health policy not found");
+      if (policy.revision !== input.expectedRevision) throw new ConflictException("健康策略已被更新，请刷新后重试");
+      if (context) {
+        if (context.policy?.enabled) throw new ConflictException("请先关闭该地址族的故障自动轮换，再删除健康策略");
+        const [schedule] = await tx.select().from(rotationSchedules).where(eq(rotationSchedules.slotId, context.slot.id));
+        if (schedule?.enabled) throw new ConflictException("请先关闭该地址族的定时轮换，再删除健康策略");
+        const [incident] = await tx.select({ id: rotationIncidents.id }).from(rotationIncidents).where(and(eq(rotationIncidents.slotId, context.slot.id), ne(rotationIncidents.status, "complete"))).limit(1);
+        if (incident) throw new ConflictException("该地址仍有未完成的轮换，请等待完成或终止并完成收尾后再删除健康策略");
+      }
+
+      const now = await databaseNow(tx);
+      await tx.delete(addressHealthPolicies).where(eq(addressHealthPolicies.id, policy.id));
+      await tx.update(addressHealthStates).set({ ...resetHealthEvidence, stateChangedAt: now, updatedAt: now }).where(healthTargetWhere(addressHealthStates, policy));
+      await tx.update(probeRounds).set({ status: "superseded", consensusResult: "unknown", finalizedAt: now }).where(and(eq(probeRounds.policyId, policy.id), eq(probeRounds.status, "pending")));
+      // Result/lease handlers lock tasks before checking the policy. Skip their
+      // locks to avoid an inversion; they will reject the deleted policy epoch.
+      const tasks = tx.select({ id: probeTasks.id }).from(probeTasks).innerJoin(probeRounds, eq(probeRounds.id, probeTasks.roundId))
+        .where(and(eq(probeRounds.policyId, policy.id), inArray(probeTasks.status, ["pending", "leased"])))
+        .for("update", { of: probeTasks, skipLocked: true });
+      await tx.update(probeTasks).set({ status: "stale", finishedAt: now }).where(inArray(probeTasks.id, tasks));
+      await tx.insert(auditLogs).values({ ownerUserId: owner.id, actorUserId: actor.id, source: "user", action: "health.policy.delete", resourceType: "address_health_policy", resourceId: policy.id, beforeSnapshot: policy, afterSnapshot: null });
+      return { deleted: true };
+    });
   }
   async saveSlotConfig(actor: AuthUser, slotId: string, body: unknown) {
     const input = slotHealthConfigSchema.parse(body);
