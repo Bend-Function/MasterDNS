@@ -147,6 +147,28 @@ it("reconciles retained static IPv4 while IPv6 remains managed by a cloud slot",
   expect(f.remote.get("zone-0:A")?.content).toBe("192.0.2.99");
   expect(f.remote.get("zone-0:AAAA")?.content).toBe("2001:db8::10");
 });
+it.each(["normal", "force", "binding override"])("excludes a historical cloud address from assignment-pool failover with %s selection", async mode => {
+  const f = await poolFixture();
+  await f.d.update(db.endpointPools).set({ strategy: "assignment_pool", selectionMode: "ordered" }).where(eq(db.endpointPools.id, f.pool.id));
+  await f.d.update(db.cloudAddresses).set({ inventoryPresent: false }).where(eq(db.cloudAddresses.id, f.address.id));
+  if (mode === "binding override") {
+    for (const binding of f.bindings.filter(row => row.recordType === "A")) {
+      await f.d.insert(db.healthCheckConfigs).values({ domainBindingId: binding.id, checkerType: "tcp", config: { type: "tcp", port: 443 } });
+      for (const endpointId of [f.endpoints[0]!.id, f.backup.endpoints[0]!.id]) {
+        const [address] = await f.d.select().from(db.endpointAddresses).where(and(eq(db.endpointAddresses.endpointId, endpointId), eq(db.endpointAddresses.family, "4"), eq(db.endpointAddresses.state, "current")));
+        await f.d.insert(db.bindingEndpointHealth).values({ domainBindingId: binding.id, endpointId, endpointAddressId: address!.id, healthState: "healthy" });
+      }
+    }
+  }
+  const [pool] = await f.d.select().from(db.endpointPools).where(eq(db.endpointPools.id, f.pool.id));
+  await expect((f.reconcile as unknown as { process(job: unknown): Promise<void> }).process({ data: { poolId: f.pool.id, eventId: randomUUID(), trigger: "configuration", source: "user", force: mode === "force", policyRevision: pool!.policyRevision } })).resolves.toBeUndefined();
+  await f.reconcileDns();
+  expect(f.remote.get("zone-0:A")?.content).toBe("192.0.2.20");
+  expect(f.remote.get("zone-1:A")?.content).toBe("192.0.2.20");
+  expect(f.remote.get("zone-0:AAAA")?.content).toBe("2001:db8::10");
+  const bindings = await f.d.select().from(db.domainBindings).where(eq(db.domainBindings.poolId, f.pool.id));
+  expect(bindings.every(binding => binding.state === "healthy")).toBe(true);
+});
 
 it.each(["automatic", "keep_current"] as const)("fails over two providers' domains using external cloud health and respects %s recovery", async recoveryMode => {
   const f = await poolFixture(recoveryMode);

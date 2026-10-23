@@ -22,6 +22,8 @@ import {
   providerAccounts,
   reconcileIntents,
   projectPoolHealth,
+  getCloudTargetsForSlots,
+  withPoolAddressAvailability,
   zones,
 } from "@masterdns/db";
 import { dnsRecordMatches } from "@masterdns/providers";
@@ -87,7 +89,7 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
         .where(eq(operations.idempotencyKey, idempotencyKey)).limit(1);
       if (existingOperation) return { operationId: existingOperation.id };
 
-      const [poolEndpoints, poolBindings, assignments, addresses, bindingHealthRows, bindingCheckRows] = await Promise.all([
+      const [poolEndpoints, poolBindings, assignments, storedAddresses, bindingHealthRows, bindingCheckRows] = await Promise.all([
         tx.select().from(endpoints).where(eq(endpoints.poolId, pool.id)),
         tx.select().from(domainBindings).where(eq(domainBindings.poolId, pool.id)),
         tx.select().from(bindingAssignments)
@@ -105,6 +107,8 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           .innerJoin(domainBindings, eq(healthCheckConfigs.domainBindingId, domainBindings.id))
           .where(and(eq(domainBindings.poolId, pool.id), eq(healthCheckConfigs.enabled, true))),
       ]);
+      const cloudTargets = await getCloudTargetsForSlots(tx, linkedSlots.map(link => link.slotId));
+      const addresses = storedAddresses.map(row => ({ ...row, endpoint_addresses: withPoolAddressAvailability(row.endpoint_addresses, linkedSlots, cloudTargets) }));
       const deletingBindingIds = await getDeletingBindingIds(tx, poolBindings.map(binding => binding.id));
       const bindings = poolBindings.filter(binding => !deletingBindingIds.has(binding.id));
       const assignmentRows = assignments.map((row) => row.binding_assignments).filter(assignment => !deletingBindingIds.has(assignment.domainBindingId));
@@ -150,7 +154,9 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
             requiredAddressFamily: binding.recordType === "AAAA" ? "6" : "4",
             endpointHealthStates: Object.fromEntries(poolEndpoints.map((endpoint) => [
               endpoint.id,
-              (job.data.force || manualAddresses.has(`${endpoint.id}:${binding.recordType === "AAAA" ? "6" : "4"}`)) && endpoint.lifecycle === "enabled"
+              currentAddressForBinding(endpoint.id, binding.recordType, addresses)?.available === false
+                ? "unknown"
+                : (job.data.force || manualAddresses.has(`${endpoint.id}:${binding.recordType === "AAAA" ? "6" : "4"}`)) && endpoint.lifecycle === "enabled"
                 ? "healthy"
                 : bindingsWithHealthOverrides.has(binding.id)
                   ? healthForCurrentBindingAddress(binding.id, endpoint.id, binding.recordType, bindingHealthRows, addresses)
@@ -453,7 +459,7 @@ export function shouldPlanProviderSteps(reason: StrategyDecision["decisions"][nu
 function currentAddressForBinding(
   endpointId: string,
   recordType: string,
-  addresses: Array<{ endpoint_addresses: typeof endpointAddresses.$inferSelect }>,
+  addresses: Array<{ endpoint_addresses: typeof endpointAddresses.$inferSelect & { available?: boolean } }>,
 ) {
   const family = recordType === "AAAA" ? "6" : "4";
   return addresses.find((row) => row.endpoint_addresses.endpointId === endpointId

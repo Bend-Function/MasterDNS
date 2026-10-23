@@ -404,6 +404,8 @@ resource.cleanup    retained | pending | released | failed
 
 账号/服务层面的速率准入另由 [cloud-rotation-limits.ts](../packages/db/src/schema/cloud-rotation-limits.ts) 中的 `cloud_rotation_limit_switches`、`cloud_rotation_limit_policies`、`cloud_rotation_buckets`、`cloud_rotation_reservations` 保存。该限制与单次事件的尝试次数预算职责不同。
 
+Pool 查询中的 `addressHealthPolicies[].evidenceStatus` 增加只读值 `unavailable`：云目标缺失或不可用于探测时返回，优先于 waiting/expired/current。`endpoint_addresses` 旧探测结果仍保留；API/调度用云槽位 current 地址的库存存在性生成有效健康投影，历史 cloud 地址为 unknown/available=false。此次无 schema 或数据库迁移。
+
 ## 15. 状态推进与持久边界
 
 | 事实 | 主要写入路径 | 下游如何使用 |

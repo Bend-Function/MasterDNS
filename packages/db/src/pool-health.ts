@@ -2,10 +2,11 @@ import type { HealthState } from "@masterdns/contracts";
 import { and, eq, inArray } from "drizzle-orm";
 import type { MasterDnsDatabase } from "./index.js";
 import { bindingEndpointHealth, cloudEndpointLinks, domainBindings, endpointAddresses, endpointPools, endpoints, healthCheckConfigs } from "./schema/index.js";
+import { getCloudTargetsForSlots, type CloudTargetSummary } from "./cloud-targets.js";
 
 export type PoolHealthInput = {
   endpoints: Array<{ id: string; lifecycle: string; addressFamilies?: Array<"4" | "6"> }>;
-  addresses: Array<{ id: string; endpointId: string; family: "4" | "6"; healthState: HealthState }>;
+  addresses: Array<{ id: string; endpointId: string; family: "4" | "6"; healthState: HealthState; available?: boolean }>;
   bindings: Array<{ id: string; recordType: string }>;
   bindingHealth: Array<{ domainBindingId: string; endpointId: string; endpointAddressId: string | null; healthState: HealthState }>;
   overrideBindingIds: string[];
@@ -35,13 +36,14 @@ export function projectPoolHealth(input: PoolHealthInput): PoolHealthSummary {
       // A brand new endpoint is waiting for its first verified address. A node
       // with only the other address family is not a candidate for this binding.
       if (!address) return (endpoint.addressFamilies?.length ? endpoint.addressFamilies.includes(family) : addresses.length === 0) ? ["unknown" as const] : [];
+      if (address.available === false) return ["unknown" as const];
       if (!overrides.has(binding.id)) return [address.healthState];
       const health = input.bindingHealth.find(row => row.domainBindingId === binding.id && row.endpointId === endpoint.id && row.endpointAddressId === address.id);
       return [health?.healthState ?? "unknown"];
     });
     bindingStates[binding.id] = summarizeHealth(states);
   }
-  const endpointStates = Object.fromEntries(enabled.map(endpoint => [endpoint.id, summarizeHealth(addressesByEndpoint.get(endpoint.id)!.map(address => address.healthState))]));
+  const endpointStates = Object.fromEntries(enabled.map(endpoint => [endpoint.id, summarizeHealth(addressesByEndpoint.get(endpoint.id)!.map(address => address.available === false ? "unknown" : address.healthState))]));
   return {
     state: summarizeHealth(input.bindings.length ? Object.values(bindingStates) : Object.values(endpointStates)),
     bindingStates,
@@ -62,6 +64,16 @@ function summarizeHealth(states: HealthState[]): HealthState {
 }
 
 type Reader = Pick<MasterDnsDatabase, "select">;
+/** A cached published address is not eligible once cloud inventory says it is gone.
+ * Inspect the published current address, not an unrelated candidate being verified. */
+export function withPoolAddressAvailability<T extends { endpointId: string; family: "4" | "6"; source: string; address: string; healthState: HealthState }>(address: T,
+  links: Array<{ endpointId: string; family: "4" | "6"; slotId: string }>, targets: ReadonlyMap<string, CloudTargetSummary>): T & { available: boolean } {
+  if (address.source !== "cloud") return { ...address, available: true };
+  const link = links.find(row => row.endpointId === address.endpointId && row.family === address.family);
+  const target = link ? targets.get(link.slotId) : undefined;
+  const available = !!target?.currentAddressObserved && target.currentAddress?.address === address.address;
+  return { ...address, available, healthState: available ? address.healthState : "unknown" };
+}
 export async function getPoolHealthSummaries(db: Reader, poolIds: string[]): Promise<Map<string, PoolHealthSummary>> {
   if (poolIds.length === 0) return new Map();
   const [endpointRows, addressRows, bindings, healthRows, checks, cloudLinks] = await Promise.all([
@@ -70,11 +82,12 @@ export async function getPoolHealthSummaries(db: Reader, poolIds: string[]): Pro
     db.select({ id: domainBindings.id, poolId: domainBindings.poolId, recordType: domainBindings.recordType }).from(domainBindings).where(inArray(domainBindings.poolId, poolIds)),
     db.select({ health: bindingEndpointHealth, poolId: domainBindings.poolId }).from(bindingEndpointHealth).innerJoin(domainBindings, eq(domainBindings.id, bindingEndpointHealth.domainBindingId)).where(inArray(domainBindings.poolId, poolIds)),
     db.select({ bindingId: domainBindings.id, poolId: domainBindings.poolId }).from(healthCheckConfigs).innerJoin(domainBindings, eq(domainBindings.id, healthCheckConfigs.domainBindingId)).where(and(inArray(domainBindings.poolId, poolIds), eq(healthCheckConfigs.enabled, true))),
-    db.select({ endpointId: cloudEndpointLinks.endpointId, family: cloudEndpointLinks.family }).from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId)).where(inArray(endpoints.poolId, poolIds)),
+    db.select({ endpointId: cloudEndpointLinks.endpointId, family: cloudEndpointLinks.family, slotId: cloudEndpointLinks.slotId }).from(cloudEndpointLinks).innerJoin(endpoints, eq(endpoints.id, cloudEndpointLinks.endpointId)).where(inArray(endpoints.poolId, poolIds)),
   ]);
+  const cloudTargets = await getCloudTargetsForSlots(db, cloudLinks.map(link => link.slotId));
   return new Map(poolIds.map(poolId => [poolId, projectPoolHealth({
     endpoints: endpointRows.filter(row => row.poolId === poolId).map(row => ({ ...row, addressFamilies: cloudLinks.filter(link => link.endpointId === row.id).map(link => link.family) })),
-    addresses: addressRows.filter(row => row.poolId === poolId).map(row => row.address),
+    addresses: addressRows.filter(row => row.poolId === poolId).map(row => withPoolAddressAvailability(row.address, cloudLinks, cloudTargets)),
     bindings: bindings.filter(row => row.poolId === poolId),
     bindingHealth: healthRows.filter(row => row.poolId === poolId).map(row => row.health),
     overrideBindingIds: checks.filter(row => row.poolId === poolId).map(row => row.bindingId),

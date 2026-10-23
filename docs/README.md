@@ -8,6 +8,8 @@
 
 同日继续检查其余厂商和发布路径，修复 Azure 异步记录过期后无法完成清理、Linode 旧重启事件误归因、EC2 缺字段响应误判，以及发布超时/无限重投递；详见[后续恢复审查](validation/2026-10-23-rotation-follow-up-audit.md)。
 
+2026-10-23 补充历史云地址的 Pool 调度过滤与停止探测状态提示，见[历史云地址与池健康验证](validation/2026-10-23-pool-historical-addresses.md)。
+
 ## 阅读入口
 
 - [系统架构](ARCHITECTURE.md)：运行拓扑、代码分层、领域边界、核心流程、并发与故障恢复；建议先读。

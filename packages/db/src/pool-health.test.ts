@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { projectPoolHealth, type PoolHealthInput } from "./pool-health.js";
+import { projectPoolHealth, withPoolAddressAvailability, type PoolHealthInput } from "./pool-health.js";
+import type { CloudTargetSummary } from "./cloud-targets.js";
 
 const endpoint = { id: "edge", lifecycle: "enabled" };
 const address = { id: "ipv4", endpointId: "edge", family: "4" as const, healthState: "healthy" as const };
@@ -9,6 +10,21 @@ function input(overrides: Partial<PoolHealthInput> = {}): PoolHealthInput {
 }
 
 describe("Pool health projection", () => {
+  it("rejects stale healthy overrides for an address missing from cloud inventory", () => {
+    expect(projectPoolHealth(input({ addresses: [{ ...address, available: false }], overrideBindingIds: ["a"],
+      bindingHealth: [{ domainBindingId: "a", endpointId: "edge", endpointAddressId: "ipv4", healthState: "healthy" }],
+    }))).toMatchObject({ state: "unknown", bindingStates: { a: "unknown" }, healthyEndpointCount: 0 });
+  });
+  it("checks the published address independently of a stale candidate and retains static addresses", () => {
+    const links = [{ endpointId: "edge", family: "4" as const, slotId: "slot" }];
+    const published = { ...address, source: "cloud", address: "192.0.2.1" };
+    const target = { currentAddressObserved: true, currentAddress: { address: "192.0.2.1" }, candidateAddressObserved: false, available: false } as CloudTargetSummary;
+    const targets = new Map([["slot", target]]);
+    expect(withPoolAddressAvailability(published, links, targets)).toMatchObject({ available: true, healthState: "healthy" });
+    expect(withPoolAddressAvailability(published, [], targets)).toMatchObject({ available: false, healthState: "unknown" });
+    expect(withPoolAddressAvailability({ ...published, address: "192.0.2.99" }, links, targets).available).toBe(false);
+    expect(withPoolAddressAvailability({ ...published, source: "static" }, [], new Map()).available).toBe(true);
+  });
   it("keeps an unpublished address waiting instead of declaring a failed probe", () => {
     expect(projectPoolHealth(input({ addresses: [] }))).toMatchObject({ state: "unknown", waitingBindingCount: 1 });
   });

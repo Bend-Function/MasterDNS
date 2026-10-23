@@ -453,7 +453,7 @@ export default function PoolDetailPage() {
           <td><span className={`provider-mark ${binding.provider === "cloudflare" ? "provider-cf" : "provider-ali"}`}>{binding.provider === "cloudflare" ? "CF" : "ALI"}</span></td>
           <td>{endpointName(data.endpoints, binding.originalEndpointId)}</td>
           <td>{binding.assignments.filter((assignment) => assignment.applied).map((assignment) => endpointName(data.endpoints, assignment.endpointId)).join(", ") || "未发布"}</td>
-          <td>{binding.awaitingVerification ? <span className="status status-warning">等待地址验证</span> : <StatusBadge value={binding.state} />}{binding.healthState && <small className="muted">地址健康：<StatusBadge value={binding.healthState} /></small>}</td>
+          <td>{binding.awaitingVerification ? <span className="status status-warning">等待地址验证</span> : <StatusBadge value={binding.state} />}{binding.healthState && <small className="muted">候选地址整体健康：<StatusBadge value={binding.healthState} /></small>}</td>
           <td>{binding.ttl}s</td>
           <td><div className="row-actions"><IconButton label="编辑绑定" onClick={() => openBindingEditor(binding)}><Edit3 size={15} /></IconButton><IconButton label="删除绑定" onClick={() => { setActionError(null); setDeletingBinding(binding); }}><Trash2 size={15} /></IconButton></div></td>
         </tr>)}</tbody>
@@ -467,7 +467,7 @@ export default function PoolDetailPage() {
         <tbody>{data.addressHealthPolicies?.map(policy => <tr key={policy.id}>
           <td><div className="table-primary"><strong>{policy.cloudTarget ? cloudTargetLabel(policy.cloudTarget) : endpointName(data.endpoints, policy.endpointId)}</strong><small>{policy.cloudTarget ? cloudTargetAddresses(policy.cloudTarget) : `IPv${policy.family}`}</small></div></td>
           <td>{policy.mode === "mixed" ? "本地 + 外部 Agent" : policy.mode === "external" ? "外部 Agent" : "本地"}<small className="muted">{policy.group?.name ?? (policy.mode === "local" ? "本机探测" : "未配置探测组")}</small></td>
-          <td>{policy.evidenceStatus === "current" ? <StatusBadge value={policy.state?.healthState ?? "unknown"} /> : <span className="status status-warning">{policy.evidenceStatus === "expired" ? "证据已过期" : "等待有效结果"}</span>}</td>
+          <td>{policy.evidenceStatus === "current" ? <StatusBadge value={policy.state?.healthState ?? "unknown"} /> : <span className="status status-warning">{policy.evidenceStatus === "unavailable" ? "目标不可用，已停止探测" : policy.evidenceStatus === "expired" ? "证据已过期" : "等待有效结果"}</span>}</td>
           <td>{policy.latestRound ? <span>#{policy.latestRound.sequence} · {policy.latestRound.status === "pending" ? "探测中" : policy.latestRound.consensusResult === "success" ? "通过" : policy.latestRound.consensusResult === "failure" ? "失败" : "结果不足"}<small className="muted">{policy.latestRound.memberIds.filter(id => id !== "local").length} 个外部 Agent · {policy.latestRound.address}</small></span> : "尚未开始"}</td>
           <td><RelativeTime value={policy.state?.lastCheckedAt} /></td>
           <td><Link href="/health">策略与投票明细</Link></td>

@@ -104,6 +104,10 @@ Pool 是策略容器，Endpoint 是可被选择的逻辑节点；Endpoint 可以
 
 三种策略为 `primary_backup`、`healthy_set`、`assignment_pool`；选择方式包括顺序、稳定伪随机、轮询和最少绑定。恢复策略、冷却期、地址族和 Binding 专属健康参与协调。全池无健康候选时，策略保留已有分配并报告问题。
 
+Pool 可用性投影与 Reconcile 决策共享 `withPoolAddressAvailability`：来源为 cloud 的已发布 current 地址必须仍与链接槽位的 currentAddress 相同，且 currentAddressObserved 为真。历史/失联地址的旧 healthy 缓存变为只读投影 unknown，不参与候选分配；Binding 专属健康覆盖、force 和待完成手动发布也不能使已消失地址重新成为候选。此检查针对已发布地址，不会因为另一个 candidate 失效而排除仍可观察到的 current；明确保留为 static 的地址不受云库存过滤。
+
+域名行的健康为同地址族候选集合的整体状态，一好一坏可显示 degraded，不能解释为所有节点失败；Binding state 则记录调度/DNS 发布结果。Pool 健康策略的目标不可用优先于证据新鲜度，返回 unavailable 并显示已停止探测，不再持续显示等待结果。该投影不伪造探测失败、不删除历史地址，也不自动选择未经验证的新云 IP。
+
 ### 4.2 云实例、地址槽位与发布地址
 
 云资源链为 `Account → Instance → Interface → Address`。Slot（`managed_address_slots`）代表某个接口和地址族下的受管位置，保存 current/candidate 地址及版本。IP 会变化，Slot 身份可以持续不变。

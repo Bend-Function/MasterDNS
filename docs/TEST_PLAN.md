@@ -102,6 +102,11 @@ pnpm lint
 
 ## 4. Pool 场景矩阵
 
+历史云地址回归入口：`pnpm --filter @masterdns/db exec vitest run src/pool-health.test.ts`、`pnpm --filter @masterdns/api exec vitest run src/modules/pools/pool-health.integration.test.ts`、`pnpm --filter @masterdns/worker exec vitest run src/rotation/cloud-pool-failover.test.ts`。API 测试需隔离 DATABASE_URL/REDIS_URL 与仅用于测试的 MASTER_ENCRYPTION_KEY；数据库用例另需 MASTERDNS_TEST_DATABASE_URL，Worker 及使用 Redis 的 API 用例需 MASTERDNS_TEST_REDIS_URL。先运行 `pnpm build:packages`。
+
+新增要求：云清单标记 current 地址缺失后，旧 healthy 与 Binding 覆盖均不得使其继续参与 assignment_pool 分配；其他有效节点可接管 A 记录，不影响独立 AAAA。旧 candidate 缺失但 current 仍在时不误排除 current；显式保留的 static 地址保持原行为。API unavailable 状态与 UI“目标不可用，已停止探测”一致。
+
+
 | 场景 | 预期 |
 | --- | --- |
 | 单次检查失败 | 状态 degraded，不切换 |

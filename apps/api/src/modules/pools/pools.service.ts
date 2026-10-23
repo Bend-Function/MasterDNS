@@ -13,6 +13,7 @@ import {
   managedAddressSlots,
   getCloudTargetsForSlots,
   getPoolHealthSummaries,
+  withPoolAddressAvailability,
   probeGroups,
   probeRounds,
   prepareCloudPolicyRestore,
@@ -218,7 +219,7 @@ export class PoolsService {
     const summary = health.get(poolId)!;
     return {
       pool: { ...pool, ...summary },
-      endpoints: endpointRows.map((endpoint) => ({ ...endpoint, healthState: summary.endpointStates[endpoint.id] ?? endpoint.healthState, addresses: addresses.filter((row) => row.address.endpointId === endpoint.id).map((row) => row.address),
+      endpoints: endpointRows.map((endpoint) => ({ ...endpoint, healthState: summary.endpointStates[endpoint.id] ?? endpoint.healthState, addresses: addresses.filter((row) => row.address.endpointId === endpoint.id).map((row) => row.address.state === "current" ? withPoolAddressAvailability(row.address, links, cloudTargets) : row.address),
         cloudTargets: links.filter(link => link.endpointId === endpoint.id).flatMap(link => cloudTargets.get(link.slotId) ? [cloudTargets.get(link.slotId)!] : []) })),
       bindings: bindings.map((row) => ({ ...row.binding, healthState: summary.bindingStates[row.binding.id] ?? "unknown",
         awaitingVerification: summary.bindingStates[row.binding.id] === "unknown"
@@ -241,7 +242,7 @@ export class PoolsService {
           && (!target || state.addressVersion === (target.candidateAddress ? target.slot.candidateVersion : target.slot.currentVersion));
         return { ...policy, config, state, group: group ? { id: group.id, name: group.name } : null, cloudTarget: target ?? null,
           endpointIds: policy.endpointId ? [policy.endpointId] : links.filter(link => link.slotId === policy.slotId).map(link => link.endpointId),
-          evidenceStatus: !currentEvidence || state.latestDecision === "unknown" || !state.evidenceExpiresAt ? "waiting" : state.evidenceExpiresAt <= new Date() ? "expired" : "current",
+          evidenceStatus: policy.slotId && !target?.available ? "unavailable" : !currentEvidence || state.latestDecision === "unknown" || !state.evidenceExpiresAt ? "waiting" : state.evidenceExpiresAt <= new Date() ? "expired" : "current",
           latestRound: rounds.find(round => round.policyId === policy.id) ?? null };
       }),
       events,

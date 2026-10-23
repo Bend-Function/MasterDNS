@@ -39,6 +39,13 @@ it("returns inherited cloud probe policy, identity and pending verification with
   expect(detail.endpoints[0]!.cloudTargets[0]).toMatchObject({ account: { name: "production" }, instance: { name: "edge-us" }, currentAddress: { address: "192.0.2.40" } });
   expect(detail.addressHealthPolicies[0]).toMatchObject({ id: policy!.id, mode: "external", group: { name: "group" }, config: { id: config!.id }, evidenceStatus: "current", state: { healthState: "healthy" } });
   expect(detail.healthResults).toEqual([]);
+  await connection.db.insert(db.endpointAddresses).values({ endpointId: f.endpoint.id, family: "4", address: address!.address, source: "cloud", state: "current", healthState: "healthy" });
+  await connection.db.update(db.cloudAddresses).set({ inventoryPresent: false }).where(eq(db.cloudAddresses.id, address!.id));
+  const historical = await service.get(f.actor as never, f.pool.id);
+  expect(historical.addressHealthPolicies[0]).toMatchObject({ evidenceStatus: "unavailable", cloudTarget: { available: false } });
+  expect(historical.endpoints[0]!.healthState).toBe("unknown");
+  expect(historical.pool.healthyEndpointCount).toBe(0);
+  await connection.db.update(db.cloudAddresses).set({ inventoryPresent: true }).where(eq(db.cloudAddresses.id, address!.id));
   await connection.db.update(db.addressHealthStates).set({ evidenceExpiresAt: new Date(Date.now() - 1000) }).where(eq(db.addressHealthStates.id, state!.id));
   expect((await service.get(f.actor as never, f.pool.id)).addressHealthPolicies[0]!.evidenceStatus).toBe("expired");
   await connection.db.update(db.addressHealthStates).set({ consecutiveSuccesses: 1, evidenceExpiresAt: new Date(Date.now() + 60000) }).where(eq(db.addressHealthStates.id, state!.id));
