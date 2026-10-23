@@ -8,6 +8,8 @@
 
 有 Docker daemon 的隔离环境还应以小阈值持续输出测试日志，验证自动轮转、最旧文件淘汰、压缩及 `docker logs` 可读性；部署验收按[部署手册](DEPLOYMENT.md)重建后检查所有服务的 `HostConfig.LogConfig`，确认数据卷仍是原卷。配置解析通过不代表已完成真实轮转或生产磁盘回收。记录见[容器日志限制验证](validation/2026-10-23-docker-log-limits.md)。
 
+应用脚本回归入口：`pnpm test:log-limits`。使用真实 Bash/Python、临时 Git 仓库与文件系统，Docker 边界用 Fake 覆盖备份、校验、依赖重建、应用恢复阶段失败后立即停止；核对当前镜像、命名卷和包含字面 `$` 的凭证保留，环境/卷/日志配置不一致、非标准数据库、迁移运行中、空备份与维护锁均拒绝继续。设置 `MASTERDNS_TEST_COMPOSE_BINARY=/path/to/docker-compose` 可额外启用真实 Compose 解析测试；未设置时这一项明确跳过。脚本和 Docker 流程回归不替代真实容器重建或数据库恢复演练，见[脚本验证记录](validation/2026-10-23-apply-log-limits.md)。
+
 ### 单元测试
 
 - Provider 数据标准化和错误分类。

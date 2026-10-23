@@ -37,7 +37,7 @@ docker compose up --build
 
 默认入口：Web `http://localhost:3000`，API `http://localhost:4000/api/health`。Compose 默认只监听 `127.0.0.1`；需要由其他主机访问时，应明确修改 `BIND_ADDRESS` 并同时配置防火墙。
 
-所有 Compose 服务默认启用容器日志轮转：单文件 10 MB、每容器最多保留 3 份（包含当前文件），旧日志压缩；可用 `.env` 中的 `DOCKER_LOG_MAX_SIZE` 和 `DOCKER_LOG_MAX_FILES` 调整。已有容器须重建才会生效，普通 restart 不会更新日志配置；部署手册的“容器日志与磁盘占用”提供操作步骤。这只限制容器输出日志，镜像、构建缓存和数据库卷需分别检查。
+所有 Compose 服务默认启用容器日志轮转：单文件 10 MB、每容器最多保留 3 份（包含当前文件），旧日志压缩；可用 `.env` 中的 `DOCKER_LOG_MAX_SIZE` 和 `DOCKER_LOG_MAX_FILES` 调整。已有容器须重建才会生效，普通 restart 不会更新日志配置。拉取最新脚本后运行 `bash apply-log-limits.sh`，会备份配置及数据库、核对现有密钥与数据卷，固定当前运行镜像并按顺序重建，期间短暂停服；需要 Python 3，详细条件与失败处置见部署手册的“容器日志与磁盘占用”。这只限制容器输出日志，镜像、构建缓存和数据库卷需分别检查。
 
 生产部署应在 Web/API 前配置 HTTPS 反向代理，并将 `WEB_URL`、`PUBLIC_API_URL`、`NEXT_PUBLIC_API_URL` 和 `TRUSTED_PROXY_CIDRS` 设置为实际地址。数据库卷包含加密后的云凭证；`MASTER_ENCRYPTION_KEY` 必须独立备份，不能提交到 Git。
 

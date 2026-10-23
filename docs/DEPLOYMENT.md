@@ -63,19 +63,50 @@ DOCKER_LOG_MAX_FILES=3
 
 `DOCKER_LOG_MAX_SIZE` 为正整数加单位 `k`、`m` 或 `g`；`DOCKER_LOG_MAX_FILES` 为至少 1 的整数，包含当前文件。默认每容器约 30 MB 的未压缩日志预算；单实例六个服务约 180 MB，压缩通常会减少实际占用。这是轮转阈值，不是 Docker 总磁盘配额，单条日志和轮转过程可能产生短暂额外占用。超过文件数量时 Docker 删除最旧日志，排障需长期保留的片段应提前导出。
 
-新容器直接生效。已有容器只执行 `restart` 不会更新日志配置；`bash update.sh` 更新应用服务，但保留 PostgreSQL/Redis 容器，因此其日志设置还需在维护窗口应用。先按“升级与回退”完成代码升级与数据库备份，再执行以下步骤；每个命令成功后才继续：
+新容器直接生效。已有容器只执行 `restart` 不会更新日志配置；`bash update.sh` 更新应用服务，但保留 PostgreSQL/Redis 容器。已有部署可在维护窗口使用专用脚本，在服务器项目目录执行：
 
 ```bash
-docker compose config --quiet
-docker compose stop web api worker migrate
-docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 postgres redis
-docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 api
-docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 worker web
-docker compose rm -f migrate
-docker compose ps
+git pull --ff-only origin master && bash apply-log-limits.sh
 ```
 
-这会短暂停服，重建容器时复用原有命名数据卷；最后移除已停止的旧迁移容器，下次迁移创建新容器时自动采用日志限制。旧容器及其本地日志会被替换或移除，如需诊断证据，提前用 `docker compose logs --since=24h > masterdns-before-log-rotation.log` 导出到有空间的目录；导出文件不受容器轮转限制。此配置本身没有数据库迁移。不要通过 `down -v` 或删除数据卷应用日志配置。
+需要 Bash、Git、Python 3、Docker Compose v2（支持 `up --wait --wait-timeout`）及 Docker 操作权限；脚本仅支持当前标准六服务的单实例部署、命名数据卷以及 `masterdns` 数据库/用户。五个常驻服务须已运行，不能有正在执行的迁移。脚本会核对 Compose 声明的环境与现有容器是否一致，包括 `MASTER_ENCRYPTION_KEY` 和数据库凭证；不一致时在停服前退出，先核对配置或按正常升级流程处理。它不会覆盖 `.env`、重新生成密钥或升级镜像，也不执行数据库迁移。
+
+执行顺序为：备份 `.env`、Compose 配置和容器快照，保存每个服务最近 200 行日志；停止应用写入；执行 `pg_dump -Fc` 并用 `pg_restore --file=/dev/null` 读取检查归档；固定现有运行镜像 ID 和原数据卷，按 PostgreSQL/Redis、API、Web/Worker 顺序重建并等待启动；最后检查镜像、环境、卷及日志设置，移除已停止的旧迁移容器。归档读取检查不等于完整恢复演练。Redis 复用原持久数据卷，本脚本不另做 Redis 离线备份。
+
+脚本默认将备份保存在项目旁的 `masterdns-backups/log-limits-时间-随机值/`，目录权限 `0700`、文件仅当前用户可读写；其中包含密钥和凭证，需妥善保护，仍应按既有要求另行独立备份加密密钥。空间紧张时可指定另一个有足够空间且位于项目外的磁盘：
+
+```bash
+MASTERDNS_BACKUP_ROOT=/mnt/backup/masterdns bash apply-log-limits.sh
+```
+
+`MASTERDNS_LOG_WAIT_TIMEOUT` 调整每次启动等待秒数，默认 180。与 `update.sh` 共用维护锁，不能同时执行。任何一步失败都会停止后续步骤并显示失败阶段和备份路径；停服之后失败时应用可能仍然停止，不会自动继续或回滚。不要在原因不明时反复运行脚本。`.partial` 文件不是已验证的数据库备份。
+
+若失败阶段为“停止应用写入”或“备份并检查数据库归档”，尚未重建依赖，核对原 PostgreSQL/Redis 仍正常后可按快照记录的容器 ID 启动原应用；直接 `docker start` 不会创建容器或启动迁移依赖。将路径替换为脚本输出的实际备份目录：
+
+```bash
+MASTERDNS_LOG_BACKUP=/实际路径/masterdns-backups/log-limits-时间-随机值
+original_id() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))[0]["Id"])' "$MASTERDNS_LOG_BACKUP/before-$1.json"; }
+docker start "$(original_id api)"
+docker inspect --format '{{.State.Health.Status}}' "$(original_id api)"
+```
+
+确认 API 显示 `healthy` 后，再执行 `docker start "$(original_id worker)" "$(original_id web)"`。排除备份失败原因后才能重新运行应用脚本；不要改用可能同时启动迁移依赖的 `docker compose start`。
+
+若失败发生在依赖重建或之后，先根据备份的容器快照核对实际卷、镜像和健康状态；确认故障已修复且已有有效 `masterdns.dump` 后，使用冻结配置恢复：
+
+```bash
+MASTERDNS_LOG_BACKUP=/实际路径/masterdns-backups/log-limits-时间-随机值
+log_recovery() { docker compose --env-file /dev/null -f "$MASTERDNS_LOG_BACKUP/runtime.compose.json" "$@"; }
+log_recovery up -d --no-deps --no-build --pull never --wait postgres redis
+# 核对原卷及依赖健康后，再执行：
+log_recovery up -d --no-deps --no-build --pull never --wait api
+# 确认 API 健康后，再执行：
+log_recovery up -d --no-deps --no-build --pull never --wait worker web
+```
+
+每阶段核对成功后再继续，不能只因备份文件存在便假定卷或数据库正常。
+
+维护期间会短暂停服，重建复用原有命名数据卷；旧容器及本地日志会被替换或移除。若最近 200 行不足以排障，提前将需要的日志导出到有空间的目录；导出文件不受容器轮转限制。不要通过 `down -v` 或删除数据卷应用日志配置。
 
 检查已创建容器的实际设置（输出应包含 `json-file`、`max-size`、`max-file` 和 `compress`）：
 

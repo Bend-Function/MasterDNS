@@ -46,6 +46,8 @@ flowchart TB
 
 2026-10-23 起，六个 Compose 服务共享 Docker `json-file` 日志配置，由 Docker 对容器 stdout/stderr 进行轮转及旧文件压缩。默认单文件 10 MB、每容器保留 3 份（含当前文件），通过 `DOCKER_LOG_MAX_SIZE` / `DOCKER_LOG_MAX_FILES` 调整；配置在容器创建时生效。该策略不改变数据库中审计、Operation 或探测历史的保留规则，也不限制镜像、构建缓存及数据卷大小。已有部署操作见[部署手册](DEPLOYMENT.md)。
 
+`apply-log-limits.sh` 是只应用日志配置的维护入口：与 `update.sh` 共用 `.git/masterdns-update.lock`，在停服前冻结已解析的 Compose 配置并核对运行环境；为五个常驻服务固定当前镜像 ID，PostgreSQL/Redis 卷声明为原名称的 external 卷，防止缺卷时静默新建空库。停止应用写入并完成数据库归档检查后，先重建依赖、核对卷与镜像，再恢复 API、Web/Worker 并检查最终日志设置；失败停止后续操作，保留快照与备份供人工诊断。脚本不运行 migration、构建或拉取镜像，也不执行数据库回退。
+
 API 除配置和任务创建外，也执行凭证验证、资源预检等必要的厂商调用；长流程由 Worker 推进。PostgreSQL 保存平台的持久事实，远端云/DNS 的实际效果仍必须通过厂商接口观察确认。
 
 ## 3. 代码分层与实际依赖
