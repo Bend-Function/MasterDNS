@@ -70,3 +70,5 @@ export * from "./cloud-lifecycle.js";
 
 export * from "./linode-temporary-inventory.js";
 export * from "./binding-deletion.js";
+
+export * from "./cloud-state-reset.js";

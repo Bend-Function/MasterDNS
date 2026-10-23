@@ -144,6 +144,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     currentAddressId: uuid("current_address_id"),
     currentAddressKind: cloudAddressKindEnum("current_address_kind").notNull().default("host"),
     currentVersion: integer("current_version").notNull().default(0),
+    resetRecoveryRetries: integer("reset_recovery_retries").notNull().default(0),
     candidateAddressId: uuid("candidate_address_id"),
     candidateAddressKind: cloudAddressKindEnum("candidate_address_kind").notNull().default("host"),
     candidateVersion: integer("candidate_version").notNull().default(0),
@@ -163,6 +164,7 @@ export function defineCloudSchema(dependencies: CloudSchemaDependencies) {
     }).onDelete("restrict"),
     check("managed_address_slots_family_valid", sql`${table.family} in ('4', '6')`),
     check("managed_address_slots_host_only", sql`${table.currentAddressKind} = 'host' and ${table.candidateAddressKind} = 'host'`),
+    check("managed_slots_reset_retry_bounds", sql`${table.resetRecoveryRetries} between 0 and 20`),
     check("managed_address_slots_versions_nonnegative", sql`${table.currentVersion} >= 0 and ${table.candidateVersion} >= 0`),
   ]);
 

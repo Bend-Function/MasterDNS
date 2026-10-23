@@ -1,3 +1,4 @@
+import { RotationResetRecoveryService } from "./rotation-reset-recovery.service.js";
 import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
 import { RotationPublicationService } from "./rotation-publication.service.js";
 import { RotationCleanupService } from "./rotation-cleanup.service.js";
@@ -16,13 +17,14 @@ const noEffectErrors = new Set(["permission_denied", "quota_exceeded", "rate_lim
 export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
   private worker?: Worker<RotationJob>;
   private readonly logger = new Logger(RotationProcessor.name);
-  constructor(private readonly store: RotationStore, private readonly runtime: CloudRuntimeService, private readonly queues: QueueRuntimeService, @Optional() private readonly publication?: RotationPublicationService, @Optional() private readonly cleanup?: RotationCleanupService) {}
+  constructor(private readonly store: RotationStore, private readonly runtime: CloudRuntimeService, private readonly queues: QueueRuntimeService, @Optional() private readonly publication?: RotationPublicationService, @Optional() private readonly cleanup?: RotationCleanupService, @Optional() private readonly resetRecovery?: RotationResetRecoveryService) {}
   onModuleInit() {
     this.worker = new Worker<RotationJob>(queueNames.rotation, job => this.run(job.data.incidentId), { connection: this.queues.redis, concurrency: 8 });
     this.worker.on("error", error => this.logger.error(error.message));
   }
   async onModuleDestroy() { await this.worker?.close(); }
   async run(incidentId: string) {
+    if (await this.resetRecovery?.recover(incidentId)) return;
     const lease = await this.store.claim(incidentId); if (!lease) return;
     try {
       const run = await this.store.read(incidentId, lease);

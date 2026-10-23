@@ -1,8 +1,9 @@
 import { persistedCleanupOptions, persistedRotationOptions, rotationPersistenceExtension } from "./rotation-persistence-extensions.js";
+import { RotationResetRecoveryService } from "./rotation-reset-recovery.service.js";
 import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
 import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { randomUUID } from "node:crypto";
-import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
+import { Injectable, Optional, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import {
   CloudError,
@@ -21,6 +22,7 @@ import {
   resetHealthEvidence,
   databaseNow,
   rotationAttempts,
+  managedAddressSlots,
   rotationIncidents,
   rotationLeases,
   rotationPublications,
@@ -65,6 +67,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly database: DatabaseService,
     private readonly runtime: CloudRuntimeService,
+    @Optional() private readonly resetRecovery?: RotationResetRecoveryService,
   ) {}
   onModuleInit() {
     void this.tick();
@@ -102,6 +105,10 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     for (const i of incidents) await this.complete(i.id);
   }
   async run(resourceId: string, _now: Date) {
+    if (this.resetRecovery) {
+      const [resource] = await this.database.db.select({ incidentId: rotationResources.incidentId }).from(rotationResources).where(eq(rotationResources.id, resourceId));
+      if (resource && await this.resetRecovery.recover(resource.incidentId)) return;
+    }
     // Admission always uses database time. A caller-provided future clock cannot bypass TTL.
     const initial = await this.database.db.transaction(async (tx) => {
       const [r] = await tx.select().from(rotationResources).where(eq(rotationResources.id, resourceId));
@@ -110,7 +117,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (!incident) return;
       const c = await lockRotationContext(tx, incident.slotId);
       const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id)).for("update");
-      if (!lockedIncident || lockedIncident.terminatedAt) return;
+      if (!lockedIncident || lockedIncident.terminatedAt || ["cloud_reset_pending", "cloud_reset_sync_failed"].includes(lockedIncident.errorCode ?? "")) return;
       const now = await databaseNow(tx);
       if (lockedIncident.recoveryRetryAt && lockedIncident.recoveryRetryAt > now) {
         await tx.update(rotationResources).set({ cleanupDueAt: lockedIncident.recoveryRetryAt }).where(eq(rotationResources.id, r.id));
@@ -540,7 +547,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (!i) return;
       const c = await lockRotationContext(tx, i.slotId);
       const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, i.id)).for("update");
-      if (!lockedIncident || lockedIncident.terminatedAt) return;
+      if (!lockedIncident || lockedIncident.terminatedAt || ["cloud_reset_pending", "cloud_reset_sync_failed"].includes(lockedIncident.errorCode ?? "")) return;
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.status !== "in_flight" || dispatchFence !== undefined && step.fence !== dispatchFence) return;
       if (code === "rate_limited") {
@@ -586,6 +593,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         }
       }
       const now = await databaseNow(tx);
+      await tx.update(managedAddressSlots).set({ resetRecoveryRetries: 0 }).where(eq(managedAddressSlots.id, c.slot.id));
       await tx
         .update(rotationIncidents)
         .set({ status: "complete", phase: "complete", completedAt: now, updatedAt: now, errorCode: null })

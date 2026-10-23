@@ -18,6 +18,7 @@
   },
   "dependencies": {
     "@masterdns/contracts": "workspace:*",
+    "@masterdns/cloud-providers": "workspace:*",
     "@masterdns/crypto": "workspace:*",
     "drizzle-orm": "^0.45.2",
     "postgres": "^3.4.9"

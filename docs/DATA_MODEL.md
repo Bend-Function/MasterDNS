@@ -398,10 +398,11 @@ resource.cleanup    retained | pending | released | failed
 - Incident 同时保存 status 和 phase，终止另存 `terminated_at`。不能把 `complete` 单独当作“所有业务效果成功”的证明。
 - health/scheduled 事件保存探测上下文版本；manual 事件对应字段为空，不能伪造为已通过外部探测。
 - Linode 临时实例身份保存在步骤 receipt 和资源 snapshot 中，通过 [rotation-temporary-instances.ts](../packages/db/src/rotation-temporary-instances.ts) 提取，并无独立临时实例表。
-- `charged` 表示尝试预算记账；恢复原步骤不创建一次新的换址尝试。
+- `charged` 表示尝试预算记账；原步骤接续不创建新换址尝试。AWS 同步重置后的新故障任务拥有新预算段，保留旧计费历史，并受到跨任务重置次数和云账号速率上限约束。
 - 迁移 `0034_rotation-recovery-retries` 给 `rotation_policies` 增加 `max_recovery_retries`（默认 5，0–20，0 关闭自动重试），给 `rotation_incidents` 增加 `recovery_retries`（默认 0，0–20）、`recovery_retry_at`、`last_recovery_error`。现有策略原有 `max_attempts`、授权、开关和事件状态保持原值。
-- `recovery_retries` 记录本事件累计安排的自动恢复次数，跨步骤/候选及 cloud/publish/cleanup 阶段累计；普通重启不清零。重试等待期间 active，到期接续原步骤；耗尽后 exhausted，`error_code=recovery_retries_exhausted`，`last_recovery_error` 保留真实失败原因。显式人工恢复会重置恢复计数，并遵守原有预算段语义。
-- 清理步骤复用 `observe_deadline` 和 `fence`，失败恢复时间同时写入 Incident `recovery_retry_at` 和资源 `cleanup_due_at`。已确认未生效状态不可被旧 pending 观察覆盖；重新派发清除原 receipt，历史记录保留。无需在 0034 之外再新增迁移。
+- `recovery_retries` 记录本事件累计安排的自动恢复次数，跨步骤/候选及 cloud/publish/cleanup 阶段累计；普通重启不清零。非 AWS 自动重置路径的重试等待期间 active，到期接续原步骤；耗尽后 exhausted，`error_code=recovery_retries_exhausted`，`last_recovery_error` 保留真实失败原因。显式人工恢复会重置恢复计数，并遵守原有预算段语义。
+- 清理步骤复用 `observe_deadline` 和 `fence`，失败恢复时间同时写入 Incident `recovery_retry_at` 和资源 `cleanup_due_at`。已确认未生效状态不可被旧 pending 观察覆盖；重新派发清除原 receipt，历史记录保留。原步骤恢复无需额外字段；自动同步重置新增 0035，见下条。
+- 迁移 `0035_rotation_reset_recovery` 新增 `managed_address_slots.reset_recovery_retries`，默认 0、约束 0–20。计数在自动同步尝试前提交；API 手动重置清零，自动重置保留；新 Incident 继承到 `recovery_retries` 展示。独立健康发布完成或正常任务完成清零；耗尽后需显式手动同步重置，单独切换开关不会刷新预算。`cloud_reset_pending` / `cloud_reset_sync_failed` 沿用 Incident 错误与重试时间字段；重置后旧 Incident 保存 `cloud_state_reset` 和 `terminated_at`、清空 `recovery_retry_at`。审计 `rotation.auto_reset_started/failed`、`cloud_instance.reset_state` 的自动来源为 failover、actor 为空。
 - Linode 已确认失败的电源操作回执作为步骤计划中的 `retryReceipt` 保存；重新读取失败事件、操作者和事件水位后才可派发，历史观察记录保留。
 
 账号/服务层面的速率准入另由 [cloud-rotation-limits.ts](../packages/db/src/schema/cloud-rotation-limits.ts) 中的 `cloud_rotation_limit_switches`、`cloud_rotation_limit_policies`、`cloud_rotation_buckets`、`cloud_rotation_reservations` 保存。该限制与单次事件的尝试次数预算职责不同。
@@ -417,7 +418,7 @@ Pool 查询中的 `addressHealthPolicies[].evidenceStatus` 增加只读值 `unav
 | 本地健康 | HealthResultService | 维护节点/地址/Binding 状态并触发调和 |
 | Probe 轮次与证据 | API 接收结果、Worker 收束轮次，共享 db 事务 | Pool 可用性判断及自动换址/发布准入 |
 | DNS 期望 | ReconcileProcessor | OperationProcessor 执行与验证 |
-| 换址意图与步骤 | RotationStore/Processor | 恢复扫描继续执行或观察原步骤 |
+| 换址意图与步骤 | RotationStore/Processor、ResetRecovery | AWS 自动轮换失败先同步重置；其余恢复扫描继续执行或观察原步骤 |
 | 地址发布与清理 | Publication/Cleanup Service + DNS 执行器 | 分别证明新地址发布与旧资源处理结果 |
 | 通知投递 | NotificationProcessor | 持久重试与历史展示 |
 

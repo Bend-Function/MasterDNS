@@ -200,3 +200,19 @@ pnpm lint
 - `pnpm --filter @masterdns/web exec vitest run src/app/health/page.test.tsx`：以真实 React 页面与受控 fetch 验证普通用户入口、取消无请求、版本化确认、重复点击隔离、失败重试、成功移除与卸载后的迟到响应。
 - 浏览器检查桌面/移动端的删除按钮、确认目标和地址族、云/普通节点影响说明、加载与错误反馈。React/happy-dom 测试不替代浏览器视觉验收。
 - 对此变更执行全仓库类型检查、Web lint 和构建；不把这些离线验证记为真实云/DNS 写入或生产升级验收。详细执行范围见[专题记录](validation/2026-10-11-health-policy-deletion.md)。
+
+## AWS 失败自动同步重置（2026-10-24）
+
+使用隔离 PostgreSQL/Redis 验证，真实 AWS/DNS 写入仍按前述专用凭证和隔离资源规则单独验收：
+
+```sh
+MASTERDNS_TEST_DATABASE_URL=postgres://... MASTERDNS_TEST_REDIS_URL=redis://... pnpm --filter @masterdns/worker exec vitest run src/rotation src/health src/automation src/operations --maxWorkers=3
+MASTERDNS_TEST_DATABASE_URL=postgres://... pnpm --filter @masterdns/db exec vitest run src/rotation-recovery-migration.test.ts
+MASTERDNS_TEST_DATABASE_URL=postgres://... pnpm --filter @masterdns/api exec vitest run src/modules/cloud/cloud-state-reset.service.test.ts src/modules/rotation --maxWorkers=3
+pnpm --filter @masterdns/web test
+pnpm build
+pnpm typecheck
+pnpm lint
+```
+
+验收要求：自动轮换已启用的 AWS 任务失败后走同步/重置，三个工作入口均不能重放原阻塞步骤；同步失败/超时不清本地状态，队列执行能退出；物理租约及两次授权核对有效。重置结束旧任务并按真实 IP 重建新候选、作废旧健康证据，保持已启用开关；新故障任务继承次数，连续最多 5 次，0 关闭，进程重启/并发调用不刷新预算。旧步骤迟到回执不覆盖新状态；手动暂停、终止、关闭或撤权不被恢复覆盖。排队双地址族健康任务不能互锁，已执行/手动暂停的另一族仍受保护。未开启故障自动轮换的手动/定时任务回到原恢复路径。迁移从 0033/0034 升级后保留已有状态、预算默认 0，验证范围约束与重复迁移不刷新计数。

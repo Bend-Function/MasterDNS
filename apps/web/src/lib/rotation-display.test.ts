@@ -8,6 +8,8 @@ it("does not show cleanup failures or active rotations as normal", () => {
   expect(rotationStatusValue({ status: "active", errorCode: null }, [{ cleanupStatus: "failed" }])).toBe("failed");
   expect(rotationStatusValue({ status: "exhausted", errorCode: "recovery_retries_exhausted" })).toBe("exhausted");
   expect(rotationStatusValue({ status: "complete", errorCode: null })).toBe("succeeded");
+  expect(rotationStatusValue({ status: "complete", errorCode: "cloud_state_reset", terminatedAt: "2026-10-24T00:00:00Z" })).toBe("reset");
+  expect(rotationStatusValue({ status: "active", errorCode: "cloud_reset_pending", recoveryRetryAt: "2026-10-24T00:00:00Z" })).toBe("retrying");
 });
 
 describe("rotation rate-limit display", () => {

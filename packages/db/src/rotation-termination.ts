@@ -3,7 +3,7 @@ import { cloudRotationReservations, operationSteps, operations, reconcileIntents
 import { databaseNow, lockRotationContext, type RotationTransaction } from "./rotation-context.js";
 import { rotationAudit } from "./rotation-incidents.js";
 
-export async function terminateRotationIncident(tx: RotationTransaction, id: string, actorUserId: string) {
+export async function terminateRotationIncident(tx: RotationTransaction, id: string, actorUserId?: string) {
   const [identity] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, id));
   if (!identity) throw new Error("rotation_not_found");
   await lockRotationContext(tx, identity.slotId);
@@ -41,7 +41,7 @@ export async function terminateRotationIncident(tx: RotationTransaction, id: str
   await tx.update(rotationLeases).set({ holder: null, expiresAt: now, revision: sql`${rotationLeases.revision} + 1`,
     incidentId: sql`case when ${rotationLeases.unresolvedStepId} is null then null else ${rotationLeases.incidentId} end` })
     .where(eq(rotationLeases.incidentId, id));
-  const [updated] = await tx.update(rotationIncidents).set({ status: "complete", terminatedAt: now, completedAt: now, pausedByUserId: actorUserId, errorCode: "manual_terminated", updatedAt: now }).where(eq(rotationIncidents.id, id)).returning();
+  const [updated] = await tx.update(rotationIncidents).set({ status: "complete", terminatedAt: now, completedAt: now, pausedByUserId: actorUserId ?? null, errorCode: "manual_terminated", updatedAt: now }).where(eq(rotationIncidents.id, id)).returning();
   await rotationAudit(tx, updated!, "rotation.terminate", actorUserId);
   return updated!;
 }

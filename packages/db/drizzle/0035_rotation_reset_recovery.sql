@@ -1,0 +1,2 @@
+ALTER TABLE "managed_address_slots" ADD COLUMN "reset_recovery_retries" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
+ALTER TABLE "managed_address_slots" ADD CONSTRAINT "managed_slots_reset_retry_bounds" CHECK ("managed_address_slots"."reset_recovery_retries" between 0 and 20);

@@ -1,9 +1,10 @@
+import { RotationResetRecoveryService } from "./rotation-reset-recovery.service.js";
 import { CloudError, getCloudServiceRegistration } from "@masterdns/cloud-providers";
 import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
 import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { supportsRotationTrigger } from "@masterdns/contracts";
 import { randomUUID } from "node:crypto";
-import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
+import { Injectable, Optional, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, exists, inArray, isNull, ne, notExists, or, sql } from "drizzle-orm";
 import {
   addressHealthStates,
@@ -126,6 +127,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
   constructor(
     private readonly database: DatabaseService,
     private readonly runtime: CloudRuntimeService,
+    @Optional() private readonly resetRecovery?: RotationResetRecoveryService,
   ) {}
   onModuleInit() {
     void this.tick();
@@ -436,6 +438,10 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
     return { poolId, eventId, policyRevision: pool.policyRevision, decisionRevision: pool.decisionRevision };
   }
   async observe(id: string) {
+    if (this.resetRecovery) {
+      const [publication] = await this.database.db.select({ incidentId: rotationPublications.incidentId }).from(rotationPublications).where(eq(rotationPublications.id, id));
+      if (publication?.incidentId && await this.resetRecovery.recover(publication.incidentId)) return;
+    }
     await this.database.db.transaction(async (tx) => {
       const [identity] = await tx.select().from(rotationPublications).where(eq(rotationPublications.id, id));
       if (!identity || identity.status === "applied") return;
@@ -446,7 +452,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
       let incident: typeof rotationIncidents.$inferSelect | undefined;
       if (p.incidentId) {
         [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId)).for("update");
-        if (incident?.terminatedAt) return;
+        if (incident?.terminatedAt || ["cloud_reset_pending", "cloud_reset_sync_failed"].includes(incident?.errorCode ?? "")) return;
         releaseOldAddress = incident?.releaseOldAddress ?? false;
       }
       if (c.addressVersion !== p.addressVersion || c.address?.id !== p.addressId) throw new Error("publication_version_changed");
@@ -527,11 +533,12 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           updatedAt: now,
         })
         .where(eq(rotationPublications.id, id));
+      if (done && !p.incidentId) await tx.update(managedAddressSlots).set({ resetRecoveryRetries: 0 }).where(eq(managedAddressSlots.id, c.slot.id));
       if (p.incidentId) {
         const [latest] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId));
         await tx
           .update(rotationIncidents)
-          .set({ phase: done ? "cleanup" : "publish", errorCode: latest?.pausedByUserId || latest?.errorCode === "recovery_retries_exhausted" ? latest.errorCode : !done && failed ? "dns_partial" : null,
+          .set({ phase: done ? "cleanup" : "publish", errorCode: latest?.pausedByUserId || ["recovery_retries_exhausted", "cloud_reset_pending", "cloud_reset_sync_failed"].includes(latest?.errorCode ?? "") ? latest!.errorCode : !done && failed ? "dns_partial" : null,
             ...(done ? { recoveryRetryAt: null } : {}), nextRunAt: latest?.recoveryRetryAt && latest.recoveryRetryAt > now ? latest.recoveryRetryAt : now, updatedAt: now })
           .where(eq(rotationIncidents.id, p.incidentId));
         if (done) {

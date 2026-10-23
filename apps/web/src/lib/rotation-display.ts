@@ -3,6 +3,7 @@ export type RotationLimitResource = { cleanupError: string | null; cleanupDueAt:
 
 /** Incident scheduling state is not health: active must never render as normal. */
 export function rotationStatusValue(incident: { status: string; errorCode: string | null; terminatedAt?: string | null; recoveryRetryAt?: string | null }, resources: Array<{ cleanupStatus: string }> = []): string {
+  if (incident.status === "complete" && incident.errorCode === "cloud_state_reset") return "reset";
   if (incident.terminatedAt) return "terminated";
   if (incident.status === "paused" || incident.status === "exhausted") return incident.status;
   if (incident.recoveryRetryAt || incident.errorCode === "rotation_rate_limited") return "retrying";

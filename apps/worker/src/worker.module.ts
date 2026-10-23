@@ -1,3 +1,4 @@
+import { RotationResetRecoveryService } from "./rotation/rotation-reset-recovery.service.js";
 import { RotationPublicationService } from "./rotation/rotation-publication.service.js";
 import { RotationCleanupService } from "./rotation/rotation-cleanup.service.js";
 import { RotationProcessor } from "./rotation/rotation.processor.js";
@@ -28,7 +29,7 @@ import { SyncSchedulerService } from "./sync/sync-scheduler.service.js";
 
 @Module({
   providers: [
-    RotationProcessor, RotationRecoveryService, RotationSchedulerService, RotationStore, RotationPublicationService, RotationCleanupService,
+    RotationResetRecoveryService, RotationProcessor, RotationRecoveryService, RotationSchedulerService, RotationStore, RotationPublicationService, RotationCleanupService,
     DatabaseService,
     CloudRuntimeService,
     CloudSyncService,

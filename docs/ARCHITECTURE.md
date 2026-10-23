@@ -218,15 +218,15 @@ flowchart LR
 
 一次 Incident 下有预算段、Attempt 和多个 Step。换址次数按尝试的效果记账，恢复已有尝试不应被计为一次新换址。账号/服务层面的速率预算另由 `cloud_rotation_*` 表控制。
 
-2026-10-23 增补失败恢复：云端阶段的临时运行错误、观察异常、云端收敛超时和已确认未生效步骤，在原 Incident 内自动接续。清理阶段复用同一调用超时与持久恢复调度，整次事件的 cloud/publish/cleanup 累计最多 maxRecoveryRetries 次恢复，不按阶段刷新次数。`maxRecoveryRetries` 默认 5（首次失败后最多 5 次重试），独立于按实际效果记账的 `maxAttempts`。恢复次数、重试时间、最近错误都持久保存；普通进程重启、Redis 重新投递和候选推进不会清零，显式人工恢复才重置恢复次数。重试间隔采用 `minIntervalSeconds`，云厂商 Retry-After 较长时取较晚时间，重试期间保持 active，避免周期调度误判为需人工暂停。
+2026-10-24 起，已开启自动轮换的 AWS EC2/Lightsail 优先使用 `RotationResetRecoveryService`：RotationProcessor、独立 Publication observer 与 Cleanup scanner 在接续旧工作之前调用同一恢复入口。云失败、运行超时、收敛超时、候选失败、发布/清理失败、旧清单缺失及换址尝试耗尽可以触发。限流等待、证据不足、用户暂停/终止、主动关闭、授权/配置变更、其他地址族已开始执行或被暂停的任务及永久权限/配额问题不被自动恢复覆盖。
 
-Processor 对创建适配器/身份校验、清单读取、执行和观察的每次等待设为 `min(cloudWaitSeconds, 30)` 秒，在 45 秒物理租约前释放当前队列执行。超时发出调用级取消信号，HTTP/SDK 在每次派发前检查，阻止迟到预检查继续发送新请求；已送达云端的请求仍可能生效，取消不能作为未生效的证明：派发意图与 unresolved fence 保留，迟到的执行回执仍归入原步骤历史；较旧派发 fence 的回执与错误不能覆盖新一轮派发，已确认未生效的状态也不被迟到执行回执降回 pending；恢复先观察，不启动另一个换址计划。观察窗口过期只延长原步骤观察窗口并消耗恢复次数。明确 `not_applied` 或可重试的无效果拒绝才允许重新准备原步骤，并保留已完成的申请、候选资源、计费与审计记录。
+恢复先锁定云上下文，检查启用状态、当前管理/地址族授权与版本、生命周期限制、冲突管理者和其他已执行/被暂停的任务；尚未准备 Attempt 的排队健康事件可一起被重置替代，避免双地址族互锁；领取物理租约后把恢复次数写入 Slot，并将 Incident 标为 `cloud_reset_pending`。适配器身份校验与清单读取共享 `min(cloudWaitSeconds, 30)` 秒的云调用时间预算。同步/身份验证失败时不会清空本地云状态，只记录原因、释放租约，按 `minIntervalSeconds` 与较长 Retry-After 延后；状态为 `cloud_reset_sync_failed`。迟到只读返回不会进入重置事务。
 
-恢复达到上限后状态为 exhausted、错误为 `recovery_retries_exhausted`；不新增云写入、不刷新预算，不调用人工终止逻辑，也不关闭自动轮换开关。保留未决效果的只读核对和物理隔离，避免其他事件跨过不确定步骤。人工暂停/终止、授权撤销、配置版本变化、归属不明、永久权限/配额错误继续阻止自动写入。旧版因可恢复错误而 paused 的 cloud 事件也进入相同的有界恢复流程。任务关联的 PublicationService 也使用有界身份校验/清单读取；临时失败持久安排恢复，独立 publication scanner 与 rotation processor 都尊重恢复截止时间。DNS 部分发布先安排一次恢复，到期只重新投递失败的 Operation/Step，保留成功记录；paused/exhausted 不重投递，耗尽原因不被观察扫描覆盖。无 Incident 的首次绑定发布保持原有语义。健康候选验证仍要求新鲜证据，不把探针不足视为故障或强行发布。已 complete 的事件不能被迟到错误重新激活。
+API 的手动重置与自动恢复共享 `db.resetCloudInstanceState` 的同一事务：核对账号/实例快照，在正常账号、实例、Slot 和物理锁下读取实际云清单，并在自动路径提交前复核租约；停止旧 Incident，取消旧 Publication/Operation/Intent，放弃旧待定步骤、清除本地 unresolved 指针，保留历史回执与未释放资源。按真实云 IP 重建当前 Slot 和新的 candidateVersion，重置健康证据并作废旧 Probe 任务。最后恢复重置前的策略启用值；自动路径不将用户关闭的开关改为开启。实际任务以 `complete + terminated_at + cloud_state_reset` 结束，UI 显示“已同步重置”。这只终止本地工作，不保证已发出的云请求被撤销；后续新鲜清单/健康检查继续识别云端变化。
 
-CleanupService 的身份读取、清单、执行和观察都使用同一有界云调用机制。清理步骤保存 observeDeadline；pending 超过收敛窗口会消耗一次恢复并继续观察原步骤，明确 not_applied 才可重新派发，派发时清空旧操作回执并保存新的 fence。旧 fence 回执及已确认失败后的迟到 pending 只进入历史，不能覆盖已确认结果。failed 资源在 pending 观察时保留失败原因，直到步骤成功或明确重试推进。清理 prerequisites（发布/TTL、归属、授权）仍独立检查，缺失时不会刷新恢复预算或绕过校验。
+Slot 的 `reset_recovery_retries` 在每次真正开始自动同步前递增，默认最多 5 次，跨重置、新 Incident 和进程重启累计；同步失败也消耗一次，避免读接口故障造成无限循环。实际 IP 通过健康阈值和发布后结束恢复链；仍失败时由原健康调度创建新任务并继承次数。耗尽保留 `exhausted/recovery_retries_exhausted` 和原开关，停止自动同步重置；用户主动手动重置可重新开始一轮。新任务遵守独立的 `maxAttempts` 和云账号速率预算，旧资源不会因重置被视为已删除，也不会自动重复释放。
 
-Lightsail 释放优先核对原静态 IP：NotFound 可确认已释放，不受历史失败 operation 阻挡；原 ARN/地址仍存在且未附着时，读取该派发的全部操作。全部结束且至少一项 Failed 才返回 not_applied；仍有 Started 则继续观察，身份变化则 ambiguous。失败重试只重做 ReleaseStaticIp，不重放申请、解绑、绑定或 DNS 发布。恢复扫描按 cleanupDueAt 排序；租约冲突及已耗尽、无需观察的资源延后，避免前 200 个旧任务长期占据扫描页。任务 UI 单独映射 active 为执行中，错误/恢复等待展示失败或重试中，不能用健康状态的“正常”代表任务成功。
+Azure/Linode、未启用自动轮换的任务及普通限流继续按 2026-10-23 的原步骤恢复规则：持久恢复上限、调用超时、先观察效果、确认未生效后再派发，保留原申请和计费记录。旧 fence/已确认失败后的迟到回执只进入历史，不覆盖新状态。无 Incident 的首次发布保持外部健康和实时清单核对；不得把 unknown 当作 failure。Cleanup 的 TTL、引用、归属和授权前置检查仍有效。Lightsail 原始释放适配器仍依据原静态 IP 与 operation 判断实际状态；失败自动轮换任务由上述同步重置入口接管，不继续重复原释放步骤。
 
 ### 7.4 并发与旧任务隔离
 

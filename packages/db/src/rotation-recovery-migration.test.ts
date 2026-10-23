@@ -6,7 +6,7 @@ import { migrate } from "drizzle-orm/postgres-js/migrator";
 import { expect, it } from "vitest";
 import { createDatabase } from "./index.js";
 
-it("upgrades existing policies and incidents with durable bounded failure retries", async () => {
+it.each([33, 34])("upgrades migration %s with durable retry limits and a zeroed reset budget without changing existing state", async baseline => {
   const root = process.env.MASTERDNS_TEST_DATABASE_URL;
   if (!root) throw new Error("MASTERDNS_TEST_DATABASE_URL is required");
   const name = `recovery_upgrade_${randomUUID().replaceAll("-", "")}`;
@@ -16,7 +16,7 @@ it("upgrades existing policies and incidents with durable bounded failure retrie
   let connection: ReturnType<typeof createDatabase> | undefined;
   try {
     const journal = JSON.parse(await readFile(join(migrations, "meta/_journal.json"), "utf8"));
-    const previous = { ...journal, entries: journal.entries.filter((entry: { idx: number }) => entry.idx <= 33) };
+    const previous = { ...journal, entries: journal.entries.filter((entry: { idx: number }) => entry.idx <= baseline) };
     await mkdir(join(folder, "meta"));
     await writeFile(join(folder, "meta/_journal.json"), JSON.stringify(previous));
     for (const entry of previous.entries) await cp(join(migrations, `${entry.tag}.sql`), join(folder, `${entry.tag}.sql`));
@@ -47,7 +47,12 @@ it("upgrades existing policies and incidents with durable bounded failure retrie
     for (const limit of [0, 20]) await sql`update rotation_policies set max_recovery_retries=${limit} where slot_id=${slot!.id}`;
     for (const limit of [-1, 21]) await expect(sql`update rotation_policies set max_recovery_retries=${limit} where slot_id=${slot!.id}`).rejects.toMatchObject({ code: "23514" });
     await expect(sql`update rotation_incidents set recovery_retries=-1 where id=${health!.id}`).rejects.toMatchObject({ code: "23514" });
+    expect(await sql`select current_version, current_address_id, reset_recovery_retries from managed_address_slots where id=${slot!.id}`)
+      .toEqual([{ current_version: 1, current_address_id: address!.id, reset_recovery_retries: 0 }]);
+    for (const count of [-1, 21]) await expect(sql`update managed_address_slots set reset_recovery_retries=${count} where id=${slot!.id}`).rejects.toMatchObject({ code: "23514" });
+    await sql`update managed_address_slots set reset_recovery_retries=5 where id=${slot!.id}`;
     await migrate(connection.db, { migrationsFolder: migrations });
+    expect(await sql`select reset_recovery_retries from managed_address_slots where id=${slot!.id}`).toEqual([{ reset_recovery_retries: 5 }]);
   } finally {
     await connection?.close();
     await admin.client.unsafe(`drop database if exists "${name}"`);

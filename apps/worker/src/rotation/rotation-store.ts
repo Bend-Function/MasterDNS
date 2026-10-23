@@ -38,7 +38,7 @@ export class RotationStore {
   async read(id: string, lease: RotationLease) {
     return this.transaction(id, async (tx, c, incident) => {
       const run = await this.snapshot(tx, c, incident, lease);
-      if (incident.terminatedAt || incident.pausedByUserId || !run.physical || !["cloud", "publish"].includes(incident.phase)) return run;
+      if (incident.terminatedAt || incident.pausedByUserId || !run.physical || ["cloud_reset_pending", "cloud_reset_sync_failed"].includes(incident.errorCode ?? "") || !["cloud", "publish"].includes(incident.phase)) return run;
       // Recover incidents paused by older workers too, without refreshing their
       // authorization, actual-effect budget, plan or resource ownership.
       if (incident.status === "paused" && recoveryErrors.has(incident.errorCode ?? "")) {
@@ -87,7 +87,7 @@ export class RotationStore {
     if (incident.terminatedAt) return { c, incident, h, physical, budget, attempt, steps, snapshot, action: { kind: "wait" as const, reason: "instance_busy" as const }, publication };
     if (action.kind !== "observe") {
       if (incident.pausedByUserId) action = { kind: "wait", reason: "instance_busy" };
-      else if (incident.errorCode === "recovery_retries_exhausted") action = { kind: "wait", reason: "instance_busy" };
+      else if (["recovery_retries_exhausted", "cloud_reset_pending", "cloud_reset_sync_failed"].includes(incident.errorCode ?? "")) action = { kind: "wait", reason: "instance_busy" };
       else if (incident.status === "paused" && incident.phase === "cloud") action = { kind: "wait", reason: "instance_busy" };
       else if (incident.trigger !== "manual" && !healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
       else if (c.physicalKey !== incident.physicalKey) action = { kind: "pause", reason: "remote_identity_changed" };
@@ -242,6 +242,7 @@ export class RotationStore {
         }
         await tx.update(rotationIncidents).set({ phase: "complete", status: "complete", errorCode: null, completedAt: run.h.now, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
         await tx.update(rotationLeases).set({ incidentId: null }).where(and(eq(rotationLeases.physicalKey, incident.physicalKey), eq(rotationLeases.incidentId, id)));
+        await tx.update(managedAddressSlots).set({ resetRecoveryRetries: 0 }).where(eq(managedAddressSlots.id, c.slot.id));
         if (run.attempt) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, run.attempt.id));
         await rotationAudit(tx, incident, "rotation.current_recovered");
       } else if (action.kind === "pause") await this.pauseIn(tx, incident, action.reason, run.h.now);
