@@ -397,6 +397,10 @@ resource.cleanup    retained | pending | released | failed
 - health/scheduled 事件保存探测上下文版本；manual 事件对应字段为空，不能伪造为已通过外部探测。
 - Linode 临时实例身份保存在步骤 receipt 和资源 snapshot 中，通过 [rotation-temporary-instances.ts](../packages/db/src/rotation-temporary-instances.ts) 提取，并无独立临时实例表。
 - `charged` 表示尝试预算记账；恢复原步骤不创建一次新的换址尝试。
+- 迁移 `0034_rotation-recovery-retries` 给 `rotation_policies` 增加 `max_recovery_retries`（默认 5，0–20，0 关闭自动重试），给 `rotation_incidents` 增加 `recovery_retries`（默认 0，0–20）、`recovery_retry_at`、`last_recovery_error`。现有策略原有 `max_attempts`、授权、开关和事件状态保持原值。
+- `recovery_retries` 记录本事件累计安排的自动恢复次数，跨步骤/候选及 cloud/publish/cleanup 阶段累计；普通重启不清零。重试等待期间 active，到期接续原步骤；耗尽后 exhausted，`error_code=recovery_retries_exhausted`，`last_recovery_error` 保留真实失败原因。显式人工恢复会重置恢复计数，并遵守原有预算段语义。
+- 清理步骤复用 `observe_deadline` 和 `fence`，失败恢复时间同时写入 Incident `recovery_retry_at` 和资源 `cleanup_due_at`。已确认未生效状态不可被旧 pending 观察覆盖；重新派发清除原 receipt，历史记录保留。无需在 0034 之外再新增迁移。
+- Linode 已确认失败的电源操作回执作为步骤计划中的 `retryReceipt` 保存；重新读取失败事件、操作者和事件水位后才可派发，历史观察记录保留。
 
 账号/服务层面的速率准入另由 [cloud-rotation-limits.ts](../packages/db/src/schema/cloud-rotation-limits.ts) 中的 `cloud_rotation_limit_switches`、`cloud_rotation_limit_policies`、`cloud_rotation_buckets`、`cloud_rotation_reservations` 保存。该限制与单次事件的尝试次数预算职责不同。
 

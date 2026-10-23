@@ -1,3 +1,4 @@
+import { cloudCallSignal } from "./call-context.js";
 import { CloudError } from "./errors.js";
 
 const origin = "https://api.linode.com/v4";
@@ -14,7 +15,7 @@ export class LinodeHttp {
     // A dispatched mutation is never automatically retried, including 429 and 5xx.
     let response: Response;
     try {
-      response = await this.fetcher(`${origin}${path}`, { method, redirect: "manual", signal: AbortSignal.timeout(10_000),
+      response = await this.fetcher(`${origin}${path}`, { method, redirect: "manual", signal: cloudCallSignal(10_000),
         headers: { Authorization: `Bearer ${this.token}`, Accept: "application/json", ...(options.body === undefined ? {} : { "Content-Type": "application/json" }), ...(options.filter ? { "X-Filter": JSON.stringify(options.filter) } : {}) },
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
       });

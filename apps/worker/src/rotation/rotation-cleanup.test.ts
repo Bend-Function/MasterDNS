@@ -95,6 +95,176 @@ async function cleanupFixture(origin: "system" | "user" = "system", family: "4" 
   return { ...f, resource: resource!, state, cleanup, incident: incident!, adapter };
 }
 
+let lightsailCleanupAddress = 10;
+async function lightsailCleanupFixture() {
+  const f = await cleanupFixture("user", "4", `198.51.100.${lightsailCleanupAddress++}`);
+  f.account.externalAccountId = String(100000000000 + Number.parseInt(randomUUID().replaceAll("-", "").slice(0, 9), 16));
+  await f.d.update(db.cloudAccounts).set({ externalAccountId: f.account.externalAccountId }).where(eq(db.cloudAccounts.id, f.account.id));
+  const instanceId = `arn:aws:lightsail:us-east-1:123456789012:Instance/${randomUUID()}`;
+  const resourceId = "arn:aws:lightsail:us-east-1:123456789012:StaticIp/old-static";
+  const physicalKey = JSON.stringify(["aws", f.account.externalAccountId, "lightsail", "us-east-1", instanceId]);
+  const inventory = structuredClone(f.resource.snapshot.inventory) as typeof f.live;
+  Object.assign(inventory.ref, { service: "lightsail", instanceId });
+  Object.assign(inventory, { nativeName: "instance", ipv6Only: false });
+  Object.assign(inventory.interfaces[0]!.addresses[0]!, { allocationId: "old-static", resourceId });
+  Object.assign(f.live.ref, { service: "lightsail", instanceId });
+  Object.assign(f.live, { nativeName: "instance", ipv6Only: false });
+  await f.d.insert(db.cloudScanScopes).values({ accountId: f.account.id, service: "lightsail", region: "us-east-1", generation: 1 });
+  await f.d.update(db.cloudInstances).set({ service: "lightsail", externalId: instanceId }).where(eq(db.cloudInstances.id, f.instance.id));
+  await f.d.update(db.rotationIncidents).set({ physicalKey, releaseOldAddress: true }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationAttempts).set({ beforeInventory: inventory }).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.update(db.rotationResources).set({ allocationId: "old-static", resourceId,
+    snapshot: { ...f.resource.snapshot, slot: { ...(f.resource.snapshot.slot as object), service: "lightsail", instanceId }, inventory, ownership: inventory.interfaces[0]!.addresses[0] },
+  }).where(eq(db.rotationResources.id, f.resource.id));
+  const state = { writes: [] as string[], present: true, failures: 1, pending: false, recreated: false };
+  const { LightsailCloudAdapter } = await import("@masterdns/cloud-providers");
+  const cloud = new LightsailCloudAdapter(f.account.id, { kind: "access_key", accessKeyId: "fake", secretAccessKey: "fake" }, { lightsailSend: async command => {
+    const name = command.constructor.name;
+    if (name === "GetInstanceCommand") return { instance: { arn: instanceId, name: "instance", isStaticIp: true, ipAddressType: "dualstack", publicIpAddress: f.address.address, state: { name: "running" } } };
+    if (name === "GetStaticIpCommand") {
+      if (!state.present) throw Object.assign(new Error("gone"), { name: "NotFoundException" });
+      return { staticIp: { name: "old-static", arn: state.recreated ? "arn:recreated" : resourceId, ipAddress: f.resource.address } };
+    }
+    if (name === "GetOperationCommand") return { operation: { id: (command.input as { operationId: string }).operationId, resourceName: "old-static", status: state.pending ? "Started" : "Failed", errorCode: "ServiceException" } };
+    state.writes.push(name);
+    if (state.writes.length > state.failures) state.present = false;
+    return { operations: [{ id: `release-${state.writes.length}`, status: "Started" }] };
+  } });
+  const adapter = { ...f.adapter, execute: cloud.execute.bind(cloud), observeDetails: cloud.observeDetails.bind(cloud) };
+  const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => adapter } as never);
+  await f.d.update(db.rotationPublications).set({ incidentId: f.incident.id }).where(eq(db.rotationPublications.slotId, f.slot.id));
+  return { ...f, cleanup, adapter, lightsail: state };
+}
+async function dueCleanup(f: Pick<Awaited<ReturnType<typeof cleanupFixture>>, "d" | "incident" | "resource" | "account">) {
+  await f.d.update(db.cloudRotationBuckets).set({ updatedAt: new Date(0) }).where(eq(db.cloudRotationBuckets.identityKey, JSON.stringify(["aws", f.account.externalAccountId, "lightsail"])));
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0), nextRunAt: new Date(0) }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+}
+it("automatically retries a failed Lightsail release and completes without allocating another IP", async () => {
+  const f = await lightsailCleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1, errorCode: "cleanup_failed" });
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.lightsail.writes).toEqual(["ReleaseStaticIpCommand"]);
+  await dueCleanup(f);
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.complete(f.incident.id);
+  expect(f.lightsail.writes).toEqual(["ReleaseStaticIpCommand", "ReleaseStaticIpCommand"]);
+  expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]!.cleanupStatus).toBe("released");
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", errorCode: null, recoveryRetries: 1 });
+  expect((await f.d.select().from(db.rotationPolicies).where(eq(db.rotationPolicies.slotId, f.slot.id)))[0]!.enabled).toBe(true);
+});
+it("limits failed Lightsail cleanup to five retries across worker restarts", async () => {
+  const f = await lightsailCleanupFixture(); f.lightsail.failures = 100;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: async () => f.adapter } as never);
+    await cleanup.run(f.resource.id, new Date());
+    await cleanup.run(f.resource.id, new Date());
+    const [incident] = await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id));
+    expect(incident).toMatchObject({ recoveryRetries: Math.min(attempt + 1, 5), status: attempt === 5 ? "exhausted" : "active" });
+    await dueCleanup(f);
+  }
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.lightsail.writes).toHaveLength(6);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBe("recovery_retries_exhausted");
+});
+it.each(["disabled", "paused", "revoked"])("does not reissue Lightsail cleanup when retry is %s", async mode => {
+  const f = await lightsailCleanupFixture();
+  if (mode === "disabled") await f.d.update(db.rotationPolicies).set({ maxRecoveryRetries: 0 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.run(f.resource.id, new Date());
+  if (mode === "paused") await f.d.update(db.rotationIncidents).set({ status: "paused", pausedByUserId: f.account.ownerUserId, errorCode: "manual_pause" }).where(eq(db.rotationIncidents.id, f.incident.id));
+  if (mode === "revoked") await f.d.update(db.instanceAuthorizations).set({ managed: false }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
+  await dueCleanup(f);
+  await f.cleanup.run(f.resource.id, new Date());
+  expect(f.lightsail.writes).toHaveLength(1);
+  if (mode === "disabled") expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "exhausted", recoveryRetries: 0 });
+});
+it("finishes Lightsail cleanup whose failed historical operation already removed the old IP", async () => {
+  const f = await lightsailCleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date()); f.lightsail.present = false;
+  await f.cleanup.run(f.resource.id, new Date());
+  await f.cleanup.complete(f.incident.id);
+  expect(f.lightsail.writes).toHaveLength(1);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.status).toBe("complete");
+});
+it("bounds stalled Lightsail cleanup observations while retaining the original release intent", async () => {
+  const f = await lightsailCleanupFixture(); f.lightsail.pending = true;
+  await f.d.update(db.rotationPolicies).set({ maxRecoveryRetries: 1 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  for (let n = 0; n < 2; n++) {
+    await f.d.update(db.rotationSteps).set({ observeDeadline: new Date(0) }).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+    await f.cleanup.run(f.resource.id, new Date());
+    if (n === 0) await dueCleanup(f);
+  }
+  expect(f.lightsail.writes).toEqual(["ReleaseStaticIpCommand"]);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "exhausted", recoveryRetries: 1, lastRecoveryError: "cleanup_convergence_timeout" });
+  const leases = await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.incidentId, f.incident.id));
+  expect(leases[0]!.unresolvedStepId).toBe(resource!.cleanupStepId);
+});
+it("preserves a confirmed Lightsail release failure against stale observations and receipts", async () => {
+  const f = await lightsailCleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  const [old] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, resource!.cleanupStepId!));
+  await f.cleanup.run(f.resource.id, new Date());
+  await (f.cleanup as any).receipt(f.resource, old!.id, { status: "pending", ...old!.receipt }, true, old!.fence);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, old!.id)))[0]!.status).toBe("not_applied");
+  await dueCleanup(f);
+  await f.cleanup.run(f.resource.id, new Date());
+  await (f.cleanup as any).receipt(f.resource, old!.id, old!.receipt, false, old!.fence);
+  expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, old!.id)))[0]!.receipt?.operationId).toBe("release-2");
+});
+it("keeps ambiguous Lightsail cleanup visibly failed and defers exhausted observation", async () => {
+  const f = await lightsailCleanupFixture();
+  await f.cleanup.run(f.resource.id, new Date());
+  f.lightsail.recreated = true;
+  await f.cleanup.run(f.resource.id, new Date());
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBe("cleanup_failed");
+  await f.d.update(db.rotationIncidents).set({ status: "exhausted", errorCode: "recovery_retries_exhausted" }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  const before = Date.now();
+  await f.cleanup.run(f.resource.id, new Date());
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  expect(resource).toMatchObject({ cleanupStatus: "failed", cleanupError: "cleanup_ownership_ambiguous" });
+  expect(resource!.cleanupDueAt!.getTime()).toBeGreaterThanOrEqual(before + 30000);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBe("recovery_retries_exhausted");
+  expect(f.lightsail.writes).toHaveLength(1);
+});
+it("defers 200 exhausted cleanup resources so newer due resources can run", async () => {
+  const f = await lightsailCleanupFixture();
+  const [resource] = await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id));
+  const [attempt] = await f.d.select().from(db.rotationAttempts).where(eq(db.rotationAttempts.id, f.resource.attemptId));
+  await f.d.update(db.rotationIncidents).set({ status: "exhausted", errorCode: "recovery_retries_exhausted", recoveryRetries: 5 }).where(eq(db.rotationIncidents.id, f.incident.id));
+  await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(1), cleanupStatus: "failed" }).where(eq(db.rotationResources.id, resource!.id));
+  for (let n = 0; n < 199; n++) {
+    const id = randomUUID();
+    await f.d.insert(db.rotationAttempts).values({ ...attempt!, id, sequence: n + 2 });
+    await f.d.insert(db.rotationResources).values({ ...resource!, id: randomUUID(), attemptId: id, cleanupDueAt: new Date(1), cleanupStatus: "failed" });
+  }
+  const next = await lightsailCleanupFixture();
+  await next.cleanup.recover();
+  expect(next.lightsail.writes).toEqual([]);
+  await next.cleanup.recover();
+  expect(next.lightsail.writes).toEqual(["ReleaseStaticIpCommand"]);
+});
+it.each(["identity", "inspect", "execute", "observe"])("releases the cleanup scanner when the %s call hangs", async stage => {
+  const f = await lightsailCleanupFixture();
+  await f.d.update(db.rotationPolicies).set({ cloudWaitSeconds: 10 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  if (stage === "observe") await f.cleanup.run(f.resource.id, new Date());
+  const never = async () => new Promise<never>(() => {});
+  const adapter = { ...f.adapter, ...(stage === "inspect" ? { inspect: never } : stage === "execute" ? { execute: never } : stage === "observe" ? { observeDetails: never } : {}) };
+  const cleanup = new RotationCleanupService({ db: f.d } as never, { adapter: stage === "identity" ? never : async () => adapter } as never);
+  const original = globalThis.setTimeout;
+  const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => original(callback, delay === 10000 ? 10 : delay, ...args)) as typeof setTimeout);
+  try { await cleanup.run(f.resource.id, new Date()); } finally { timer.mockRestore(); }
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ recoveryRetries: 1, errorCode: "cleanup_failed", lastRecoveryError: "rotation_call_timeout" });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, JSON.stringify(["aws", f.account.externalAccountId, "lightsail", "us-east-1", f.live.ref.instanceId]))))[0]!.holder).toBeNull();
+});
+
 it("refuses cleanup before dispatch when detailed observation is unavailable", async () => {
   const f = await cleanupFixture();
   const { observeDetails: _observeDetails, ...withoutDetailedObservation } = f.adapter;
@@ -208,6 +378,7 @@ it("observes a lost temporary Linode delete response after grant revocation with
   f.swap.lost = true;
   await f.cleanup.run(f.resource.id, new Date());
   await f.d.update(db.rotationPolicies).set({ linodeAllowTemporaryInstance: false }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.swap.writes).toHaveLength(1);
   expect(f.swap.observations).toBe(1);
@@ -270,6 +441,7 @@ it("waits quietly for a lifecycle hold while retaining observation of a dispatch
   f.state.lost = true;
   await f.cleanup.run(f.resource.id, new Date());
   await f.d.update(db.cloudInstanceControls).set({ powerHold: "manual_stop" }).where(eq(db.cloudInstanceControls.physicalKey, f.incident.physicalKey));
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(1);
   expect(f.state.observations).toBe(1);
@@ -374,6 +546,7 @@ it("does not clean before grace or while the old address is published, then obse
   expect(f.state.writes).toBe(1);
   const [step] = await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.attemptId, f.resource.attemptId));
   expect(step!.plan.arguments.phase).toBe("post_publish_cleanup");
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(1);
   expect(f.state.observations).toBe(1);
@@ -557,6 +730,7 @@ it("persists cleanup failure markers for the durable notification scanner", asyn
     phase: "cleanup",
     errorCode: "cleanup_failed",
   });
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBeNull();
 });
@@ -658,6 +832,7 @@ it.each(["pause", "revoke", "config"] as const)("observes an uncertain cleanup a
   if (change === "pause") await changeAdmission(f, "pause");
   if (change === "revoke") await f.d.update(db.instanceAuthorizations).set({ managed: false, revision: 2 }).where(eq(db.instanceAuthorizations.instanceId, f.instance.id));
   if (change === "config") await changeAdmission(f, "health config");
+  await dueCleanup(f);
   f.state.observationStatus = "pending";
   await f.cleanup.run(f.resource.id, new Date());
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(before!.cleanupStepId);
@@ -701,19 +876,23 @@ it("persists the entire cleanup chain before DELETE, advances only on observatio
   expect(f.state.writes).toBe(1);
   const release = steps.find(s => s.plan.action !== "linode.instance.reboot")!;
   const reboot = steps.find(s => s.plan.action === "linode.instance.reboot")!;
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(1);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "pending", cleanupStepId: reboot.id });
   await changeAdmission(f, "pause");
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(1);
   await f.d.transaction(async tx => db.resumeRotationIncident(tx, await db.lockRotationContext(tx, f.slot.id), f.incident.id, f.account.ownerUserId));
   await f.d.update(db.rotationResources).set({ cleanupDueAt: new Date(0) }).where(eq(db.rotationResources.id, f.resource.id));
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(2);
   await (f.cleanup as any).receipt(f.resource, release.id, { status: "applied", allocationId: f.resource.allocationId }, true);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStepId: reboot.id, cleanupStatus: "failed" });
   expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, f.incident.physicalKey)))[0]!.unresolvedStepId).toBe(reboot.id);
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(2);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: reboot.id });
@@ -796,6 +975,7 @@ it("retains legacy one-step cleanup IDs and receipts without rewriting the plan"
   const { cleanupResourceId: _, ...arguments_ } = step!.plan.arguments;
   await f.d.update(db.rotationSteps).set({ plan: { ...step!.plan, arguments: arguments_ } }).where(eq(db.rotationSteps.id, step!.id));
   await f.d.update(db.rotationResources).set({ snapshot: f.resource.snapshot }).where(eq(db.rotationResources.id, f.resource.id));
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(1);
   expect((await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.id, f.resource.id)))[0]).toMatchObject({ cleanupStatus: "released", cleanupStepId: step!.id, snapshot: f.resource.snapshot });
@@ -825,6 +1005,7 @@ it("still records an admitted reboot observation after a contradictory late rele
   f.state.lost = true;
   await f.cleanup.run(f.resource.id, new Date());
   await (f.cleanup as any).receipt(f.resource, release.id, { status: "applied", allocationId: "foreign-allocation" }, true);
+  await dueCleanup(f);
   await f.cleanup.run(f.resource.id, new Date());
   expect(f.state.writes).toBe(2);
   expect((await f.d.select().from(db.rotationSteps).where(eq(db.rotationSteps.id, reboot.id)))[0]!.status).toBe("applied");

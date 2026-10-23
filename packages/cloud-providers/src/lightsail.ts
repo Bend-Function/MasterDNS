@@ -1,3 +1,4 @@
+import { cloudCallSignal } from "./call-context.js";
 import { isIPv4 } from "node:net";
 import {
   DeleteInstanceCommand,
@@ -59,18 +60,20 @@ export class LightsailCloudAdapter implements CloudAdapter {
   }
 
   private stsSend(command: GetCallerIdentityCommand) {
+    const abortSignal = cloudCallSignal();
     return this.dependencies.stsSend?.(command)
-      ?? this.stsClient.send(command);
+      ?? this.stsClient.send(command, abortSignal ? { abortSignal } : {});
   }
 
   private lightsailSend(region: string, command: Parameters<AwsSend>[0]) {
+    const abortSignal = cloudCallSignal();
     if (this.dependencies.lightsailSend !== undefined) return this.dependencies.lightsailSend(command);
     let client = this.lightsailClients.get(region);
     if (client === undefined) {
       client = new LightsailClient({ ...this.clientOptions, region, credentials: this.credentialSource });
       this.lightsailClients.set(region, client);
     }
-    return (client.send.bind(client) as AwsSend)(command);
+    return (client.send.bind(client) as (command: Parameters<AwsSend>[0], options: { abortSignal?: AbortSignal }) => ReturnType<AwsSend>)(command, abortSignal ? { abortSignal } : {});
   }
 
   private async listStaticIps(region: string): Promise<StaticIp[]> {

@@ -175,7 +175,7 @@ function shutdown(args: RotationStepArguments): CloudStepResult {
   return receipt!;
 }
 function watermark(args: RotationStepArguments, action: string): number {
-  const value = args.receipt?.before?.eventWatermark ?? (action === "linode.instance.start" ? Number(shutdown(args).operationId) : swapReceipt(args).before?.eventWatermark);
+  const value = args.receipt?.before?.eventWatermark ?? (args.retryReceipt ? Number(args.retryReceipt.operationId) : action === "linode.instance.start" ? Number(shutdown(args).operationId) : swapReceipt(args).before?.eventWatermark);
   if (!Number.isSafeInteger(value) || Number(value) < 0) throw ambiguous();
   return Number(value);
 }
@@ -193,6 +193,11 @@ export async function executeLinodeSwap(step: CloudStep, adapter: LinodeCloudAda
     throw ambiguous();
   }
   const current = await target(args, adapter, true);
+  if (args.retryReceipt) {
+    if (!step.action.startsWith("linode.instance.")) throw ambiguous();
+    const failed = await observeLinodeSwap({ ...step, arguments: { ...step.arguments, retryReceipt: undefined, receipt: args.retryReceipt } }, adapter);
+    if (failed.status !== "not_applied" || current.metadata?.eventWatermark !== Number(failed.operationId)) throw new CloudError("remote_identity_changed", false);
+  }
   if (step.action === "linode.swap.delete") {
     const p = cleanupProof(args);
     await published(args, adapter, current, true);
@@ -227,11 +232,12 @@ export async function executeLinodeSwap(step: CloudStep, adapter: LinodeCloudAda
     return result(args, current, p);
   }
   const afterId = watermark(args, step.action);
-  if (current.metadata?.eventWatermark !== afterId) throw ambiguous();
+  if (current.metadata?.eventWatermark !== afterId) throw new CloudError("remote_identity_changed", false);
   if (step.action === "linode.instance.start") shutdown(args);
   const command = step.action === "linode.instance.stop" ? "shutdown" : step.action === "linode.instance.start" ? "boot" : "reboot";
   await adapter.http.request(`/linode/instances/${args.slot.instanceId}/${command}`, { method: "POST", body: command === "shutdown" ? {} : { config_id: current.metadata!.configId } });
   const powerReceipt = result(args, current, p, true);
+  powerReceipt.before = { ...powerReceipt.before, eventWatermark: afterId };
   return { ...powerReceipt, after: { ...powerReceipt.after, powerActionRequested: command } };
 }
 
@@ -276,7 +282,10 @@ export async function observeLinodeSwap(step: CloudStep, adapter: LinodeCloudAda
     if (events.length !== 1) throw ambiguous();
     const event = events[0]!;
     if (event.username !== args.before.metadata?.authenticatedUsername || args.receipt?.operationId && args.receipt.operationId !== String(event.id)) throw ambiguous();
-    if (event.status === "failed") throw new CloudError("cloud_operation_failed", false, undefined, `linode_${action}_failed`);
+    if (event.status === "failed") {
+      if (current.state !== (step.action === "linode.instance.start" ? "offline" : "running")) throw new CloudError("cloud_operation_failed", false);
+      return { ...receipt, operationId: String(event.id), after: { ...receipt.after, eventStatus: "failed", powerState: current.state }, status: "not_applied" };
+    }
     const desired = step.action === "linode.instance.stop" ? "offline" : "running";
     return { ...receipt, operationId: String(event.id), after: { ...receipt.after, eventStatus: event.status, powerState: current.state }, status: ["finished", "completed"].includes(event.status ?? "") && current.state === desired ? "applied" : "pending" };
   } catch (error) {

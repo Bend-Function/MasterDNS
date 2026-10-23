@@ -15,6 +15,35 @@ const plan = (s = slot, i = inventory): CloudStep[] => providers.planCloudRotati
 }));
 const adapter = (send: (c: any) => Promise<any>) => new providers.LightsailCloudAdapter("local", { kind: "access_key", accessKeyId: "fake", secretAccessKey: "fake" }, { lightsailSend: send });
 
+it.each([false, true])("reconciles a failed release against the actual static IP (already removed: %s)", async removed => {
+  const ownershipSnapshot = { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: "old-static", resourceId: "arn:static:old", address: slot.address };
+  const step = providers.planCloudRotationCleanup(slot, inventory, { attemptId: "attempt-1", releaseAuthorized: true, publishedAddress: "198.51.100.2", ownershipSnapshot })[0]!;
+  step.arguments.receipt = { operationId: "failed-release", allocationId: "old-static", resourceId: "arn:static:old" };
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "GetInstanceCommand") return { instance: { ...instance, publicIpAddress: "198.51.100.2" } };
+    if (c.constructor.name === "GetOperationCommand") return { operation: { id: "failed-release", resourceName: "old-static", status: "Failed", errorCode: "ServiceException" } };
+    if (c.constructor.name === "GetStaticIpCommand") {
+      if (removed) throw Object.assign(new Error("missing"), { name: "NotFoundException" });
+      return { staticIp: { name: "old-static", arn: "arn:static:old", ipAddress: slot.address } };
+    }
+    throw new Error("unexpected mutation");
+  });
+  expect(await cloud.observeDetails(step)).toMatchObject({ status: removed ? "applied" : "not_applied" });
+});
+it.each(["recreated", "attached", "still_pending", "malformed"])("does not retry failed Lightsail release with %s evidence", async scenario => {
+  const ownershipSnapshot = { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: "old-static", resourceId: "arn:static:old", address: slot.address };
+  const step = providers.planCloudRotationCleanup(slot, inventory, { attemptId: "attempt-1", releaseAuthorized: true, publishedAddress: "198.51.100.2", ownershipSnapshot })[0]!;
+  step.arguments.receipt = { operationIds: ["failed", "other"], resourceId: "arn:static:old" };
+  const cloud = adapter(async c => {
+    if (c.constructor.name === "GetInstanceCommand") return { instance: { ...instance, publicIpAddress: "198.51.100.2" } };
+    if (c.constructor.name === "GetOperationCommand") return { operation: { id: c.input.operationId, resourceName: "old-static", status: c.input.operationId === "failed" ? "Failed" : "Started" } };
+    if (c.constructor.name === "GetStaticIpCommand") return scenario === "malformed" ? {} : { staticIp: { name: "old-static", arn: scenario === "recreated" ? "different-arn" : "arn:static:old", ipAddress: slot.address, ...(scenario === "attached" ? { attachedTo: "another-instance" } : {}) } };
+    throw new Error("unexpected mutation");
+  });
+  if (scenario === "malformed") await expect(cloud.observeDetails(step)).rejects.toMatchObject({ code: "unknown_cloud_error" });
+  else expect(await cloud.observeDetails(step)).toMatchObject({ status: scenario === "still_pending" ? "pending" : "ambiguous" });
+});
+
 it("plans static allocation, detach, attach with no implicit release", () => {
   expect(plan().map(s => s.action)).toEqual(["lightsail.static-ip.allocate", "lightsail.static-ip.detach", "lightsail.static-ip.attach"]);
 });

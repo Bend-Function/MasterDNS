@@ -62,6 +62,14 @@ describe("Linode identity and inventory", () => {
 });
 
 describe("Linode conditional rotation", () => {
+  it("rejects a changed event watermark before power dispatch so an old reboot cannot satisfy recovery", async () => {
+    const { adapter, state, steps } = await setup();
+    const allocation = await adapter.execute(steps[0]!);
+    state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished" });
+    const step = withArgs(steps[1]!, { candidateReceipt: allocation });
+    await expect(adapter.execute(step)).rejects.toMatchObject({ code: "remote_identity_changed" });
+    expect(state.writes).toHaveLength(1);
+  });
   it("shuts down and boots only when the stop-start strategy is selected", async () => {
     const { adapter, state, inventory } = await setup();
     const steps = planLinodeRotation(slot, inventory, { attemptId: "stop-start", allowStop: true, linodeRestartMode: "stop_start" });
@@ -124,7 +132,7 @@ describe("Linode conditional rotation", () => {
     expect(await adapter.observeDetails(withArgs(reboot, { previousExecution: true }))).toMatchObject({ status: "applied", operationId: "11" });
     await adapter.execute(withArgs(reboot, { previousExecution: true })); expect(state.writes).toHaveLength(2);
   });
-  it("rejects multiple matching events and failed events", async () => { const { adapter, state, steps } = await setup(); const allocation = await adapter.execute(steps[0]!); const step = withArgs(steps[1]!, { candidateReceipt: allocation }); state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "failed" }); await expect(adapter.observeDetails(step)).rejects.toMatchObject({ code: "cloud_operation_failed" }); state.events.push({ ...state.events[1]!, id: 12 }); expect(await adapter.observeDetails(step)).toMatchObject({ status: "ambiguous" }); });
+  it("rejects multiple matching events and identifies a failed event for safe retry", async () => { const { adapter, state, steps } = await setup(); const allocation = await adapter.execute(steps[0]!); const step = withArgs(steps[1]!, { candidateReceipt: allocation }); state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "failed" }); expect(await adapter.observeDetails(step)).toMatchObject({ status: "not_applied", operationId: "11" }); state.events.push({ ...state.events[1]!, id: 12 }); expect(await adapter.observeDetails(step)).toMatchObject({ status: "ambiguous" }); });
   it("ignores a reboot for another Linode", async () => {
     const { adapter, state, steps } = await setup(); const allocation = await adapter.execute(steps[0]!);
     state.events.push({ id: 11, action: "linode_reboot", entity: { type: "linode", id: 43 }, status: "finished" });
@@ -172,6 +180,16 @@ describe("Linode conditional rotation", () => {
 
 describe("Linode cleanup", () => {
   async function cleanupSetup() { const f = await setup(); const allocation = await f.adapter.execute(f.steps[0]!); const original = f.inventory.interfaces[0]!.addresses[0]!; const options = { attemptId: "attempt", allowStop: true, releaseAuthorized: true, publishedAddress: next, ownershipSnapshot: { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: original.allocationId!, resourceId: original.resourceId!, address: old } }; return { ...f, allocation, options }; }
+  it("keeps failed cleanup reboots out of the cloud-phase automatic retry path", async () => {
+    const { adapter, state, inventory, options, allocation } = await cleanupSetup();
+    const steps = planLinodeCleanup(slot, inventory, options);
+    const release = await adapter.execute(withArgs(steps[0]!, { candidateReceipt: allocation }));
+    const reboot = withArgs(steps[1]!, { candidateReceipt: allocation, priorReceipts: [{ action: "linode.ipv4.release", receipt: release }] });
+    const receipt = await adapter.execute(reboot);
+    state.events.push({ id: 12, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "failed" });
+    await expect(adapter.observeDetails(withArgs(reboot, { receipt }))).rejects.toMatchObject({ code: "cloud_operation_failed" });
+    expect(state.writes).toHaveLength(3);
+  });
   it("plans release, shutdown and boot for stop-start cleanup", async () => {
     const { inventory, options } = await cleanupSetup();
     expect(planLinodeCleanup(slot, inventory, { ...options, linodeRestartMode: "stop_start" }).map(step => step.action)).toEqual(["linode.ipv4.release", "linode.instance.stop", "linode.instance.start"]);

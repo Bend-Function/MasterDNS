@@ -34,6 +34,8 @@ export type RotationStepArguments = LinodeSwapOptions & {
   before: CloudInventory;
   phase: "rotation" | "post_publish_cleanup";
   receipt?: CloudStepResult;
+  /** Confirmed failed operation retained when retrying this exact durable step. */
+  retryReceipt?: CloudStepResult;
   /** Persisted applied allocation observation, carried into subsequent provider steps. */
   candidateReceipt?: CloudStepResult;
   /** Trusted receipts from earlier persisted applied steps, in execution order. */

@@ -209,6 +209,16 @@ flowchart LR
 
 一次 Incident 下有预算段、Attempt 和多个 Step。换址次数按尝试的效果记账，恢复已有尝试不应被计为一次新换址。账号/服务层面的速率预算另由 `cloud_rotation_*` 表控制。
 
+2026-10-23 增补失败恢复：云端阶段的临时运行错误、观察异常、云端收敛超时和已确认未生效步骤，在原 Incident 内自动接续。清理阶段复用同一调用超时与持久恢复调度，整次事件的 cloud/publish/cleanup 累计最多 maxRecoveryRetries 次恢复，不按阶段刷新次数。`maxRecoveryRetries` 默认 5（首次失败后最多 5 次重试），独立于按实际效果记账的 `maxAttempts`。恢复次数、重试时间、最近错误都持久保存；普通进程重启、Redis 重新投递和候选推进不会清零，显式人工恢复才重置恢复次数。重试间隔采用 `minIntervalSeconds`，云厂商 Retry-After 较长时取较晚时间，重试期间保持 active，避免周期调度误判为需人工暂停。
+
+Processor 对创建适配器/身份校验、清单读取、执行和观察的每次等待设为 `min(cloudWaitSeconds, 30)` 秒，在 45 秒物理租约前释放当前队列执行。超时发出调用级取消信号，HTTP/SDK 在每次派发前检查，阻止迟到预检查继续发送新请求；已送达云端的请求仍可能生效，取消不能作为未生效的证明：派发意图与 unresolved fence 保留，迟到的执行回执仍归入原步骤历史；较旧派发 fence 的回执与错误不能覆盖新一轮派发，已确认未生效的状态也不被迟到执行回执降回 pending；恢复先观察，不启动另一个换址计划。观察窗口过期只延长原步骤观察窗口并消耗恢复次数。明确 `not_applied` 或可重试的无效果拒绝才允许重新准备原步骤，并保留已完成的申请、候选资源、计费与审计记录。
+
+恢复达到上限后状态为 exhausted、错误为 `recovery_retries_exhausted`；不新增云写入、不刷新预算，不调用人工终止逻辑，也不关闭自动轮换开关。保留未决效果的只读核对和物理隔离，避免其他事件跨过不确定步骤。人工暂停/终止、授权撤销、配置版本变化、归属不明、永久权限/配额错误继续阻止自动写入。旧版因可恢复错误而 paused 的 cloud 事件也进入相同的有界恢复流程。任务关联的 PublicationService 也使用有界身份校验/清单读取；临时失败持久安排恢复，独立 publication scanner 与 rotation processor 都尊重恢复截止时间。DNS 部分发布先安排一次恢复，到期只重新投递失败的 Operation/Step，保留成功记录；paused/exhausted 不重投递，耗尽原因不被观察扫描覆盖。无 Incident 的首次绑定发布保持原有语义。健康候选验证仍要求新鲜证据，不把探针不足视为故障或强行发布。已 complete 的事件不能被迟到错误重新激活。
+
+CleanupService 的身份读取、清单、执行和观察都使用同一有界云调用机制。清理步骤保存 observeDeadline；pending 超过收敛窗口会消耗一次恢复并继续观察原步骤，明确 not_applied 才可重新派发，派发时清空旧操作回执并保存新的 fence。旧 fence 回执及已确认失败后的迟到 pending 只进入历史，不能覆盖已确认结果。failed 资源在 pending 观察时保留失败原因，直到步骤成功或明确重试推进。清理 prerequisites（发布/TTL、归属、授权）仍独立检查，缺失时不会刷新恢复预算或绕过校验。
+
+Lightsail 释放优先核对原静态 IP：NotFound 可确认已释放，不受历史失败 operation 阻挡；原 ARN/地址仍存在且未附着时，读取该派发的全部操作。全部结束且至少一项 Failed 才返回 not_applied；仍有 Started 则继续观察，身份变化则 ambiguous。失败重试只重做 ReleaseStaticIp，不重放申请、解绑、绑定或 DNS 发布。恢复扫描按 cleanupDueAt 排序；租约冲突及已耗尽、无需观察的资源延后，避免前 200 个旧任务长期占据扫描页。任务 UI 单独映射 active 为执行中，错误/恢复等待展示失败或重试中，不能用健康状态的“正常”代表任务成功。
+
 ### 7.4 并发与旧任务隔离
 
 - `physicalKey` 由厂商、外部账号、服务、区域、实例远端 ID 组成。同一实际实例即使通过不同本地账号别名访问，也需按物理身份协调。

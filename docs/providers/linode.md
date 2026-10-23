@@ -52,3 +52,11 @@ Helper disabled or unknown, multiple/unknown boot profiles, non-default boot mod
 SLAAC IPv6 is hardware-derived and immutable for this purpose: MasterDNS can bind and monitor the actual global SLAAC host address, but cannot replace, remove, or transfer it. Link-local addresses and routed prefixes are never offered as candidates. Routed IPv6 ranges require guest address configuration; publishing an invented host from a prefix would not configure the guest. See [IPv6](https://techdocs.akamai.com/cloud-computing/docs/an-overview-of-ipv6-on-linode) and [managing addresses](https://techdocs.akamai.com/cloud-computing/docs/managing-ip-addresses-on-a-compute-instance).
 
 Implementation references were checked against official Akamai documentation on 2026-09-30. HTTP-fake tests perform no live cloud mutations.
+
+## 换址电源步骤失败恢复（2026-10-23）
+
+额外 IPv4 和临时实例交换两条路径中，已匹配原操作者、目标实例和事件 ID 的失败电源操作，可在实例仍处于可重试状态时确认为 `not_applied`。自动重试保留原候选地址、临时实例和交换结果，只重试失败的 reboot/shutdown/boot 步骤；派发前重新验证失败事件及当前事件水位，并把该事件 ID 作为新观察起点。出现其他事件、资源变化或效果不明确时停止重放。
+
+自动恢复上限来自换址策略的 `maxRecoveryRetries`，默认 5，跨 Worker 重启持久保存。超时或网络错误本身不允许重做 IPv4 分配、临时实例创建或地址交换；这些情况仍核对原步骤，保留不确定操作的物理隔离。清理阶段保持独立恢复语义。详见[自动恢复验证记录](../validation/2026-10-23-rotation-recovery.md)。
+
+额外 IPv4 路径的电源操作现在也要求派发前的当前事件水位与持久化水位相同（含清理 reboot/stop/start）。若中间发生其他操作，返回 remote_identity_changed 并保留为未派发的拒绝，不会把该旧事件归因于丢失响应的本次操作。临时实例交换路径及失败电源重试的前置校验也使用 remote_identity_changed 明确拒绝；不能仅返回会进入观察恢复的归属不明错误，否则旧事件仍可能被误归因。

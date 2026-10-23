@@ -20,6 +20,25 @@
 - 使用 Provider Fake 验证限流、权限、超时和读取验证流程。
 - 在隔离 PostgreSQL 中从持久健康/轮换状态重建通知，使用 Fake Queue 验证 Redis wake 丢失后的稳定去重、跨 Pool 同 owner 路由和敏感字段隔离；不调用真实 Webhook、Telegram 或收件人。
 
+### 换址失败恢复回归（2026-10-23）
+
+使用隔离 PostgreSQL 的 `MASTERDNS_TEST_DATABASE_URL` 和隔离 Redis 的 `MASTERDNS_TEST_REDIS_URL`，先运行 `pnpm build:packages`，再运行：
+
+```bash
+pnpm --filter @masterdns/worker exec vitest run src/rotation --maxWorkers=3
+pnpm --filter @masterdns/db exec vitest run src/rotation-recovery-migration.test.ts src/rotation-schema.test.ts src/interval-rotation-migration.test.ts
+pnpm --filter @masterdns/cloud-providers test
+pnpm --filter @masterdns/contracts test
+pnpm --filter @masterdns/api exec vitest run src/modules/rotation
+pnpm --filter @masterdns/web test
+pnpm typecheck
+pnpm lint
+```
+
+追加检查：发布身份/清单挂起后退出，任务关联的 DNS 失败按预算等待再投递且保留成功步骤，人工暂停/耗尽不重投递，complete 不因迟到失败复活；Azure operation 404/失败时核对实际资源并保留旧计划 GUID/发布地址校验；EC2 缺字段响应不能冒充清理成功；Linode 派发前事件水位变化拒绝执行。
+
+验收要求：首次失败后最多 5 次自动恢复，0/自定义上限生效；重启与重复入队不刷新计数；重试间隔与 Retry-After 生效；云请求挂起能释放队列执行并保留迟到回执；明确未生效重试保留原申请和预算；收敛超时继续观察而不重放不确定写入；旧版临时暂停可接续；人工暂停/终止、授权撤销和归属不明仍受保护；scheduled 恢复期间不暂停周期计划；升级保留原开关与换址预算并校验范围约束。Lightsail 清理必须覆盖真实 adapter + Fake SDK 的失败释放后重试完成、首次加 5 次重试耗尽、旧 IP 已删除但旧操作失败、并行操作未结束/资源重建/附着变化拒绝重放，以及 200 个耗尽任务不阻塞后续扫描；cleanup 四种云调用挂起都应退出，旧 pending 不覆盖 confirmed not_applied，页面不再将 active 显示为正常。Linode 电源失败需通过失败事件水位和原资源身份复核后重试，不能重复建临时实例或交换地址。Fake 云用例不构成真实云或生产验收。
+
 ### 端到端测试
 
 - 管理员创建用户及权限隔离。

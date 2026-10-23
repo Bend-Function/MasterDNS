@@ -11,6 +11,13 @@ const eni = { NetworkInterfaceId: "eni-main", Attachment: { InstanceId: "i-one",
 const plan = (s = slot, i = inventory, allowStop = false) => providers.planCloudRotation(s, i, { allowStop, attemptId: "attempt-1" });
 const adapter = (send: (c: any) => Promise<any>) => new providers.Ec2CloudAdapter("local", credentials, { ec2Send: send });
 
+it("does not interpret a malformed EC2 allocation response as successful cleanup", async () => {
+  const before: CloudInventory = { ...inventory, interfaces: [{ ...inventory.interfaces[0]!, addresses: [{ address: slot.address, family: 4, primary: true, allocationId: "eipalloc-old", privateAddress: "10.0.0.1" }] }] };
+  const step = providers.planCloudRotationCleanup(slot, before, { attemptId: "attempt-1", releaseAuthorized: true, publishedAddress: "198.51.100.2", ownershipSnapshot: { accountId: slot.accountId, instanceId: slot.instanceId, interfaceId: slot.interfaceId, allocationId: "eipalloc-old", address: slot.address } })[0]!;
+  const cloud = adapter(async command => command.constructor.name === "DescribeNetworkInterfacesCommand" ? { NetworkInterfaces: [eni] } : {});
+  await expect(cloud.observeDetails(step)).rejects.toMatchObject({ code: "unknown_cloud_error" });
+});
+
 it.each([
   { label: "changed allocation", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: "substituted", publicIp: "198.51.100.2" },
   { label: "changed address", proof: { allocationId: "intended", candidateAddress: "198.51.100.2" }, allocationId: "intended", publicIp: "198.51.100.99" },

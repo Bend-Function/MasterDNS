@@ -1,5 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { rotationLimitWait } from "./rotation-display";
+import { rotationLimitWait, rotationStatusValue } from "./rotation-display";
+
+it("does not show cleanup failures or active rotations as normal", () => {
+  expect(rotationStatusValue({ status: "active", errorCode: "cleanup_failed" })).toBe("failed");
+  expect(rotationStatusValue({ status: "active", errorCode: "cleanup_failed", recoveryRetryAt: "2026-10-23T00:00:00Z" })).toBe("retrying");
+  expect(rotationStatusValue({ status: "active", errorCode: null })).toBe("running");
+  expect(rotationStatusValue({ status: "active", errorCode: null }, [{ cleanupStatus: "failed" }])).toBe("failed");
+  expect(rotationStatusValue({ status: "exhausted", errorCode: "recovery_retries_exhausted" })).toBe("exhausted");
+  expect(rotationStatusValue({ status: "complete", errorCode: null })).toBe("succeeded");
+});
 
 describe("rotation rate-limit display", () => {
   it("presents incident deferral as waiting and uses the exact next-run time", () => {

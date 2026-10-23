@@ -4,6 +4,10 @@
 
 2026-10-11 增补地址健康策略删除功能及其权限、版本与轮换依赖限制。该增量的实现和验证范围见[地址健康策略删除记录](validation/2026-10-11-health-policy-deletion.md)；基础架构基线和历史验收范围保持原有标注。
 
+2026-10-23 增补云端换址失败自动恢复：新增默认 5 次的独立重试上限、云请求超时退出和持久恢复记录，并补齐 AWS Lightsail 清理失败恢复与任务状态显示，保留换址进度及自动开关。该增量基于已检查的 `2fb6238` 工作树，范围与验证见[换址自动恢复记录](validation/2026-10-23-rotation-recovery.md)；不扩大前述历史基线的验收范围。
+
+同日继续检查其余厂商和发布路径，修复 Azure 异步记录过期后无法完成清理、Linode 旧重启事件误归因、EC2 缺字段响应误判，以及发布超时/无限重投递；详见[后续恢复审查](validation/2026-10-23-rotation-follow-up-audit.md)。
+
 ## 阅读入口
 
 - [系统架构](ARCHITECTURE.md)：运行拓扑、代码分层、领域边界、核心流程、并发与故障恢复；建议先读。
@@ -23,6 +27,7 @@
 
 - [新增云厂商指南](providers/ADDING_PROVIDER.md)：注册目录、能力接口、持久扩展和验收步骤。
 - [Azure](providers/azure.md)、[Linode](providers/linode.md)：支持拓扑、授权、换址与恢复限制。
+- [AWS Lightsail 清理恢复](providers/aws-lightsail.md)：失败释放、真实资源读回、重试和界面状态。
 - [AWS 控制平面验收入口](validation/aws-control-plane.md)。
 - [多云换址闭环验证](validation/multicloud-ip-rotation.md)、[Probe 二进制联调](validation/probe-binary-integration.md)、[Azure/Linode 验证记录](validation/azure-linode.md)。
 - `validation/` 其余文件按专题和日期保存证据；`superpowers/specs/` 与 `superpowers/plans/` 保存专题设计和实施记录。历史记录只对注明的提交、环境和范围有效。

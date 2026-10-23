@@ -83,6 +83,144 @@ async function fixture(family: "4" | "6" = "4", trigger: "health" | "scheduled" 
   return { owner: owner!, account: account!, instance: instance!, iface: iface!, address: address!, slot: slot!, config: config!, group: group!, healthPolicy: healthPolicy!, health: health!, incident, state, inventory, adapter, store, runtime, processor };
 }
 async function drive(f: Awaited<ReturnType<typeof fixture>>, turns = 5) { for (let n = 0; n < turns; n++) await f.processor.run(f.incident.id); }
+it("automatically recovers a transient preparation failure without disabling rotation", async () => {
+  const f = await fixture();
+  const inspect = f.adapter.inspect;
+  f.adapter.inspect = async () => { throw new CloudError("temporary_cloud_error", true); };
+  await drive(f, 1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1 });
+  f.adapter.inspect = inspect;
+  await drive(f, 1);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(0);
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second', next_run_at = now() where id = ${f.incident.id}`;
+  await drive(f, 1);
+  expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toHaveLength(1);
+  expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]!.enabled).toBe(true);
+});
+it("does not revive a completed incident when a late failure arrives", async () => {
+  const f = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "complete", phase: "complete", completedAt: new Date() }).where(eq(rotationIncidents.id, f.incident.id));
+  await f.store.pause(f.incident.id, "rotation_runtime_failed");
+  await f.processor.run(f.incident.id);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "complete", phase: "complete", recoveryRetries: 0 });
+  expect(f.state.writes).toEqual([]);
+});
+it("persists a maximum of five automatic retries across processor restarts", async () => {
+  const f = await fixture();
+  f.adapter.inspect = async () => { throw new CloudError("temporary_cloud_error", true); };
+  for (let n = 0; n < 6; n++) {
+    const restarted = new RotationProcessor(new RotationStore({ db: connection.db } as never), f.runtime as never, {} as never);
+    await restarted.run(f.incident.id);
+    const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+    expect(incident).toMatchObject({ recoveryRetries: Math.min(n + 1, 5), status: n === 5 ? "exhausted" : "active" });
+    await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second', next_run_at = now() where id = ${f.incident.id}`;
+  }
+  await drive(f, 3);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ recoveryRetries: 5, errorCode: "recovery_retries_exhausted" });
+  expect((await connection.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, f.slot.id)))[0]!.enabled).toBe(true);
+});
+it("retries a confirmed unapplied cloud step without losing the applied allocation", async () => {
+  const f = await fixture();
+  await drive(f, 4);
+  const stepId = f.state.writes[1]!;
+  await f.store.saveReceipt(f.incident.id, stepId, { status: "not_applied" } as never, true);
+  await drive(f, 1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1 });
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second', next_run_at = now() where id = ${f.incident.id}`;
+  await drive(f, 2);
+  expect(f.state.writes).toEqual([f.state.writes[0], stepId, stepId]);
+  expect(f.state.count).toBe(1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]!.phase).toBe("candidate");
+});
+it("archives a late receipt from an older dispatch without overwriting the retried step", async () => {
+  const f = await fixture(); await drive(f, 4);
+  const stepId = f.state.writes[1]!;
+  const [old] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, stepId));
+  await f.store.saveReceipt(f.incident.id, stepId, { status: "not_applied" } as never, true);
+  await drive(f, 1);
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${f.incident.id}`;
+  const execute = f.adapter.execute;
+  f.adapter.execute = async plan => ({ ...await execute(plan), before: { eventWatermark: 200 } });
+  await drive(f, 1);
+  await f.store.saveReceipt(f.incident.id, stepId, { ...old!.receipt, before: { eventWatermark: 100 } }, false, old!.fence!);
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)))[0]).toMatchObject({ status: "pending", receipt: { before: { eventWatermark: 200 } } });
+  const history = await connection.db.select().from(rotationStepObservations).where(eq(rotationStepObservations.stepId, stepId));
+  expect(history.some(row => (row.result.before as { eventWatermark?: number })?.eventWatermark === 100)).toBe(true);
+});
+it("preserves a definitive failure when its execution receipt arrives during retry cooldown", async () => {
+  const f = await fixture(); await drive(f, 4);
+  await connection.db.update(rotationPolicies).set({ maxRecoveryRetries: 1 }).where(eq(rotationPolicies.slotId, f.slot.id));
+  const stepId = f.state.writes[1]!;
+  const [old] = await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, stepId));
+  await f.store.saveReceipt(f.incident.id, stepId, { status: "not_applied", before: { eventWatermark: 100 } } as never, true);
+  await drive(f, 1);
+  await f.store.saveReceipt(f.incident.id, stepId, old!.receipt!, false, old!.fence!);
+  expect((await connection.db.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)))[0]!.status).toBe("not_applied");
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${f.incident.id}`;
+  await drive(f, 2);
+  expect(f.state.writes).toHaveLength(3);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1, phase: "candidate" });
+});
+it.each(["identity", "inspect", "observe"])("honors Retry-After for %s failures", async stage => {
+  const f = await fixture();
+  if (stage === "observe") await drive(f, 2);
+  const failed = async () => { throw new CloudError("rate_limited", true, 600_000); };
+  if (stage === "identity") f.runtime.adapter = failed;
+  else if (stage === "inspect") f.adapter.inspect = failed;
+  else f.adapter.observeDetails = failed;
+  const before = Date.now();
+  await drive(f, 1);
+  const [incident] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
+  expect(incident!.recoveryRetryAt!.getTime()).toBeGreaterThanOrEqual(before + 600_000);
+  expect(incident!.nextRunAt).toEqual(incident!.recoveryRetryAt);
+});
+it("restarts observation after a convergence deadline without replaying uncertain cloud writes", async () => {
+  const f = await fixture(); await drive(f, 2);
+  f.state.observationStatus = "pending";
+  await connection.db.update(rotationSteps).set({ observeDeadline: new Date(0) }).where(eq(rotationSteps.id, f.state.writes[0]!));
+  await drive(f, 1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1 });
+  await drive(f, 2);
+  expect(f.state.observations).toHaveLength(1);
+  expect(f.state.writes).toHaveLength(1);
+});
+it("automatically recovers legacy runtime pauses but preserves manual pauses and changed authorization", async () => {
+  const legacy = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "paused", errorCode: "rotation_runtime_failed" }).where(eq(rotationIncidents.id, legacy.incident.id));
+  await drive(legacy, 1);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, legacy.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1 });
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${legacy.incident.id}`;
+  await connection.db.update(instanceAuthorizations).set({ managed: false }).where(eq(instanceAuthorizations.instanceId, legacy.instance.id));
+  await drive(legacy, 2);
+  expect(legacy.state.writes).toEqual([]);
+  const manual = await fixture();
+  await connection.db.update(rotationIncidents).set({ status: "paused", pausedByUserId: manual.owner.id, errorCode: "rotation_runtime_failed" }).where(eq(rotationIncidents.id, manual.incident.id));
+  await drive(manual, 3);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, manual.incident.id)))[0]).toMatchObject({ status: "paused", recoveryRetries: 0 });
+  expect(manual.state.writes).toEqual([]);
+});
+it("keeps a zero-retry limit exhausted when uncertain observations continue failing", async () => {
+  const f = await fixture(); await drive(f, 2);
+  await connection.db.update(rotationPolicies).set({ maxRecoveryRetries: 0 }).where(eq(rotationPolicies.slotId, f.slot.id));
+  f.adapter.observeDetails = async () => { throw new CloudError("cloud_operation_failed", false); };
+  await drive(f, 4);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "exhausted", recoveryRetries: 0, errorCode: "recovery_retries_exhausted", lastRecoveryError: "cloud_operation_failed" });
+  expect(f.state.writes).toHaveLength(1);
+  expect((await connection.db.select().from(rotationLeases).where(eq(rotationLeases.incidentId, f.incident.id)))[0]!.unresolvedStepId).toBe(f.state.writes[0]);
+});
+it("continues a scheduled incident after recovery without pausing its schedule", async () => {
+  const f = await fixture("4", "scheduled");
+  const inspect = f.adapter.inspect;
+  f.adapter.inspect = async () => { throw new CloudError("temporary_cloud_error", true); };
+  await drive(f, 1);
+  const { reconcileRotationSchedule } = await import("@masterdns/db");
+  await connection.db.transaction(async tx => { await lockRotationContext(tx, f.slot.id); await reconcileRotationSchedule(tx, f.slot.id); });
+  expect((await connection.db.select().from(rotationSchedules).where(eq(rotationSchedules.slotId, f.slot.id)))[0]).toMatchObject({ pausedReason: null, enabled: true });
+  f.adapter.inspect = inspect;
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${f.incident.id}`;
+  await drive(f, 5);
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "candidate", recoveryRetries: 1 });
+});
 it("rejects an incomplete rotation capability before persisting a cloud attempt", async () => {
   const f = await fixture();
   // Inventory adapters may expose optional observations without implementing writes.
@@ -240,15 +378,15 @@ it.each(["4", "6"] as const)("publishes a verified IPv%s health rotation without
   expect(f.state.count).toBe(1);
 });
 
-it("resumes a paused unbound publication, waits for fresh evidence, and keeps its original candidate and attempt", async () => {
+it("automatically recovers an unbound publication, waits for fresh evidence, and keeps its original candidate and attempt", async () => {
   const f = await publishingFixture();
   const [before] = await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id));
   const writes = [...f.state.writes];
   await f.store.pause(f.incident.id, "rotation_runtime_failed");
   await f.processor.run(f.incident.id);
-  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "paused", errorCode: "rotation_runtime_failed" });
+  expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1, errorCode: "rotation_runtime_failed" });
   await connection.db.update(addressHealthStates).set({ evidenceExpiresAt: new Date(0) }).where(eq(addressHealthStates.id, f.health.id));
-  await connection.db.transaction(async tx => resumeRotationIncident(tx, await lockRotationContext(tx, f.slot.id), f.incident.id, f.owner.id));
+  await connection.db.update(rotationIncidents).set({ recoveryRetryAt: new Date(0) }).where(eq(rotationIncidents.id, f.incident.id));
   await f.processor.run(f.incident.id);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]).toMatchObject({ status: "active", phase: "publish", currentAttemptId: before!.currentAttemptId });
   await evidence(f, "success");
@@ -709,7 +847,9 @@ it("uses actual AWS adapter commands with a fake SDK and never issues a second I
   });
   f.runtime.adapter = async () => sdk;
   const save = vi.spyOn(f.store, "saveReceipt").mockRejectedValueOnce(new Error("simulated database disconnect after SDK effect"));
-  await drive(f, 2); save.mockRestore(); await drive(f, 2);
+  await drive(f, 2); save.mockRestore();
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${f.incident.id}`;
+  await drive(f, 2);
   expect(writes).toEqual(["AssignIpv6AddressesCommand"]);
   expect((await connection.db.select().from(rotationIncidents).where(eq(rotationIncidents.id, f.incident.id)))[0]!.errorCode).toBe("resource_ownership_ambiguous");
   expect((await connection.db.select().from(rotationBudgetSegments).where(eq(rotationBudgetSegments.incidentId, f.incident.id)))[0]!.attemptsUsed).toBe(1);
@@ -845,6 +985,7 @@ it("preserves the same uncharged attempt for a due explicit throttling retry", a
   await connection.db.update(rotationSteps).set({ retryAt: new Date(0) }).where(eq(rotationSteps.id, f.state.writes[0]!));
   await connection.db.update(rotationIncidents).set({ nextRunAt: new Date(0) }).where(eq(rotationIncidents.id, f.incident.id));
   await connection.db.update(cloudRotationBuckets).set({ cooldownUntil: new Date(0) }).where(eq(cloudRotationBuckets.identityKey, JSON.stringify(["aws", f.account.externalAccountId, "ec2"])));
+  await connection.client`update rotation_incidents set recovery_retry_at = now() - interval '1 second' where id = ${f.incident.id}`;
   await drive(f, 1);
   expect(await connection.db.select().from(rotationAttempts).where(eq(rotationAttempts.incidentId, f.incident.id))).toMatchObject([{ id: before!.id, charged: true }]);
   expect(f.state.writes).toEqual([f.state.writes[0], f.state.writes[0]]);

@@ -52,3 +52,9 @@ Outstanding live acceptance: a disposable running standalone dual-stack VM, real
 References were checked in the bounded research supplied on 2026-09-15. Network documentation redirected older requested versions to the pinned `2025-09-01` contract.
 
 Allocation receipts pin the public IP resource GUID before association. A missing or changed GUID blocks association and recovery; the deterministic ARM name and tags alone do not prove the same resource generation. A lost NIC PUT response with otherwise unchanged identity and supported topology remains pending while the NIC is Updating, then completes by observation without another PUT. Installed allocation identity is stored separately from mutable inventory metadata; scans preserve this proof, and publication and queued DNS writes reject a recreated generation even when the address and ARM ID match. Legacy persisted GUID evidence is preserved before the first metadata refresh. No live-cloud validation is implied by the HTTP-fixture regressions.
+
+## 异步记录过期与清理恢复（2026-10-23）
+
+异步 operation URL 返回 404 时，不能据此断定云端未执行，也不应永久停在 pending；观察会继续核对精确资源 ID、GUID、地址和绑定。删除旧 Public IP 时先读实际资源，确认 404 后可收尾，不受历史 Failed/Canceled/无状态响应阻挡；旧版计划仍需验证发布候选的 GUID、地址和 NIC 绑定。
+
+原资源仍在且归属、地址与未附着条件有效时，明确 Failed/Canceled 的删除可返回 not_applied，交由有界清理重试；操作记录缺失但资源仍在只继续观察，不能重发不确定写入。资源重建或附着变化保持 ambiguous。该增量的离线验收见[后续恢复审查](../validation/2026-10-23-rotation-follow-up-audit.md)。

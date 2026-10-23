@@ -11,6 +11,7 @@ import { Field, Switch } from "./ui";
 export function RotationPolicyForm({ formId, slot, authorization, policy, blockReason, onSubmit }: { formId: string; slot: AddressSlot; authorization: CloudAuthorization | null; policy: RotationPolicy; blockReason?: string | null; onSubmit: (input: RotationPolicyInput) => Promise<void> }) {
   const [enabled, setEnabled] = useState(policy.enabled);
   const [maxAttempts, setMaxAttempts] = useState(policy.maxAttempts);
+  const [maxRecoveryRetries, setMaxRecoveryRetries] = useState(policy.maxRecoveryRetries ?? 5);
   const [minIntervalSeconds, setMinIntervalSeconds] = useState(policy.minIntervalSeconds);
   const [cloudWaitSeconds, setCloudWaitSeconds] = useState(policy.cloudWaitSeconds);
   const [candidateWindowSeconds, setCandidateWindowSeconds] = useState(policy.candidateWindowSeconds);
@@ -27,7 +28,7 @@ export function RotationPolicyForm({ formId, slot, authorization, policy, blockR
 
   const submit = async (event: FormEvent) => {
     event.preventDefault(); setError(null);
-    try { await onSubmit(parseRotationPolicyInput({ revision: policy.revision, enabled, maxAttempts, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds, linodeRestartMode, linodeIpv4Strategy, linodeSwapPlan, linodeAllowTemporaryInstance }, { savedPolicy: policy, blockReason: authorizationBlock })); }
+    try { await onSubmit(parseRotationPolicyInput({ revision: policy.revision, enabled, maxAttempts, maxRecoveryRetries, minIntervalSeconds, cloudWaitSeconds, candidateWindowSeconds, linodeRestartMode, linodeIpv4Strategy, linodeSwapPlan, linodeAllowTemporaryInstance }, { savedPolicy: policy, blockReason: authorizationBlock })); }
     catch (value) { setError(value instanceof Error ? value.message : "轮换策略保存失败"); }
   };
 
@@ -45,7 +46,8 @@ export function RotationPolicyForm({ formId, slot, authorization, policy, blockR
       <Field label="换址时实例重启方式"><select value={linodeRestartMode} onChange={event => setLinodeRestartMode(event.target.value as RotationPolicyInput["linodeRestartMode"])}><option value="reboot">重启</option><option value="stop_start">关机后开机</option></select></Field>
     </>}
     <p>新地址接管并完成 DNS 切换后，系统会等待旧记录缓存期限结束，自动释放可释放的旧云端 IP，不作为备用保留。</p>
-    <div className="field-grid"><Field label="每个任务最多换址"><input type="number" min={1} max={20} value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} required /></Field><Field label="尝试最小间隔（秒）"><input type="number" min={60} max={86400} value={minIntervalSeconds} onChange={(event) => setMinIntervalSeconds(Number(event.target.value))} required /></Field><Field label="等待云端生效（秒）"><input type="number" min={10} max={3600} value={cloudWaitSeconds} onChange={(event) => setCloudWaitSeconds(Number(event.target.value))} required /></Field><Field label="候选复测窗口（秒）"><input type="number" min={15} max={86400} value={candidateWindowSeconds} onChange={(event) => setCandidateWindowSeconds(Number(event.target.value))} required /></Field></div>
+    <p className="muted">云端失败或超时后自动恢复，默认最多重试 5 次；0 表示关闭自动重试。重试沿用原任务进度，达到上限后停止自动重试。</p>
+    <div className="field-grid"><Field label="每个任务最多换址"><input type="number" min={1} max={20} value={maxAttempts} onChange={(event) => setMaxAttempts(Number(event.target.value))} required /></Field><Field label="失败自动重试上限"><input type="number" min={0} max={20} value={maxRecoveryRetries} onChange={(event) => setMaxRecoveryRetries(Number(event.target.value))} required /></Field><Field label="尝试最小间隔（秒）"><input type="number" min={60} max={86400} value={minIntervalSeconds} onChange={(event) => setMinIntervalSeconds(Number(event.target.value))} required /></Field><Field label="等待云端生效（秒）"><input type="number" min={10} max={3600} value={cloudWaitSeconds} onChange={(event) => setCloudWaitSeconds(Number(event.target.value))} required /></Field><Field label="候选复测窗口（秒）"><input type="number" min={15} max={86400} value={candidateWindowSeconds} onChange={(event) => setCandidateWindowSeconds(Number(event.target.value))} required /></Field></div>
     <p className="muted">次数耗尽后保持锁存；重启、持续失败和恢复执行不会补回本次任务预算。</p>
   </form>;
 }

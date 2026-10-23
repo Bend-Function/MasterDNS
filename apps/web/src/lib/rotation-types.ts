@@ -5,6 +5,7 @@ export type RotationPolicy = {
   enabled: boolean;
   revision: number;
   maxAttempts: number;
+  maxRecoveryRetries: number;
   minIntervalSeconds: number;
   cloudWaitSeconds: number;
   candidateWindowSeconds: number;
@@ -33,6 +34,9 @@ export type RotationIncident = {
   nextRunAt: string;
   candidateDeadline: string | null;
   errorCode: string | null;
+  recoveryRetries?: number;
+  recoveryRetryAt?: string | null;
+  lastRecoveryError?: string | null;
   createdAt: string;
   updatedAt: string;
   completedAt: string | null;

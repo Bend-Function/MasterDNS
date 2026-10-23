@@ -11,6 +11,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     enabled: boolean("enabled").notNull().default(false),
     revision: integer("revision").notNull().default(1),
     maxAttempts: integer("max_attempts").notNull().default(3),
+    maxRecoveryRetries: integer("max_recovery_retries").notNull().default(5),
     minIntervalSeconds: integer("min_interval_seconds").notNull().default(60),
     cloudWaitSeconds: integer("cloud_wait_seconds").notNull().default(120),
     candidateWindowSeconds: integer("candidate_window_seconds").notNull().default(180),
@@ -19,7 +20,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     linodeSwapPlan: varchar("linode_swap_plan", { length: 128 }).notNull().default("g6-nanode-1"),
     linodeAllowTemporaryInstance: boolean("linode_allow_temporary_instance").notNull().default(false),
     updatedAt: time("updated_at").notNull().defaultNow(),
-  }, t => [check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`), check("rotation_policy_linode_restart_mode", sql`${t.linodeRestartMode} in ('reboot','stop_start')`), check("rotation_policy_linode_ipv4_strategy", sql`${t.linodeIpv4Strategy} in ('additional_ipv4','instance_swap')`), check("rotation_policy_linode_swap_plan", sql`${t.linodeSwapPlan} ~ '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$'`)]);
+  }, t => [check("rotation_policy_recovery_bounds", sql`${t.maxRecoveryRetries} between 0 and 20`), check("rotation_policy_bounds", sql`${t.revision} > 0 and ${t.maxAttempts} between 1 and 20 and ${t.minIntervalSeconds} between 60 and 86400 and ${t.cloudWaitSeconds} between 10 and 3600 and ${t.candidateWindowSeconds} between 15 and 86400`), check("rotation_policy_linode_restart_mode", sql`${t.linodeRestartMode} in ('reboot','stop_start')`), check("rotation_policy_linode_ipv4_strategy", sql`${t.linodeIpv4Strategy} in ('additional_ipv4','instance_swap')`), check("rotation_policy_linode_swap_plan", sql`${t.linodeSwapPlan} ~ '^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$'`)]);
   const rotationIncidents = pgTable("rotation_incidents", {
     id: uuid("id").primaryKey().defaultRandom(),
     ownerUserId: uuid("owner_user_id").notNull().references(dependencies.userId, { onDelete: "restrict" }),
@@ -47,6 +48,9 @@ export function defineRotationSchema(dependencies: Dependencies) {
     nextRunAt: time("next_run_at").notNull().defaultNow(),
     candidateDeadline: time("candidate_deadline"),
     errorCode: varchar("error_code", { length: 80 }),
+    recoveryRetries: integer("recovery_retries").notNull().default(0),
+    recoveryRetryAt: time("recovery_retry_at"),
+    lastRecoveryError: varchar("last_recovery_error", { length: 80 }),
     pausedByUserId: uuid("paused_by_user_id"),
     createdAt: time("created_at").notNull().defaultNow(),
     updatedAt: time("updated_at").notNull().defaultNow(),
@@ -57,6 +61,7 @@ export function defineRotationSchema(dependencies: Dependencies) {
     uniqueIndex("rotation_incidents_source_unique").on(t.slotId, t.sourceEventId),
     index("rotation_incidents_due_idx").on(t.nextRunAt).where(sql`${t.status} <> 'complete'`),
     index("rotation_incidents_owner_idx").on(t.ownerUserId, t.createdAt),
+    check("rotation_recovery_retries_bounds", sql`${t.recoveryRetries} between 0 and 20`),
     check("rotation_incidents_status", sql`${t.status} in ('active','paused','exhausted','complete') and ${t.phase} in ('cloud','candidate','publish','cleanup','complete')`),
     check("rotation_incidents_trigger_epoch", sql`(${t.trigger} in ('health','scheduled') and ${t.healthPolicyId} is not null and ${t.healthPolicyRevision} is not null and ${t.configId} is not null and ${t.configRevision} is not null and ${t.groupId} is not null and ${t.groupRevision} is not null) or (${t.trigger} = 'manual' and ${t.healthPolicyId} is null and ${t.healthPolicyRevision} is null and ${t.configId} is null and ${t.configRevision} is null and ${t.groupId} is null and ${t.groupRevision} is null)`),
   ]);

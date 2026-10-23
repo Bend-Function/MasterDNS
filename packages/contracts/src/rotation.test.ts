@@ -6,6 +6,12 @@ import {
   rotationScheduleUpdateSchema,
 } from "./rotation.js";
 
+it("defaults failure recovery to five retries and validates its independent limit", () => {
+  expect(rotationPolicySchema.parse({ revision: 0 })).toMatchObject({ maxRecoveryRetries: 5, maxAttempts: 3 });
+  for (const maxRecoveryRetries of [0, 1, 5, 20]) expect(rotationPolicySchema.safeParse({ revision: 0, maxRecoveryRetries }).success).toBe(true);
+  for (const maxRecoveryRetries of [-1, 21, 1.5]) expect(rotationPolicySchema.safeParse({ revision: 0, maxRecoveryRetries }).success).toBe(false);
+});
+
 describe("Linode swap policy", () => {
   it("keeps existing policies on additional IPv4 without helper authorization", () => {
     expect(rotationPolicySchema.parse({ revision: 0 })).toMatchObject({ linodeIpv4Strategy: "additional_ipv4", linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: false });

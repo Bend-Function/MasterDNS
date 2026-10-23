@@ -113,18 +113,19 @@ export async function resumeRotationIncident(tx: RotationTransaction, c: Rotatio
   const continuingCloud = incident.phase === "cloud" && !!attempt?.charged;
   if (incident.phase === "cloud" && attempt) {
     const steps = await tx.select().from(rotationSteps).where(eq(rotationSteps.attemptId, attempt.id)).for("update");
-    if (steps.some(s => !["prepared", "rejected_no_effect", "applied"].includes(s.status))) throw new Error("cloud_observation_required");
+    if (steps.some(s => !["prepared", "rejected_no_effect", "not_applied", "applied"].includes(s.status))) throw new Error("cloud_observation_required");
     if (!continuingCloud) await tx.update(rotationAttempts).set({ status: "abandoned" }).where(eq(rotationAttempts.id, attempt.id));
-    else for (const step of steps.filter(s => s.status === "rejected_no_effect")) {
+    else for (const step of steps.filter(s => s.status === "rejected_no_effect" || s.status === "not_applied")) {
       // Explicit fresh authorization may retry a conclusively rejected step of
       // this charged plan. The original allocation, charge and receipts survive.
-      await tx.update(rotationSteps).set({ status: "prepared", errorCode: null, retryAt: null, updatedAt: h.now }).where(eq(rotationSteps.id, step.id));
+      await tx.update(rotationSteps).set({ status: "prepared", plan: { ...step.plan, arguments: { ...step.plan.arguments, ...(step.status === "not_applied" && step.receipt ? { retryReceipt: step.receipt } : {}) } }, errorCode: null, retryAt: null, updatedAt: h.now }).where(eq(rotationSteps.id, step.id));
       await rotationAudit(tx, incident, "rotation.step_reprepared", actorUserId, { stepId: step.id, attemptId: attempt.id, previousStatus: step.status, previousErrorCode: step.errorCode, previousRetryAt: step.retryAt });
     }
   }
   const segmentId = incident.trigger === "manual" ? incident.currentSegmentId : randomUUID();
   if (incident.trigger !== "manual") await tx.insert(rotationBudgetSegments).values({ id: segmentId, incidentId: id, maxAttempts: c.policy.maxAttempts, actorUserId });
   const [updated] = await tx.update(rotationIncidents).set({ status: "active", currentSegmentId: continuingCloud || incident.trigger === "manual" ? incident.currentSegmentId : segmentId, pendingSegmentId: incident.trigger !== "manual" && continuingCloud ? segmentId : null, ...(incident.phase === "cloud" && !continuingCloud ? { currentAttemptId: null } : {}), pausedByUserId: null, errorCode: null,
+    recoveryRetries: 0, recoveryRetryAt: null, lastRecoveryError: null,
     authorizationRevision: c.authorization!.revision, policyRevision: c.policy!.revision, addressVersion: c.addressVersion, ...revisions, nextRunAt: h.now, updatedAt: h.now }).where(eq(rotationIncidents.id, id)).returning();
   await rotationAudit(tx, updated!, "rotation.resume", actorUserId, { previousSegmentId: incident.currentSegmentId, segmentId });
   return updated!;

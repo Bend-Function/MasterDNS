@@ -101,6 +101,27 @@ function cleanup(f: Awaited<ReturnType<typeof swapped>>, receipt: CloudStepResul
 }
 
 describe("Linode temporary instance swap", () => {
+  it("classifies an event-watermark change as a no-effect rejection before power dispatch", async () => {
+    const f = await swapped();
+    f.state.events.push({ id: 99, action: "linode_reboot", entity: { type: "linode", id: 42 }, status: "finished", username: f.state.username });
+    const step = withArgs(f.steps[2]!, { candidateReceipt: f.allocation, priorReceipts: [{ action: "linode.ipv4.swap", receipt: f.swap }] });
+    await expect(f.adapter.execute(step)).rejects.toMatchObject({ code: "remote_identity_changed" });
+    expect(f.state.writes).toHaveLength(2);
+  });
+  it.each(["reboot", "stop_start"] as const)("retries a confirmed failed %s command using a new event watermark and the same helper", async mode => {
+    const f = await swapped(mode);
+    const step = withArgs(f.steps[2]!, { candidateReceipt: f.allocation, priorReceipts: [{ action: "linode.ipv4.swap", receipt: f.swap }] });
+    const receipt = await f.adapter.execute(step);
+    f.state.events.at(-1)!.status = "failed";
+    f.state.target.status = "running";
+    const failed = await f.adapter.observeDetails(withArgs(step, { receipt }));
+    expect(failed).toMatchObject({ status: "not_applied", operationId: String(f.state.events.at(-1)!.id) });
+    const retry = withArgs(step, { retryReceipt: failed });
+    const retried = await f.adapter.execute(retry);
+    expect(await f.adapter.observeDetails(withArgs(retry, { receipt: retried }))).toMatchObject({ status: "applied", operationId: String(f.state.events.at(-1)!.id) });
+    expect(f.state.writes.filter(write => write.path === "/linode/instances")).toHaveLength(1);
+    expect(f.state.writes.filter(write => write.path === "/networking/ips/assign")).toHaveLength(1);
+  });
   it.each(["reboot", "stop_start"] as const)("creates an empty offline donor and completes the %s flow with durable ownership", async mode => {
     const f = await swapped(mode);
     expect(f.steps.map(step => step.action)).toEqual(mode === "reboot"
@@ -207,7 +228,7 @@ describe("Linode temporary instance swap", () => {
     if (change === "failed") f.state.events[0]!.status = "failed";
     if (change === "wrong-state") f.state.target.status = "rebooting";
     if (change === "old-event") receipt.before!.eventWatermark = 10;
-    if (change === "failed") await expect(f.adapter.observeDetails(withArgs(step, { receipt }))).rejects.toMatchObject({ code: "cloud_operation_failed" });
+    if (change === "failed") expect(await f.adapter.observeDetails(withArgs(step, { receipt }))).toMatchObject({ status: "not_applied" });
     else expect(await f.adapter.observeDetails(withArgs(step, { receipt }))).toMatchObject({ status: ["wrong-actor", "multiple"].includes(change) ? "ambiguous" : "pending" });
     expect(f.state.writes).toHaveLength(3);
   });

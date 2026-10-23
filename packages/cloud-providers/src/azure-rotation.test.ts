@@ -7,6 +7,44 @@ const prepare = async (f = fixture()) => { const before = await f.adapter.inspec
 const withCandidate = (step: any, receipt: CloudStepResult) => ({ ...step, arguments: { ...step.arguments, candidateReceipt: receipt } });
 describe('Azure exact-resource rotation', () => {
     afterEach(() => vi.restoreAllMocks());
+    it.each(['missing', 'Failed', 'Canceled'])('reconciles actual deletion when its historical operation is %s', async outcome => {
+        const f = await prepare();
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        await f.adapter.execute(withCandidate(f.steps[1], candidate));
+        const cleanup = planAzureCleanup(f.slot, f.before, { attemptId: 'attempt-1', releaseAuthorized: true, publishedAddress: candidate.candidateAddress!, ownershipSnapshot: { accountId: 'account', instanceId: vmId, interfaceId: configId, allocationId: pipId, address: f.slot.address } })[0]!;
+        const step = withCandidate(cleanup, candidate);
+        const receipt = await f.adapter.execute(step);
+        const operation = 'https://management.azure.com/subscriptions/subscription-1/providers/Microsoft.Network/locations/eastus/operationResults/expired-delete';
+        if (outcome !== 'missing') f.resources[new URL(operation).pathname] = { status: outcome };
+        expect(await f.adapter.observeDetails({ ...step, arguments: { ...step.arguments, receipt: { ...receipt, operationId: operation }, previousExecution: true } })).toMatchObject({ status: 'applied' });
+        expect(f.writes).toHaveLength(3);
+    });
+    it.each(['missing', 'failed', 'recreated', 'attached'])('keeps deletion retry conservative with %s operation or ownership evidence', async outcome => {
+        const f = await prepare();
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        await f.adapter.execute(withCandidate(f.steps[1], candidate));
+        const operation = 'https://management.azure.com/subscriptions/subscription-1/providers/Microsoft.Network/locations/eastus/operationResults/failed-delete';
+        f.setMutation((_url, method) => method === 'DELETE' ? new Response('{}', { status: 202, headers: { location: operation } }) : undefined);
+        const cleanup = planAzureCleanup(f.slot, f.before, { attemptId: 'attempt-1', releaseAuthorized: true, publishedAddress: candidate.candidateAddress!, ownershipSnapshot: { accountId: 'account', instanceId: vmId, interfaceId: configId, allocationId: pipId, address: f.slot.address } })[0]!;
+        const step = withCandidate(cleanup, candidate);
+        const receipt = await f.adapter.execute(step);
+        if (outcome !== 'missing') f.resources[new URL(operation).pathname] = { status: 'Failed' };
+        if (outcome === 'recreated') f.resources[pipId].properties.resourceGuid = 'replacement-resource-guid';
+        if (outcome === 'attached') f.resources[pipId].properties.ipConfiguration = { id: 'another-config' };
+        expect(await f.adapter.observeDetails({ ...step, arguments: { ...step.arguments, receipt, previousExecution: true } })).toMatchObject({ status: outcome === 'missing' ? 'pending' : outcome === 'failed' ? 'not_applied' : 'ambiguous' });
+        expect(f.writes).toHaveLength(3);
+    });
+    it.each(['generation', 'address'])('rechecks the published candidate %s before confirming legacy cleanup', async changed => {
+        const f = await prepare();
+        const candidate = await f.adapter.execute(f.steps[0]!);
+        await f.adapter.execute(withCandidate(f.steps[1], candidate));
+        const cleanup = planAzureCleanup(f.slot, f.before, { attemptId: 'attempt-1', releaseAuthorized: true, publishedAddress: candidate.candidateAddress!, ownershipSnapshot: { accountId: 'account', instanceId: vmId, interfaceId: configId, allocationId: pipId, address: f.slot.address } })[0]!;
+        const step = withCandidate(cleanup, candidate);
+        const receipt = await f.adapter.execute(step);
+        if (changed === 'generation') f.resources[candidate.allocationId!].properties.resourceGuid = 'new-generation';
+        else f.resources[candidate.allocationId!].properties.ipAddress = '20.30.40.99';
+        expect(await f.adapter.observeDetails({ ...step, arguments: { ...step.arguments, receipt, previousExecution: true } })).toMatchObject({ status: 'ambiguous' });
+    });
     it.each([4, 6] as const)('allocates Standard IPv%s, preserves siblings and private addresses, observes binding, then explicitly deletes old PIP', async (family) => {
         const f = await prepare(fixture(family));
         const original = structuredClone(f.resources[nicId]);
@@ -231,7 +269,7 @@ describe('Azure exact-resource rotation', () => {
         const observing = { ...step, arguments: { ...step.arguments, receipt, previousExecution: true } };
         expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: 'pending' });
         delete f.resources[pipId];
-        expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: operationKind === 'location' ? 'applied' : 'pending' });
+        expect(await f.adapter.observeDetails(observing)).toMatchObject({ status: 'applied' });
         expect(f.writes).toHaveLength(3);
     });
     it('requires trusted snapshot, publication and explicit cleanup authorization', async () => {

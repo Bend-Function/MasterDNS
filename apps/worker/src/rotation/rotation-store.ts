@@ -1,3 +1,4 @@
+import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { isIP } from "node:net";
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
@@ -12,6 +13,7 @@ import { persistedRotationOptions, rotationPersistenceExtension } from "./rotati
 
 type Incident = typeof rotationIncidents.$inferSelect;
 type Step = typeof rotationSteps.$inferSelect;
+const recoveryErrors = new Set(["rotation_runtime_failed", "rotation_call_timeout", "cloud_convergence_timeout", "temporary_cloud_error", "unknown_cloud_error", "cloud_operation_failed", "cloud_not_applied", "rate_limited"]);
 export type RotationRun = Awaited<ReturnType<RotationStore["read"]>>;
 export type AdapterIdentity = { credentialCiphertext: string; externalAccountId: string | null };
 
@@ -33,7 +35,24 @@ export class RotationStore {
     });
   }
   async release(lease: RotationLease) { await this.database.db.transaction(tx => releaseRotationLease(tx, lease)); }
-  async read(id: string, lease: RotationLease) { return this.transaction(id, async (tx, c, incident) => this.snapshot(tx, c, incident, lease)); }
+  async read(id: string, lease: RotationLease) {
+    return this.transaction(id, async (tx, c, incident) => {
+      const run = await this.snapshot(tx, c, incident, lease);
+      if (incident.terminatedAt || incident.pausedByUserId || !run.physical || !["cloud", "publish"].includes(incident.phase)) return run;
+      // Recover incidents paused by older workers too, without refreshing their
+      // authorization, actual-effect budget, plan or resource ownership.
+      if (incident.status === "paused" && recoveryErrors.has(incident.errorCode ?? "")) {
+        await scheduleRotationRecovery(tx, c, incident, incident.errorCode!, run.h.now);
+      } else if (incident.phase === "cloud" && incident.status === "active" && incident.recoveryRetryAt && incident.recoveryRetryAt <= run.h.now) {
+        for (const step of run.steps.filter(s => s.status === "not_applied" || s.status === "rejected_no_effect" && recoveryErrors.has(s.errorCode ?? ""))) {
+          await tx.update(rotationSteps).set({ status: "prepared", plan: { ...step.plan, arguments: { ...step.plan.arguments, ...(step.status === "not_applied" && step.receipt ? { retryReceipt: step.receipt } : {}) } }, errorCode: null, retryAt: null, updatedAt: run.h.now }).where(eq(rotationSteps.id, step.id));
+        }
+        await tx.update(rotationIncidents).set({ recoveryRetryAt: null, errorCode: null, updatedAt: run.h.now }).where(eq(rotationIncidents.id, id));
+      } else return run;
+      const [updated] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, id));
+      return this.snapshot(tx, c, updated!, lease);
+    });
+  }
   private async snapshot(tx: RotationTransaction, c: RotationContext, incident: Incident, lease: RotationLease) {
     const h = await lockRotationHealth(tx, c);
     const physical = await verifyRotationLease(tx, lease);
@@ -68,6 +87,7 @@ export class RotationStore {
     if (incident.terminatedAt) return { c, incident, h, physical, budget, attempt, steps, snapshot, action: { kind: "wait" as const, reason: "instance_busy" as const }, publication };
     if (action.kind !== "observe") {
       if (incident.pausedByUserId) action = { kind: "wait", reason: "instance_busy" };
+      else if (incident.errorCode === "recovery_retries_exhausted") action = { kind: "wait", reason: "instance_busy" };
       else if (incident.status === "paused" && incident.phase === "cloud") action = { kind: "wait", reason: "instance_busy" };
       else if (incident.trigger !== "manual" && !healthRevisionMatches(incident, h)) action = { kind: "pause", reason: "configuration_changed" };
       else if (c.physicalKey !== incident.physicalKey) action = { kind: "pause", reason: "remote_identity_changed" };
@@ -77,6 +97,9 @@ export class RotationStore {
     }
     if (action.kind === "execute" && incident.errorCode === "rotation_rate_limited" && incident.nextRunAt > h.now) {
       action = { kind: "wait", reason: "rate_limited", until: incident.nextRunAt.getTime() };
+    }
+    if (incident.recoveryRetryAt && incident.recoveryRetryAt > h.now && (action.kind === "execute" || action.kind === "observe")) {
+      action = { kind: "wait", reason: "cooldown", until: incident.recoveryRetryAt.getTime() };
     }
     return { c, incident, h, physical, budget, attempt, steps, snapshot, action, publication };
   }
@@ -135,15 +158,16 @@ export class RotationStore {
       return plan;
     });
   }
-  async saveReceipt(id: string, stepId: string, result: CloudStepResult, observation = false) {
+  async saveReceipt(id: string, stepId: string, result: CloudStepResult, observation = false, dispatchFence?: number | null) {
     // Late responses still belong to the original durable step, including after a
     // lease handoff. Never discard the only cloud receipt because its fence expired.
-    await this.transaction(id, async (tx, c, incident) => {
+    return this.transaction(id, async (tx, c, incident) => {
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || step.attemptId !== incident.currentAttemptId) throw new Error("rotation_step_changed");
-      if (step.status === "abandoned" || incident.errorCode === "cloud_state_reset") {
+      if (step.status === "abandoned" || incident.errorCode === "cloud_state_reset" || dispatchFence !== undefined && step.fence !== dispatchFence
+        || step.status === "not_applied" || step.status === "rejected_no_effect") {
         await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result } });
-        return;
+        return false;
       }
       const now = await databaseNow(tx); const old = step.receipt ?? {};
       const conflict = ["resourceId", "allocationId"].some(key => old[key] && (result as Record<string, unknown>)[key] && old[key] !== (result as Record<string, unknown>)[key]) || rotationPersistenceExtension(c.instance.service).receiptsConflict(old, result);
@@ -153,7 +177,7 @@ export class RotationStore {
       await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result }, createdAt: now });
       if (incident.terminatedAt) return;
       if (status === "applied" || status === "not_applied") await tx.update(rotationLeases).set({ unresolvedStepId: null }).where(and(eq(rotationLeases.incidentId, id), eq(rotationLeases.unresolvedStepId, stepId)));
-      if (status === "applied" && !incident.pausedByUserId && ["rotation_runtime_failed", "cloud_convergence_timeout", "temporary_cloud_error"].includes(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null }).where(eq(rotationIncidents.id, id));
+      if (status === "applied" && !incident.pausedByUserId && recoveryErrors.has(incident.errorCode ?? "")) await tx.update(rotationIncidents).set({ status: "active", errorCode: null, recoveryRetryAt: null }).where(eq(rotationIncidents.id, id));
       if (status === "ambiguous") await this.pauseIn(tx, incident, "resource_ownership_ambiguous", now);
       if (!conflict && step.status !== "applied") {
         const reserved = await rotationPersistenceExtension(c.instance.service).recordReceipt(tx, c, id, step.attemptId, receipt as CloudStepResult, step.plan, status === "applied", now, stepId);
@@ -176,15 +200,15 @@ export class RotationStore {
       await tx.update(rotationIncidents).set({ nextRunAt: new Date(now.getTime() + (status === "pending" ? 5000 : 0)) }).where(eq(rotationIncidents.id, id));
     });
   }
-  async reject(id: string, stepId: string, code: string, noEffect: boolean, retryAfterMs?: number) {
-    await this.transaction(id, async (tx, c, incident) => {
-      if (incident.terminatedAt) return;
+  async reject(id: string, stepId: string, code: string, noEffect: boolean, retryAfterMs?: number, dispatchFence?: number | null) {
+    return this.transaction(id, async (tx, c, incident) => {
+      if (incident.terminatedAt) return false;
       const now = await databaseNow(tx);
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
-      if (!step || step.attemptId !== incident.currentAttemptId || step.status === "applied") return;
+      if (!step || step.attemptId !== incident.currentAttemptId || step.status === "applied" || dispatchFence !== undefined && step.fence !== dispatchFence) return false;
       if (!noEffect) {
         await tx.update(rotationSteps).set({ errorCode: code, updatedAt: now }).where(eq(rotationSteps.id, stepId));
-        await tx.update(rotationIncidents).set({ errorCode: code, nextRunAt: new Date(now.getTime() + 5000) }).where(eq(rotationIncidents.id, id)); return;
+        await tx.update(rotationIncidents).set({ errorCode: incident.pausedByUserId || incident.errorCode === "recovery_retries_exhausted" ? incident.errorCode : code, nextRunAt: new Date(now.getTime() + 5000) }).where(eq(rotationIncidents.id, id)); return;
       }
       const retryAt = code === "rate_limited" ? await recordCloudRotationThrottle(tx, { accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: step.plan.action, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) }) : null;
       await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code, retryAt, updatedAt: now }).where(eq(rotationSteps.id, stepId));
@@ -196,7 +220,9 @@ export class RotationStore {
         await tx.update(rotationIncidents).set({ nextAttemptAt: now }).where(eq(rotationIncidents.id, id));
       }
       if (code !== "rate_limited") await this.pauseIn(tx, incident, code, now);
-      else await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: retryAt!, updatedAt: now }).where(eq(rotationIncidents.id, id));
+      else {
+        await scheduleRotationRecovery(tx, c, incident, code, now, retryAt!);
+      }
       await rotationAudit(tx, incident, "rotation.rejected_no_effect", undefined, { stepId, code });
     });
   }
@@ -230,9 +256,23 @@ export class RotationStore {
     });
   }
   async defer(id: string) { await this.database.db.update(rotationIncidents).set({ nextRunAt: sql`greatest(${rotationIncidents.nextRunAt}, clock_timestamp() + interval '30 seconds')` }).where(eq(rotationIncidents.id, id)); }
-  async pause(id: string, code: string) { await this.transaction(id, async (tx, _c, incident) => this.pauseIn(tx, incident, code, await databaseNow(tx))); }
-  private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date) {
-    if (incident.terminatedAt) return;
+  async pause(id: string, code: string, retryAfterMs?: number) {
+    await this.transaction(id, async (tx, _c, incident) => {
+      const now = await databaseNow(tx);
+      await this.pauseIn(tx, incident, code, now, retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? new Date(now.getTime() + retryAfterMs) : undefined);
+    });
+  }
+  private async pauseIn(tx: RotationTransaction, incident: Incident, code: string, now: Date, notBefore?: Date) {
+    if (incident.status === "complete" || incident.terminatedAt) return;
+    if (incident.errorCode === "recovery_retries_exhausted") {
+      await tx.update(rotationIncidents).set({ nextRunAt: new Date(now.getTime() + 30000) }).where(eq(rotationIncidents.id, incident.id));
+      return;
+    }
+    if ((incident.phase === "cloud" || incident.phase === "publish") && recoveryErrors.has(code)) {
+      const c = await lockRotationContext(tx, incident.slotId);
+      await scheduleRotationRecovery(tx, c, incident, code, now, notBefore);
+      return;
+    }
     if (code === "attempts_exhausted") await tx.update(rotationBudgetSegments).set({ exhausted: true }).where(eq(rotationBudgetSegments.id, incident.currentSegmentId));
     const status = code === "attempts_exhausted" ? "exhausted" : "paused";
     const unchangedPause = incident.status === status && incident.errorCode === code;

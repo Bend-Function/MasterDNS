@@ -220,7 +220,7 @@ function receipt(adapter: AzureCloudAdapter, a: RotationStepArguments, response?
     return { allocationId: candidateId(a), resourceId: candidateId(a), ...(operationId ? { operationId } : {}), before: { allocationId: originalId(a), address: a.slot.address, interfaceId: a.slot.interfaceId }, after: { ...(operation ? { operationKind: async ? 'azure-asyncoperation' : 'location' } : {}), ...(response ? { retryAfterMs: retryAfter(response.headers), pollAfter: Date.now() + (retryAfter(response.headers) ?? 0) } : {}) } };
 }
 async function poll(adapter: AzureCloudAdapter, a: RotationStepArguments): Promise<{
-    status: 'ready' | 'pending';
+    status: 'ready' | 'pending' | 'failed';
     after?: Record<string, unknown>;
 }> {
     if (!a.receipt?.operationId)
@@ -231,8 +231,10 @@ async function poll(adapter: AzureCloudAdapter, a: RotationStepArguments): Promi
     const interval = retryAfter(response.headers);
     const after = { ...a.receipt.after, retryAfterMs: interval, pollAfter: Date.now() + (interval ?? 0) };
     if (response.status === 404)
-        return { status: 'pending', after };
+        return { status: 'ready', after };
     const status = String(response.body.status ?? response.body.properties?.provisioningState ?? '');
+    if (['Failed', 'Canceled', 'Cancelled'].includes(status) && a.phase === 'post_publish_cleanup')
+        return { status: 'failed', after };
     if (['Failed', 'Canceled', 'Cancelled'].includes(status))
         throw new CloudError('cloud_operation_failed', false);
     if (status === 'Succeeded')
@@ -307,6 +309,23 @@ export async function executeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
 export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudStep): Promise<CloudObservation> {
     const a = argumentsFor(adapter, step);
     try {
+        if (step.action === 'azure.public-ip.delete') {
+            // Async-operation records may fail or expire after the exact old PIP
+            // was removed. Read actual state before letting that record block cleanup.
+            const current = await context(adapter, a, true);
+            const original = await adapter.http.getResource(originalId(a), NETWORK_API, true);
+            if (original.status === 404) {
+                if (!a.publishedInventory) {
+                    const proof = validateCandidateReceipt(a);
+                    const replacement = (await adapter.http.getResource(candidateId(a))).body;
+                    checkCandidate(a, replacement);
+                    if (!equalArmId(current.binding, candidateId(a)) || !equalArmId(replacement.properties.ipConfiguration?.id, a.slot.interfaceId)
+                        || replacement.properties.ipAddress !== proof.candidateAddress || replacement.properties.ipAddress !== a.publishedAddress) return ambiguous();
+                }
+                return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: a.publishedAddress!, status: 'applied' };
+            }
+            cleanupOwnership(a, original.body);
+        }
         const operation = await poll(adapter, a);
         if (operation.status === 'pending')
             return { ...a.receipt, ...(operation.after ? { after: operation.after } : {}), status: 'pending' };
@@ -314,7 +333,7 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
         if (step.action === 'azure.public-ip.delete' && a.publishedInventory) {
             const response = await adapter.http.getResource(originalId(a), NETWORK_API, true);
             if (response.status !== 404) cleanupOwnership(a, response.body);
-            return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: a.publishedAddress!, status: response.status === 404 ? 'applied' : 'pending' };
+            return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: a.publishedAddress!, status: response.status === 404 ? 'applied' : operation.status === 'failed' ? 'not_applied' : 'pending' };
         }
         const oldResponse = await adapter.http.getResource(originalId(a), NETWORK_API, true);
         const old = oldResponse.status === 404 ? undefined : oldResponse.body;
@@ -364,7 +383,7 @@ export async function observeAzureStep(adapter: AzureCloudAdapter, step: CloudSt
                 return { ...a.receipt, status: 'ambiguous' };
             if (old?.properties.ipConfiguration)
                 return { ...a.receipt, status: 'ambiguous' };
-            return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: candidate.properties.ipAddress, status: old ? 'pending' : 'applied' };
+            return { ...a.receipt, allocationId: originalId(a), resourceId: originalId(a), candidateAddress: candidate.properties.ipAddress, status: old ? operation.status === 'failed' ? 'not_applied' : 'pending' : 'applied' };
         }
         if (!old || old.properties.ipConfiguration)
             return { ...a.receipt, status: 'ambiguous' };

@@ -1,3 +1,4 @@
+import { cloudCallSignal } from "./call-context.js";
 import {
   DescribeInstancesCommand,
   DescribeNetworkInterfacesCommand,
@@ -37,18 +38,20 @@ export class Ec2CloudAdapter implements CloudAdapter {
   }
 
   private stsSend(command: GetCallerIdentityCommand) {
+    const abortSignal = cloudCallSignal();
     return this.dependencies.stsSend?.(command)
-      ?? this.stsClient.send(command);
+      ?? this.stsClient.send(command, abortSignal ? { abortSignal } : {});
   }
 
   private ec2Send(region: string, command: Parameters<AwsSend>[0]) {
+    const abortSignal = cloudCallSignal();
     if (this.dependencies.ec2Send !== undefined) return this.dependencies.ec2Send(command);
     let client = this.ec2Clients.get(region);
     if (client === undefined) {
       client = new EC2Client({ ...this.clientOptions, region, credentials: this.credentialSource });
       this.ec2Clients.set(region, client);
     }
-    return (client.send.bind(client) as AwsSend)(command);
+    return (client.send.bind(client) as (command: Parameters<AwsSend>[0], options: { abortSignal?: AbortSignal }) => ReturnType<AwsSend>)(command, abortSignal ? { abortSignal } : {});
   }
 
   async verifyIdentity(): Promise<{ externalAccountId: string }> {

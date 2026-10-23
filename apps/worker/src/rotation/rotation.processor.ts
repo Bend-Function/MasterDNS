@@ -1,3 +1,4 @@
+import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
 import { RotationPublicationService } from "./rotation-publication.service.js";
 import { RotationCleanupService } from "./rotation-cleanup.service.js";
 import { Injectable, Optional, Logger, type OnModuleDestroy, type OnModuleInit } from "@nestjs/common";
@@ -28,6 +29,8 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
       if (run.incident.terminatedAt) return;
       const action = run.action;
       if (run.incident.phase === "publish" || run.incident.phase === "cleanup") {
+        if (run.incident.errorCode === "recovery_retries_exhausted") { await this.store.defer(incidentId); return; }
+        if (run.incident.recoveryRetryAt && run.incident.recoveryRetryAt > run.h.now) { await this.store.defer(incidentId); return; }
         if (run.incident.phase === "publish" && !run.publication?.promotedAt) {
           if (run.incident.status === "paused" || run.incident.pausedByUserId) { await this.store.defer(incidentId); return; }
           // Health may expire between candidate verification and publication.
@@ -51,33 +54,40 @@ export class RotationProcessor implements OnModuleInit, OnModuleDestroy {
         if (!registration?.rotation || !registration.workflow) throw new CloudError("rotation_unsupported", false);
       }
       const identity = { credentialCiphertext: run.c.account.credentialCiphertext, externalAccountId: run.c.account.externalAccountId };
-      const adapter = requireCloudRotation(await this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" }));
+      // Stay below the 45-second physical lease and let BullMQ release the job
+      // even if an SDK never settles. A timeout is not evidence of no effect.
+      const timeoutMs = Math.min(run.c.policy?.cloudWaitSeconds ?? 120, 30) * 1000;
+      const adapter = requireCloudRotation(await boundedCloudCall(() => this.runtime.adapter(run.c.account.id, run.c.instance.service, { observation: action.kind === "observe" }), timeoutMs));
       if (!adapter.observeDetails) throw new CloudError("rotation_unsupported", false);
       if (action.kind === "observe") {
         const step = run.steps.find(s => s.id === action.stepId)!;
         try {
-          const observation = await adapter.observeDetails({ ...step.plan, arguments: { ...step.plan.arguments, ...(step.receipt ? { receipt: step.receipt } : {}), previousExecution: true } });
-          await this.store.saveReceipt(incidentId, step.id, observation, true);
-          if (action.convergenceExpired && observation.status === "pending") await this.store.pause(incidentId, "cloud_convergence_timeout");
-        } catch (error) { await this.store.reject(incidentId, step.id, safeError(error), false); }
+          const observation = await boundedCloudCall(() => adapter.observeDetails!({ ...step.plan, arguments: { ...step.plan.arguments, ...(step.receipt ? { receipt: step.receipt } : {}), previousExecution: true } }), timeoutMs);
+          const saved = await this.store.saveReceipt(incidentId, step.id, observation, true, step.fence);
+          if (saved !== false && action.convergenceExpired && observation.status === "pending") await this.store.pause(incidentId, "cloud_convergence_timeout");
+        } catch (error) {
+          const saved = await this.store.reject(incidentId, step.id, safeError(error), false, undefined, step.fence);
+          if (saved !== false) await this.store.pause(incidentId, safeError(error), error instanceof CloudError ? error.retryAfterMs : undefined);
+        }
       } else if (action.operation === "prepare_attempt") {
-        const inventory = await adapter.inspect({ accountId: run.c.account.id, service: run.c.instance.service, region: run.c.instance.region, instanceId: run.c.instance.externalId });
+        const inventory = await boundedCloudCall(() => adapter.inspect({ accountId: run.c.account.id, service: run.c.instance.service, region: run.c.instance.region, instanceId: run.c.instance.externalId }), timeoutMs);
         await this.store.prepare(incidentId, lease, inventory, identity);
       } else {
         const plan = await this.store.dispatch(incidentId, lease, action.stepId, identity); if (!plan) return;
         let receipt;
-        try { receipt = await adapter.execute(plan); }
-        catch (error) { await this.store.reject(incidentId, action.stepId, safeError(error), error instanceof CloudError && noEffectErrors.has(error.code), error instanceof CloudError ? error.retryAfterMs : undefined); return; }
+        try { receipt = await boundedCloudCall(() => adapter.execute(plan), timeoutMs, late => this.store.saveReceipt(incidentId, action.stepId, late, false, lease.revision)); }
+        catch (error) { await this.store.reject(incidentId, action.stepId, safeError(error), error instanceof CloudError && noEffectErrors.has(error.code), error instanceof CloudError ? error.retryAfterMs : undefined, lease.revision); return; }
         // A failure here leaves the original in_flight intent. Recovery observes;
         // it cannot infer no-effect from a lost database write or SDK response.
-        await this.store.saveReceipt(incidentId, action.stepId, receipt);
+        await this.store.saveReceipt(incidentId, action.stepId, receipt, false, lease.revision);
       }
     } catch (error) {
-      await this.store.pause(incidentId, safeError(error));
+      await this.store.pause(incidentId, safeError(error), error instanceof CloudError ? error.retryAfterMs : undefined);
     } finally { await this.store.release(lease); }
   }
 }
 function safeError(error: unknown) {
+  if (error instanceof RotationCallTimeout) return "rotation_call_timeout";
   if (error instanceof CloudError) return error.code;
   if (error instanceof Error && ["authorization_changed", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "rotation_limit_too_low", "instance_lifecycle_busy", "rotation_temporary_instance_not_authorized", "rotation_temporary_instance_busy"].includes(error.message)) return error.message;
   return "rotation_runtime_failed";

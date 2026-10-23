@@ -1,4 +1,6 @@
-import { getCloudServiceRegistration } from "@masterdns/cloud-providers";
+import { CloudError, getCloudServiceRegistration } from "@masterdns/cloud-providers";
+import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
+import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { supportsRotationTrigger } from "@masterdns/contracts";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
@@ -23,6 +25,7 @@ import {
   rotationIncidents,
   rotationPublications,
   rotationResources,
+  databaseNow,
   lockRotationContext,
   lockRotationHealth,
   healthRevisions,
@@ -89,6 +92,7 @@ export async function assertPublicationContext(tx: RotationTransaction, c: Rotat
       (manual ? publication.context.manualIncidentId !== incident.id : !healthRevisionMatches(publication.context as never, h))))
     throw new Error("publication_authorization_changed");
   if (publication?.incidentId) {
+    if (incident?.recoveryRetryAt && incident.recoveryRetryAt > h.now) throw new Error("publication_recovery_wait");
     const rotationError = rotationAuthorizationError(c, trigger);
     if (rotationError) throw new Error(rotationError);
     const completedManual = manual && incident.status === "complete" && publication.status === "applied";
@@ -256,13 +260,14 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
     if (!admission.c || !admission.lease) return admission.publication;
     const { c, lease } = admission;
     try {
-      const adapter = await this.runtime.adapter(c.account.id, c.instance.service, { observation: true });
-      const live = await adapter.inspect({
+      const timeoutMs = Math.min(c.policy?.cloudWaitSeconds ?? 120, 30) * 1000;
+      const adapter = await boundedCloudCall(() => this.runtime.adapter(c.account.id, c.instance.service, { observation: true }), timeoutMs);
+      const live = await boundedCloudCall(() => adapter.inspect({
         accountId: c.account.id,
         service: c.instance.service,
         region: c.instance.region,
         instanceId: c.instance.externalId,
-      });
+      }), timeoutMs);
       return await this.database.db.transaction(async (tx) => {
         const current = await lockRotationContext(tx, slotId);
         const physical = await verifyRotationLease(tx, lease);
@@ -286,6 +291,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .for("update");
         if (existing?.promotedAt) return existing;
         const h = await assertPublicationContext(tx, current, existing);
+        if (existing?.incidentId) await tx.update(rotationIncidents).set({ recoveryRetryAt: null, errorCode: null }).where(eq(rotationIncidents.id, existing.incidentId));
         const links = await tx
           .select({ link: cloudEndpointLinks, endpoint: endpoints, pool: endpointPools })
           .from(cloudEndpointLinks)
@@ -377,6 +383,19 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
               .returning();
         return publication;
       });
+    } catch (error) {
+      if (admission.publication?.incidentId && (error instanceof RotationCallTimeout || error instanceof CloudError && ["temporary_cloud_error", "unknown_cloud_error", "rate_limited"].includes(error.code))) {
+        await this.database.db.transaction(async tx => {
+          const current = await lockRotationContext(tx, slotId);
+          const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, admission.publication!.incidentId!)).for("update");
+          if (!incident || incident.status === "complete") return;
+          const now = await databaseNow(tx);
+          const retryAfter = error instanceof CloudError ? error.retryAfterMs : undefined;
+          await scheduleRotationRecovery(tx, current, incident, error instanceof RotationCallTimeout ? "rotation_call_timeout" : error.code, now,
+            retryAfter !== undefined && Number.isFinite(retryAfter) && retryAfter > 0 ? new Date(now.getTime() + retryAfter) : undefined);
+        });
+      }
+      throw error;
     } finally {
       await this.database.db.transaction((tx) => releaseRotationLease(tx, lease));
     }
@@ -408,8 +427,9 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
       const [p] = await tx.select().from(rotationPublications).where(eq(rotationPublications.id, id)).for("update");
       if (!p?.promotedAt) return;
       let releaseOldAddress = false;
+      let incident: typeof rotationIncidents.$inferSelect | undefined;
       if (p.incidentId) {
-        const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId)).for("update");
+        [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId)).for("update");
         if (incident?.terminatedAt) return;
         releaseOldAddress = incident?.releaseOldAddress ?? false;
       }
@@ -418,6 +438,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         failed = p.errorCode === "dns_partial",
         maxTtl = p.previousMaxTtl;
       const children: Publication["children"] = [];
+      const retryOperations: string[] = [];
       for (const child of p.children) {
         await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${child.poolId}))`);
         const [pool] = await tx.select().from(endpointPools).where(eq(endpointPools.id, child.poolId));
@@ -457,15 +478,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           done = false;
           if (["partial", "failed"].includes(op.status)) {
             failed = true;
-            // Preserve successful steps. Each retry first reads DNS remote state in OperationProcessor.
-            await tx
-              .update(operationSteps)
-              .set({ status: "pending", nextRetryAt: new Date(), finishedAt: null })
-              .where(and(eq(operationSteps.operationId, op.id), eq(operationSteps.status, "failed")));
-            await tx
-              .update(operations)
-              .set({ status: "pending", finishedAt: null, errorCode: null, updatedAt: new Date() })
-              .where(eq(operations.id, op.id));
+            retryOperations.push(op.id);
           }
         }
         const bad = await tx
@@ -474,7 +487,18 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .where(and(eq(domainBindings.poolId, pool.id), ne(domainBindings.state, "healthy")));
         if (bad.length) done = false;
       }
-      const now = new Date();
+      const now = await databaseNow(tx);
+      const retryDue = incident?.status === "active" && !incident.pausedByUserId && incident.recoveryRetryAt && incident.recoveryRetryAt <= now;
+      if (retryOperations.length && incident && !incident.recoveryRetryAt && incident.status === "active") {
+        await scheduleRotationRecovery(tx, c, incident, "dns_partial", now);
+      }
+      if (retryOperations.length && (!incident || retryDue)) {
+        // Retry failed DNS steps only; preserve successes and the original cloud address.
+        await tx.update(operationSteps).set({ status: "pending", nextRetryAt: now, finishedAt: null })
+          .where(and(inArray(operationSteps.operationId, retryOperations), eq(operationSteps.status, "failed")));
+        await tx.update(operations).set({ status: "pending", finishedAt: null, errorCode: null, updatedAt: now }).where(inArray(operations.id, retryOperations));
+        if (incident) await tx.update(rotationIncidents).set({ recoveryRetryAt: null }).where(eq(rotationIncidents.id, incident.id));
+      }
       await tx
         .update(rotationPublications)
         .set({
@@ -488,9 +512,11 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         })
         .where(eq(rotationPublications.id, id));
       if (p.incidentId) {
+        const [latest] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, p.incidentId));
         await tx
           .update(rotationIncidents)
-          .set({ phase: done ? "cleanup" : "publish", errorCode: !done && failed ? "dns_partial" : null, nextRunAt: now, updatedAt: now })
+          .set({ phase: done ? "cleanup" : "publish", errorCode: latest?.pausedByUserId || latest?.errorCode === "recovery_retries_exhausted" ? latest.errorCode : !done && failed ? "dns_partial" : null,
+            ...(done ? { recoveryRetryAt: null } : {}), nextRunAt: latest?.recoveryRetryAt && latest.recoveryRetryAt > now ? latest.recoveryRetryAt : now, updatedAt: now })
           .where(eq(rotationIncidents.id, p.incidentId));
         if (done) {
           const resources = await tx.select().from(rotationResources).where(eq(rotationResources.incidentId, p.incidentId));

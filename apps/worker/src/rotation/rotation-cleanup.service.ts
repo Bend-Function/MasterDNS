@@ -1,4 +1,6 @@
 import { persistedCleanupOptions, persistedRotationOptions, rotationPersistenceExtension } from "./rotation-persistence-extensions.js";
+import { boundedCloudCall, RotationCallTimeout } from "./rotation-cloud-call.js";
+import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
 import { and, asc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
@@ -52,6 +54,9 @@ const noEffect = new Set([
   "resource_ownership_ambiguous",
   "rotation_unsupported",
 ]);
+// These are admission/ownership guards, not failed cloud attempts. Keep checking
+// prerequisites without spending the recovery budget or bypassing them.
+const prerequisiteErrors = new Set(["cleanup_grace_pending", "cleanup_publication_pending", "cleanup_replacement_not_live", "cleanup_resource_attached", "cleanup_current_candidate_retained", "cleanup_identity_changed", "cleanup_incident_changed", "cleanup_plan_ambiguous", "cleanup_attempt_missing", "cleanup_observation_unavailable", "original_address_release_not_authorized", "authorization_revoked", "family_disabled", "region_excluded", "resource_not_found", "conflicting_manager", "rotation_temporary_instance_not_authorized", "stop_not_authorized", "resource_ownership_ambiguous", "remote_identity_changed", "cleanup_not_authorized"]);
 @Injectable()
 export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
   private timer?: NodeJS.Timeout;
@@ -86,6 +91,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       .where(
         and(inArray(rotationResources.cleanupStatus, ["pending", "failed"]), sql`${rotationResources.cleanupDueAt} <= clock_timestamp()`),
       )
+      .orderBy(asc(rotationResources.cleanupDueAt), asc(rotationResources.id))
       .limit(200);
     for (const r of rows) await this.run(r.id, new Date());
     const incidents = await this.database.db
@@ -104,7 +110,24 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       if (!incident) return;
       const c = await lockRotationContext(tx, incident.slotId);
       const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id)).for("update");
-      if (lockedIncident?.terminatedAt) return;
+      if (!lockedIncident || lockedIncident.terminatedAt) return;
+      const now = await databaseNow(tx);
+      if (lockedIncident.recoveryRetryAt && lockedIncident.recoveryRetryAt > now) {
+        await tx.update(rotationResources).set({ cleanupDueAt: lockedIncident.recoveryRetryAt }).where(eq(rotationResources.id, r.id));
+        return;
+      }
+      if (lockedIncident.status === "paused" && !lockedIncident.pausedByUserId && lockedIncident.errorCode === "cleanup_failed") {
+        await scheduleRotationRecovery(tx, c, lockedIncident, r.cleanupError ?? "cleanup_failed", now);
+        return;
+      }
+      if (lockedIncident.status === "active" && lockedIncident.recoveryRetryAt) {
+        await tx.update(rotationIncidents).set({ recoveryRetryAt: null }).where(eq(rotationIncidents.id, incident.id));
+      }
+      const [step] = r.cleanupStepId ? await tx.select().from(rotationSteps).where(eq(rotationSteps.id, r.cleanupStepId)) : [];
+      if (lockedIncident.status !== "active" && (!step || !["in_flight", "pending", "ambiguous"].includes(step.status))) {
+        await tx.update(rotationResources).set({ cleanupDueAt: new Date(now.getTime() + 30000) }).where(eq(rotationResources.id, r.id));
+        return;
+      }
       const identity = cleanupIdentity(r);
       if (identity && !r.cleanupStepId) {
         const aliases = (await tx.select().from(rotationResources).where(eq(rotationResources.incidentId, incident.id)).orderBy(asc(rotationResources.createdAt), asc(rotationResources.id)))
@@ -113,46 +136,54 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         if (canonical.id !== r.id) {
           await tx.update(rotationResources).set({ snapshot: { ...r.snapshot, cleanupCanonicalResourceId: canonical.id },
             cleanupStatus: canonical.cleanupStatus, cleanupError: canonical.cleanupError,
+            cleanupDueAt: new Date(Math.max(now.getTime() + 5000, canonical.cleanupDueAt?.getTime() ?? 0)),
             ...(canonical.cleanupStatus === "released" ? { attached: false, referenced: false } : {}) }).where(eq(rotationResources.id, r.id));
           return;
         }
       }
       const lease = await acquireRotationLease(tx, c.physicalKey, randomUUID());
-      if (!lease) return;
+      if (!lease) {
+        await tx.update(rotationResources).set({ cleanupDueAt: new Date(now.getTime() + 15000) }).where(eq(rotationResources.id, r.id));
+        return;
+      }
       const physical = await verifyRotationLease(tx, lease);
-      const [step] = r.cleanupStepId ? await tx.select().from(rotationSteps).where(eq(rotationSteps.id, r.cleanupStepId)) : [];
       if (
         c.physicalKey !== incident.physicalKey ||
         (physical?.incidentId && physical.incidentId !== incident.id) ||
         (physical?.unresolvedStepId && physical.unresolvedStepId !== step?.id)
       ) {
         await releaseRotationLease(tx, lease);
+        await tx.update(rotationResources).set({ cleanupDueAt: new Date(now.getTime() + 15000) }).where(eq(rotationResources.id, r.id));
         return;
       }
-      return { c, r, incident, lease, step };
+      return { c, r, incident: lockedIncident, lease, step };
     });
     if (!initial) return;
     const { c, r, lease } = initial;
+    const timeoutMs = Math.min(c.policy?.cloudWaitSeconds ?? 120, 30) * 1000;
+    let executionStepId = initial.step?.id;
+    let executionFence = initial.step?.fence;
     try {
       const observing = initial.step && ["in_flight", "pending", "ambiguous"].includes(initial.step.status);
       if (!observing && c.lifecycleBlocked) { await this.waitForLifecycle(r, c.slot.id); return; }
-      const adapter = requireCloudRotation(await this.runtime.adapter(c.account.id, c.instance.service, { observation: !!observing }));
+      const adapter = requireCloudRotation(await boundedCloudCall(() => this.runtime.adapter(c.account.id, c.instance.service, { observation: !!observing }), timeoutMs));
       if (!adapter.observeDetails) throw new Error("cleanup_observation_unavailable");
       if (observing) {
         const step = initial.step!;
-        const result = await adapter.observeDetails({
+        const result = await boundedCloudCall(() => adapter.observeDetails!({
           ...step.plan,
           arguments: { ...step.plan.arguments, receipt: step.receipt ?? {}, previousExecution: true },
-        });
-        await this.receipt(r, step.id, result, true);
+        }), timeoutMs);
+        await this.receipt(r, step.id, result, true, step.fence);
         return;
       }
-      const live = await adapter.inspect({
+      if (initial.incident.status !== "active" || initial.incident.pausedByUserId) return;
+      const live = await boundedCloudCall(() => adapter.inspect({
         accountId: c.account.id,
         service: c.instance.service,
         region: c.instance.region,
         instanceId: c.instance.externalId,
-      });
+      }), timeoutMs);
       const dispatched = await this.database.db.transaction(async (tx) => {
         const current = await lockRotationContext(tx, c.slot.id);
         // Gate only new writes; dispatched effects still need observation after pause/revocation.
@@ -210,7 +241,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         }
         await tx
           .update(rotationSteps)
-          .set({ plan, status: "in_flight", fence: lease.revision, dispatchedAt: now, updatedAt: now, errorCode: null })
+          .set({ plan, status: "in_flight", fence: lease.revision, dispatchedAt: now, observeDeadline: new Date(now.getTime() + (current.policy?.cloudWaitSeconds ?? 120) * 1000), receipt: null, updatedAt: now, errorCode: null })
           .where(eq(rotationSteps.id, stepId));
         await tx
           .update(rotationResources)
@@ -225,44 +256,62 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
         return { ...plan, id: stepId };
       });
       if (!dispatched) return;
+      executionStepId = dispatched.id;
+      executionFence = lease.revision;
       let result: CloudStepResult;
       try {
-        result = await adapter.execute(dispatched);
+        result = await boundedCloudCall(() => adapter.execute(dispatched), timeoutMs, late => this.receipt(r, dispatched.id, late, false, lease.revision));
       } catch (e) {
         if (e instanceof CloudError && noEffect.has(e.code)) {
-          await this.rejectNoEffect(r, dispatched.id, e.code, e.retryAfterMs);
+          await this.rejectNoEffect(r, dispatched.id, e.code, e.retryAfterMs, lease.revision);
           if (e.code === "rate_limited") return;
         }
         throw e;
       }
-      await this.receipt(r, dispatched.id, result, false);
+      await this.receipt(r, dispatched.id, result, false, lease.revision);
     } catch (e) {
-      const code = e instanceof CloudError ? e.code : e instanceof Error ? e.message.slice(0, 80) : "cleanup_failed";
+      const code = e instanceof RotationCallTimeout ? "rotation_call_timeout" : e instanceof CloudError ? e.code : e instanceof Error ? e.message.slice(0, 80) : "cleanup_failed";
       if (code === "cleanup_grace_pending") return;
       if (code === "instance_lifecycle_busy") { await this.waitForLifecycle(r, c.slot.id); return; }
       // P11c's durable scanner is the only notification/routing authority.
       await this.database.db.transaction(async (tx) => {
-        await lockRotationContext(tx, c.slot.id);
+        const current = await lockRotationContext(tx, c.slot.id);
         const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId)).for("update");
-        if (incident?.terminatedAt) return;
+        if (!incident || incident.terminatedAt) return;
+        if (executionStepId) {
+          const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, executionStepId)).for("update");
+          if (!step || step.status === "applied" || executionFence !== undefined && step.fence !== executionFence) return;
+        }
+        const now = await databaseNow(tx);
         const failed = await tx
           .update(rotationResources)
           .set({
             cleanupStatus: "failed",
             cleanupError: code,
-            cleanupDueAt: new Date(Math.max(r.cleanupDueAt?.getTime() ?? 0, Date.now() + 30000)),
+            cleanupDueAt: new Date(Math.max(r.cleanupDueAt?.getTime() ?? 0, now.getTime() + 30000)),
           })
           .where(and(eq(rotationResources.id, r.id), ne(rotationResources.cleanupStatus, "released")))
           .returning({ id: rotationResources.id });
-        if (failed.length)
-          await tx
-            .update(rotationIncidents)
-            .set({ errorCode: "cleanup_failed", updatedAt: new Date() })
-            .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
+        if (failed.length) {
+          if (prerequisiteErrors.has(code)) {
+            if (!incident.pausedByUserId && incident.errorCode !== "recovery_retries_exhausted") await tx.update(rotationIncidents).set({ errorCode: "cleanup_failed", updatedAt: now }).where(eq(rotationIncidents.id, incident.id));
+          } else await this.retry(tx, current, incident, r, code, now, e instanceof CloudError ? e.retryAfterMs : undefined);
+        }
       });
       if (r.cleanupError !== code) this.logger.warn(`Cleanup ${r.id}: ${code}`);
     } finally {
       await this.database.db.transaction((tx) => releaseRotationLease(tx, lease));
+    }
+  }
+  private async retry(tx: RotationTransaction, c: RotationContext, incident: typeof rotationIncidents.$inferSelect, resource: Resource, code: string, now: Date, retryAfterMs?: number) {
+    const notBefore = retryAfterMs !== undefined && Number.isFinite(retryAfterMs) && retryAfterMs > 0 ? new Date(now.getTime() + retryAfterMs) : undefined;
+    await scheduleRotationRecovery(tx, c, incident, code, now, notBefore);
+    const [updated] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, incident.id));
+    const due = updated?.recoveryRetryAt ?? new Date(now.getTime() + 30000);
+    const [pending] = await tx.update(rotationResources).set({ cleanupStatus: "failed", cleanupError: code, cleanupDueAt: due }).where(and(eq(rotationResources.id, resource.id), ne(rotationResources.cleanupStatus, "released"))).returning({ stepId: rotationResources.cleanupStepId });
+    if (pending?.stepId && updated?.recoveryRetryAt) {
+      await tx.update(rotationSteps).set({ observeDeadline: new Date(due.getTime() + (c.policy?.cloudWaitSeconds ?? 120) * 1000) })
+        .where(and(eq(rotationSteps.id, pending.stepId), inArray(rotationSteps.status, ["in_flight", "pending"])));
     }
   }
   private async waitForLifecycle(resource: Resource, slotId: string) {
@@ -378,7 +427,7 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
     if (steps.slice(0, pointer).some(step => step.status !== "applied" && !(recordingReceipt && step.status === "ambiguous")) || steps.slice(pointer + 1).some(step => step.status !== "prepared")) throw new Error("cleanup_plan_ambiguous");
     return steps;
   }
-  private async receipt(r: Resource, stepId: string, result: CloudStepResult, observation: boolean) {
+  private async receipt(r: Resource, stepId: string, result: CloudStepResult, observation: boolean, dispatchFence?: number | null) {
     await this.database.db.transaction(async (tx) => {
       const [incident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!incident) return;
@@ -395,6 +444,11 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
       if (!step || !chain.some(member => member.id === stepId) || step.attemptId !== r.attemptId || step.plan.arguments.phase !== "post_publish_cleanup")
         throw new Error("cleanup_step_changed");
+      if (dispatchFence !== undefined && step.fence !== dispatchFence || ["not_applied", "rejected_no_effect"].includes(step.status)) {
+        await tx.insert(rotationStepObservations).values({ stepId, observation, result: { ...result } });
+        return;
+      }
+      const now = await databaseNow(tx);
       const old = step.receipt ?? {};
       const conflict = ["allocationId", "resourceId"].some((k) => {
         const expected = old[k] ?? r[k as "allocationId" | "resourceId"];
@@ -427,6 +481,14 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
           .update(rotationLeases)
           .set({ unresolvedStepId: null })
           .where(and(eq(rotationLeases.incidentId, incident.id), eq(rotationLeases.unresolvedStepId, stepId)));
+      if (resource.cleanupStepId === stepId && lockedIncident) {
+        const deadline = step.observeDeadline?.getTime() ?? (step.dispatchedAt ?? step.updatedAt).getTime() + (context.policy?.cloudWaitSeconds ?? 120) * 1000;
+        const expired = status === "pending" && deadline <= now.getTime();
+        if (status === "not_applied" || expired) {
+          await this.retry(tx, context, lockedIncident, resource, expired ? "cleanup_convergence_timeout" : "cleanup_not_applied", now);
+          return;
+        }
+      }
       // Late receipts are retained on their step; only the current pointer may advance.
       if (resource.cleanupStepId !== stepId) {
         if (status === "ambiguous") {
@@ -448,8 +510,9 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       await tx.update(rotationResources).set({
         snapshot,
         cleanupStepId: next?.id ?? stepId,
-        cleanupStatus: status === "ambiguous" || historyAmbiguous ? "failed" : status === "applied" && !next ? "released" : "pending",
-        cleanupError: status === "ambiguous" || historyAmbiguous ? "cleanup_ownership_ambiguous" : null,
+        cleanupStatus: status === "ambiguous" || historyAmbiguous || status === "pending" && resource.cleanupStatus === "failed" ? "failed" : status === "applied" && !next ? "released" : "pending",
+        cleanupError: status === "ambiguous" || historyAmbiguous ? "cleanup_ownership_ambiguous" : status === "pending" ? resource.cleanupError : null,
+        ...(next ? { cleanupDueAt: now } : status !== "applied" ? { cleanupDueAt: new Date(now.getTime() + (status === "ambiguous" || lockedIncident?.status === "exhausted" ? 30000 : 5000)) } : {}),
         ...(status === "applied" ? { attached: false, referenced: false } : {}),
       }).where(eq(rotationResources.id, r.id));
       if (status === "applied" && !next && !historyAmbiguous) {
@@ -465,25 +528,26 @@ export class RotationCleanupService implements OnModuleInit, OnModuleDestroy {
       }
       const [remainingFailure] = await tx.select({ id: rotationResources.id }).from(rotationResources)
         .where(and(eq(rotationResources.incidentId, r.incidentId), eq(rotationResources.cleanupStatus, "failed")));
-      if (remainingFailure) await tx.update(rotationIncidents).set({ errorCode: "cleanup_failed", updatedAt: new Date() })
-        .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
-      else await tx.update(rotationIncidents).set({ errorCode: null, updatedAt: new Date() })
+      if (remainingFailure) await tx.update(rotationIncidents).set({ errorCode: "cleanup_failed", updatedAt: now })
+        .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup"), or(isNull(rotationIncidents.errorCode), ne(rotationIncidents.errorCode, "recovery_retries_exhausted"))));
+      else await tx.update(rotationIncidents).set({ errorCode: null, recoveryRetryAt: null, updatedAt: now })
         .where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup"), eq(rotationIncidents.errorCode, "cleanup_failed")));
     });
   }
-  private async rejectNoEffect(r: Resource, stepId: string, code: string, retryAfterMs?: number) {
+  private async rejectNoEffect(r: Resource, stepId: string, code: string, retryAfterMs?: number, dispatchFence?: number) {
     await this.database.db.transaction(async (tx) => {
       const [i] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, r.incidentId));
       if (!i) return;
       const c = await lockRotationContext(tx, i.slotId);
       const [lockedIncident] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, i.id)).for("update");
-      if (lockedIncident?.terminatedAt) return;
+      if (!lockedIncident || lockedIncident.terminatedAt) return;
       const [step] = await tx.select().from(rotationSteps).where(eq(rotationSteps.id, stepId)).for("update");
-      if (!step || step.status !== "in_flight") return;
+      if (!step || step.status !== "in_flight" || dispatchFence !== undefined && step.fence !== dispatchFence) return;
       if (code === "rate_limited") {
         const retryAt = await recordCloudRotationThrottle(tx, { accountId: c.account.id, service: c.instance.service, region: c.instance.region, stepId, action: step.plan.action, ...(retryAfterMs === undefined ? {} : { retryAfterMs }) });
-        await tx.update(rotationResources).set({ cleanupStatus: "pending", cleanupError: "rotation_rate_limited", cleanupDueAt: retryAt }).where(eq(rotationResources.id, r.id));
-        await tx.update(rotationIncidents).set({ errorCode: "rotation_rate_limited", nextRunAt: retryAt }).where(and(eq(rotationIncidents.id, r.incidentId), eq(rotationIncidents.phase, "cleanup")));
+        await scheduleRotationRecovery(tx, c, lockedIncident, code, await databaseNow(tx), retryAt);
+        const [updated] = await tx.select().from(rotationIncidents).where(eq(rotationIncidents.id, i.id));
+        await tx.update(rotationResources).set({ cleanupStatus: updated?.status === "exhausted" ? "failed" : "pending", cleanupError: "rotation_rate_limited", cleanupDueAt: updated?.recoveryRetryAt ?? retryAt }).where(eq(rotationResources.id, r.id));
       }
       await tx.update(rotationSteps).set({ status: "rejected_no_effect", errorCode: code }).where(and(eq(rotationSteps.id, stepId), eq(rotationSteps.status, "in_flight")));
       await tx

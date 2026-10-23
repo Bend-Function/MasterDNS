@@ -48,8 +48,8 @@ describe("rotation machine overview", () => {
   });
 
   it("only changes enabled and retains the saved policy revision and every tuning parameter", () => {
-    const policy = { ...demoRotationPolicy, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" as const, linodeIpv4Strategy: "instance_swap" as const, linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true };
-    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start", linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true });
+    const policy = { ...demoRotationPolicy, maxAttempts: 7, maxRecoveryRetries: 9, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start" as const, linodeIpv4Strategy: "instance_swap" as const, linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true };
+    expect(policyToggleInput(policy, false)).toEqual({ revision: policy.revision, enabled: false, maxAttempts: 7, maxRecoveryRetries: 9, minIntervalSeconds: 300, cloudWaitSeconds: 45, candidateWindowSeconds: 900, linodeRestartMode: "stop_start", linodeIpv4Strategy: "instance_swap", linodeSwapPlan: "g6-standard-1", linodeAllowTemporaryInstance: true });
     const rows = [machine()];
     const updated = updateMachinePolicy(rows, { ...policy, enabled: false, revision: policy.revision + 1 });
     expect(updated[0]!.slots[0]!.policy?.enabled).toBe(false);

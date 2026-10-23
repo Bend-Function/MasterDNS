@@ -129,7 +129,7 @@ function verifyShutdownReceipt(args: RotationStepArguments): CloudStepResult {
   return receipt;
 }
 function watermark(args: RotationStepArguments): number {
-  const source = args.receipt?.before?.eventWatermark ?? (args.linodeRestartMode === "stop_start" && args.priorReceipts?.some(item => item.action === "linode.instance.stop")
+  const source = args.receipt?.before?.eventWatermark ?? (args.retryReceipt ? Number(args.retryReceipt.operationId) : args.linodeRestartMode === "stop_start" && args.priorReceipts?.some(item => item.action === "linode.instance.stop")
     ? Number(verifyShutdownReceipt(args).operationId)
     : args.phase === "post_publish_cleanup" ? verifyReleaseReceipt(args).before?.eventWatermark : candidateReceipt(args)?.before?.eventWatermark ?? args.before.metadata?.eventWatermark);
   if (!Number.isSafeInteger(source) || Number(source) < 0) throw new CloudError("resource_ownership_ambiguous", false);
@@ -146,6 +146,11 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
   }
   const current = await adapter.inspect(args.slot);
   identity(args, current);
+  if (args.retryReceipt) {
+    if (!step.action.startsWith("linode.instance.")) throw new CloudError("resource_ownership_ambiguous", false);
+    const failed = await observeLinodeRotation({ ...step, arguments: { ...step.arguments, retryReceipt: undefined, receipt: args.retryReceipt } }, adapter);
+    if (failed.status !== "not_applied" || current.metadata?.eventWatermark !== Number(failed.operationId)) throw new CloudError("remote_identity_changed", false);
+  }
   if (current.state !== (step.action === "linode.instance.start" ? "offline" : "running")) throw new CloudError("rotation_unsupported", false, undefined, "linode_unexpected_power_state");
   const before = snapshot(current);
   if (step.action === "linode.ipv4.allocate") {
@@ -173,11 +178,13 @@ export async function executeLinodeRotation(step: CloudStep, adapter: LinodeClou
     verifyReleaseReceipt(args);
     if (ipv4(current).includes(args.slot.address) || await exactIp(adapter, args.slot.address)) throw new CloudError("resource_ownership_ambiguous", false);
   } else verifyAssigned(args, await exactIp(adapter, args.slot.address), args.slot.address);
-  if (step.action === "linode.instance.start") {
+  if (args.retryReceipt) {
+    before.eventWatermark = Number(args.retryReceipt.operationId);
+  } else if (step.action === "linode.instance.start") {
     before.eventWatermark = Number(verifyShutdownReceipt(args).operationId);
   }
   // The before inventory and prior allocation/release receipt already retain a watermark if this response is lost.
-  watermark(args);
+  if (current.metadata?.eventWatermark !== watermark(args)) throw new CloudError("remote_identity_changed", false);
   const rebootIdentity = args.phase === "post_publish_cleanup"
     ? { remoteId: args.slot.address, allocationId: verifyReleaseReceipt(args).allocationId!, resourceId: verifyReleaseReceipt(args).resourceId! }
     : { remoteId: args.slot.instanceId };
@@ -227,7 +234,10 @@ export async function observeLinodeRotation(step: CloudStep, adapter: LinodeClou
     if (events.length !== 1) return { ...base, status: "ambiguous" };
     const event = events[0]!;
     if (event.username !== args.before.metadata?.authenticatedUsername || (args.receipt?.operationId && args.receipt.operationId !== String(event.id))) return { ...base, status: "ambiguous" };
-    if (event.status === "failed") throw new CloudError("cloud_operation_failed", false, undefined, `linode_${eventAction}_failed`);
+    if (event.status === "failed") {
+      if (args.phase !== "rotation" || current.state !== (step.action === "linode.instance.start" ? "offline" : "running")) throw new CloudError("cloud_operation_failed", false);
+      return { ...base, operationId: String(event.id), after: { ...base.after, eventStatus: "failed", powerState: current.state }, status: "not_applied" };
+    }
     const result = { ...base, operationId: String(event.id), before: { ...base.before, eventWatermark: afterId }, after: { ...base.after, eventStatus: event.status } };
     const desiredState = step.action === "linode.instance.stop" ? "offline" : "running";
     if (!["finished", "completed"].includes(event.status ?? "") || current.state !== desiredState) return { ...result, status: "pending" };

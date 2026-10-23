@@ -1,4 +1,4 @@
-import { evaluateCapabilities } from "@masterdns/cloud-providers";
+import { CloudError, evaluateCapabilities } from "@masterdns/cloud-providers";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { expect, it, vi } from "vitest";
@@ -316,12 +316,62 @@ it("manual publication updates linked DNS without health evidence and retries on
   await f.service.observe(p!.id);
   expect(f.writes).toEqual(["zone-0"]);
   expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, p!.id)))[0]).toMatchObject({ status: "failed", errorCode: "dns_partial" });
-  f.state.failSecond = false; await f.execute(); await f.service.observe(p!.id);
+  f.state.failSecond = false;
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0) }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.service.observe(p!.id); await f.execute(); await f.service.observe(p!.id);
   expect(f.writes).toEqual(["zone-0", "zone-1"]);
   expect(f.remote.get("zone-0")?.content).toBe(f.address.address);
   expect(f.remote.get("zone-1")?.content).toBe(f.address.address);
   expect(f.state.cloudCalls).toBe(0);
   expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ phase: "cleanup" });
+});
+it("bounds DNS publication retries and does not requeue failed DNS while paused or exhausted", async () => {
+  const f = await dnsFixture(); const incident = await manualPublication(f);
+  await f.d.update(db.rotationPolicies).set({ maxRecoveryRetries: 1 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  await f.service.publish(incident.id); await f.plan(); await f.execute();
+  const [p] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
+  await f.service.observe(p!.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ recoveryRetries: 1, errorCode: "dns_partial" });
+  const failedOperations = () => f.d.select().from(db.operations).where(and(eq(db.operations.status, "failed"), eq(db.operations.ownerUserId, f.account.ownerUserId)));
+  expect(await failedOperations()).toHaveLength(1);
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0), status: "paused", pausedByUserId: f.account.ownerUserId }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.service.observe(p!.id);
+  expect(await failedOperations()).toHaveLength(1);
+  await f.d.update(db.rotationIncidents).set({ status: "active", pausedByUserId: null }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.service.observe(p!.id); await f.execute(); await f.service.observe(p!.id);
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ status: "exhausted", recoveryRetries: 1, errorCode: "recovery_retries_exhausted" });
+  await f.service.observe(p!.id);
+  expect(await failedOperations()).toHaveLength(1);
+});
+it.each(["identity", "inspect"])("recovers a publication %s failure without a manual resume", async stage => {
+  const f = await fixture(); const incident = await manualPublication(f);
+  let failing = true;
+  const failed = () => { throw new CloudError("rate_limited", true, 600000); };
+  const service = new RotationPublicationService({ db: f.d } as never, { adapter: async () => {
+    if (failing && stage === "identity") return failed();
+    return { inspect: async () => failing ? failed() : f.live };
+  } } as never);
+  await expect(service.publish(incident.id)).rejects.toThrow("rate_limited");
+  const [waiting] = await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id));
+  expect(waiting).toMatchObject({ status: "active", recoveryRetries: 1 });
+  expect(waiting!.recoveryRetryAt!.getTime()).toBeGreaterThan(Date.now() + 590000);
+  failing = false;
+  await expect(service.publish(incident.id)).rejects.toThrow("publication_recovery_wait");
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0) }).where(eq(db.rotationIncidents.id, incident.id));
+  await service.publish(incident.id);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBeNull();
+});
+it.each(["identity", "inspect"])("times out a stuck publication %s call and releases its lease", async stage => {
+  const f = await fixture(); const incident = await manualPublication(f);
+  await f.d.update(db.rotationPolicies).set({ cloudWaitSeconds: 10 }).where(eq(db.rotationPolicies.slotId, f.slot.id));
+  const never = async () => new Promise<never>(() => {});
+  const service = new RotationPublicationService({ db: f.d } as never, { adapter: stage === "identity" ? never : async () => ({ inspect: never }) } as never);
+  const original = globalThis.setTimeout;
+  const timer = vi.spyOn(globalThis, "setTimeout").mockImplementation(((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => original(callback, delay === 10000 ? 10 : delay, ...args)) as typeof setTimeout);
+  try { await expect(service.publish(incident.id)).rejects.toThrow("rotation_call_timeout"); } finally { timer.mockRestore(); }
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident.id)))[0]).toMatchObject({ status: "active", recoveryRetries: 1 });
+  expect((await f.d.select().from(db.rotationLeases).where(eq(db.rotationLeases.physicalKey, incident.physicalKey)))[0]!.holder).toBeNull();
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.slot.id)))[0]!.candidateAddressId).toBe(f.address.id);
 });
 it("termination cancels queued DNS publication and recovery cannot revive it", async () => {
   const f = await dnsFixture(); const incident = await manualPublication(f);
@@ -564,6 +614,8 @@ it.each(["system", "user"] as const)("runs one allocation and cleans the old %s 
   await f.d.update(db.rotationIncidents).set({ pausedByUserId: null }).where(eq(db.rotationIncidents.id, incident.id));
   const [pausedPublication] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
   await f.service.observe(pausedPublication!.id);
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0) }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.service.observe(pausedPublication!.id);
   f.state.failSecond = true;
   await f.execute();
   let [p] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.incidentId, incident.id));
@@ -573,6 +625,8 @@ it.each(["system", "user"] as const)("runs one allocation and cleans the old %s 
     (await f.d.select().from(db.rotationResources).where(eq(db.rotationResources.incidentId, incident.id))).every((r) => !r.cleanupDueAt),
   ).toBe(true);
   f.state.failSecond = false;
+  await f.d.update(db.rotationIncidents).set({ recoveryRetryAt: new Date(0) }).where(eq(db.rotationIncidents.id, incident.id));
+  await f.service.observe(p!.id);
   await f.execute();
   await f.service.observe(p!.id);
   [p] = await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, p!.id));

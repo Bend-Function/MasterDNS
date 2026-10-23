@@ -18,7 +18,7 @@ export class RotationService {
   async policy(actor: AuthUser, slotId: string) {
     await this.ownedSlot(actor, slotId);
     const [policy] = await this.database.db.select().from(rotationPolicies).where(eq(rotationPolicies.slotId, slotId));
-    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot" as const, linodeIpv4Strategy: "additional_ipv4" as const, linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: false };
+    return policy ?? { slotId, enabled: false, revision: 0, maxAttempts: 3, maxRecoveryRetries: 5, minIntervalSeconds: 60, cloudWaitSeconds: 120, candidateWindowSeconds: 180, linodeRestartMode: "reboot" as const, linodeIpv4Strategy: "additional_ipv4" as const, linodeSwapPlan: "g6-nanode-1", linodeAllowTemporaryInstance: false };
   }
   async setPolicy(actor: AuthUser, slotId: string, input: RotationPolicyInput) {
     await this.ownedSlot(actor, slotId);
@@ -26,7 +26,7 @@ export class RotationService {
       const c = await lockRotationContext(tx, slotId);
       if ((c.policy?.revision ?? 0) !== input.revision) throw new ConflictException("Policy revision has changed");
       const revokingTemporaryGrant = c.policy?.linodeAllowTemporaryInstance && !input.linodeAllowTemporaryInstance
-        && (["enabled", "maxAttempts", "minIntervalSeconds", "cloudWaitSeconds", "candidateWindowSeconds", "linodeRestartMode", "linodeIpv4Strategy", "linodeSwapPlan"] as const).every(field => input[field] === c.policy![field]);
+        && (["enabled", "maxAttempts", "maxRecoveryRetries", "minIntervalSeconds", "cloudWaitSeconds", "candidateWindowSeconds", "linodeRestartMode", "linodeIpv4Strategy", "linodeSwapPlan"] as const).every(field => input[field] === c.policy![field]);
       if (input.enabled && !revokingTemporaryGrant) {
         const h = await lockRotationHealth(tx, c);
         if (!h.configured || !h.policy) throw new ConflictException("External health policy is required");

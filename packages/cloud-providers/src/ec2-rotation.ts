@@ -177,7 +177,9 @@ export async function observeEc2Rotation(step: CloudStep, accountId: string, sen
     const selected = originalAddress(step);
     try {
       const response = await send(new DescribeAddressesCommand({ AllocationIds: [selected.allocationId!] }));
-      return { ...base, status: response.Addresses?.length ? "pending" : "applied" };
+      if (!Array.isArray(response.Addresses)) throw new CloudError("unknown_cloud_error", false);
+      if (response.Addresses.some((address: Address) => address.AllocationId !== selected.allocationId)) return { ...base, status: "ambiguous" };
+      return { ...base, status: response.Addresses.length ? "pending" : "applied" };
     } catch (error) {
       if ((error as { name?: string }).name === "InvalidAllocationID.NotFound") return { ...base, status: "applied" };
       throw error;

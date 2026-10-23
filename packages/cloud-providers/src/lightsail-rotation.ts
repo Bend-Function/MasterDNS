@@ -40,6 +40,7 @@ function candidate(step: CloudStep, address?: string): CloudStepResult {
 async function readStaticIp(name: string, send: AwsSend): Promise<StaticIp | undefined> {
   try {
     const response = await send(new GetStaticIpCommand({ staticIpName: name }));
+    if (!response.staticIp) throw new CloudError("unknown_cloud_error", false);
     if (response.staticIp && response.staticIp.name !== name) throw new CloudError("resource_ownership_ambiguous", false);
     return response.staticIp;
   } catch (error) {
@@ -162,34 +163,54 @@ export async function executeLightsailRotation(step: CloudStep, accountId: strin
   const oldName = originalName(step);
   const ownerStep = { ...step, arguments: { ...step.arguments, attemptId: args.ownershipAttemptId } };
   const old = await readStaticIp(oldName, send);
-  if (!old || old.attachedTo || old.ipAddress !== args.slot.address || instance.publicIpAddress !== args.publishedAddress) throw new CloudError("resource_ownership_ambiguous", false);
+  if (instance.publicIpAddress !== args.publishedAddress) throw new CloudError("resource_ownership_ambiguous", false);
+  if (!old) return { remoteId: oldName, allocationId: oldName, resourceId: originalAddress(step).resourceId!, before, after: { released: true } };
+  if (old.attachedTo || old.ipAddress !== args.slot.address) throw new CloudError("resource_ownership_ambiguous", false);
   verifyOriginal(step, old);
   if (!(hasCleanupOwnership(step, { allocationId: old.name!, address: old.ipAddress!, ...(old.arn ? { resourceId: old.arn } : {}) }) || (args.ownershipAttemptId && oldName === rotationResourceName(ownerStep)))) throw new CloudError("resource_ownership_ambiguous", false);
   const response = await send(new ReleaseStaticIpCommand({ staticIpName: oldName }));
   return { remoteId: oldName, allocationId: oldName, resourceId: old.arn!, before, ...operationResult(response.operations) };
 }
 
-async function operationStatus(step: CloudStep, send: AwsSend): Promise<"ready" | "pending" | "ambiguous"> {
+async function operationStatus(step: CloudStep, send: AwsSend, cleanupRelease = false): Promise<"ready" | "pending" | "ambiguous" | "not_applied"> {
   const { receipt, before } = rotationArguments(step);
   const ids = receipt?.operationIds ?? (receipt?.operationId ? [receipt.operationId] : []);
+  let failed = false;
+  let pending = false;
   for (const id of ids) {
     const response = await send(new GetOperationCommand({ operationId: id }));
     const op = response.operation as Operation | undefined;
     if (!op || op.id !== id) return "ambiguous";
     if (op.resourceName && ![before.nativeName, rotationResourceName(step), ...(step.action.includes("static-ip") ? [originalAddress(step).allocationId] : [])].includes(op.resourceName)) return "ambiguous";
     if (op.status === "Failed") {
+      if (cleanupRelease) { failed = true; continue; }
       const error = normalizeAwsError({ name: op.errorCode });
       throw error.code === "unknown_cloud_error" ? new CloudError("cloud_operation_failed", false) : error;
     }
-    if (op.status !== "Succeeded" && op.status !== "Completed") return "pending";
+    if (op.status !== "Succeeded" && op.status !== "Completed") pending = true;
   }
-  return "ready";
+  return pending ? "pending" : failed ? "not_applied" : "ready";
 }
 
 export async function observeLightsailRotation(step: CloudStep, accountId: string, send: AwsSend): Promise<CloudObservation> {
   const args = validate(step, accountId);
   const instance = await readInstance(step, send);
   const base: CloudStepResult = { ...args.receipt, before: args.receipt?.before ?? { inventory: args.before }, after: snapshot(instance) };
+  if (step.action === "lightsail.static-ip.release") {
+    // A failed historical operation must not mask an already completed release.
+    // Retry only after all recorded operations terminate, with the exact original
+    // ARN/address still detached; execute rechecks this identity before deletion.
+    const old = await readStaticIp(originalName(step), send);
+    if (!old) return { ...base, status: "applied" };
+    try { verifyOriginal(step, old); }
+    catch (error) {
+      if (error instanceof CloudError && error.code === "resource_ownership_ambiguous") return { ...base, status: "ambiguous" };
+      throw error;
+    }
+    if (old.attachedTo) return { ...base, status: "ambiguous" };
+    const status = await operationStatus(step, send, true);
+    return { ...base, resourceId: old.arn!, status: status === "ready" ? "pending" : status };
+  }
   const status = await operationStatus(step, send);
   if (step.action.startsWith("lightsail.ipv6")) {
     if (status !== "ready") return { ...base, status };

@@ -6,6 +6,12 @@ import { demoRotationPolicy } from "../lib/rotation-demo";
 import { RotationPolicyForm } from "./rotation-policy-form";
 
 describe("rotation policy downtime permission", () => {
+  it("shows a configurable five-retry limit independently of the address budget", () => {
+    const markup = renderToStaticMarkup(createElement(RotationPolicyForm, { formId: "policy", slot: demoCloudSlots[0]!, authorization: demoCloudInstances[0]!.authorization!, policy: demoRotationPolicy, onSubmit: async () => undefined }));
+    expect(markup).toContain("失败自动重试上限");
+    expect(markup).toMatch(/min="0" max="20"[^>]*value="5"/);
+    expect(markup).toContain("每个任务最多换址");
+  });
   it("keeps Linode opt-in disabled without reboot permission and explains both reboots", () => {
     const base = demoCloudSlots[0]!;
     const slot = { ...base, ref: { ...base.ref!, service: "linode" as const }, capability: { ...base.capability!, requiresStop: true } };
