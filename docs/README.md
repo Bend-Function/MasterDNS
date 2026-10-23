@@ -10,6 +10,8 @@
 
 2026-10-23 补充历史云地址的 Pool 调度过滤与停止探测状态提示，见[历史云地址与池健康验证](validation/2026-10-23-pool-historical-addresses.md)。
 
+2026-10-23 为全部 Compose 服务增加可配置的日志大小和文件数量上限，并压缩轮转日志；已有部署的生效步骤见[部署与运维手册](DEPLOYMENT.md)，验证范围见[容器日志限制记录](validation/2026-10-23-docker-log-limits.md)。
+
 ## 阅读入口
 
 - [系统架构](ARCHITECTURE.md)：运行拓扑、代码分层、领域边界、核心流程、并发与故障恢复；建议先读。

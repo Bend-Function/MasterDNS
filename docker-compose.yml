@@ -1,5 +1,12 @@
 name: masterdns
 
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "${DOCKER_LOG_MAX_SIZE:-10m}"
+    max-file: "${DOCKER_LOG_MAX_FILES:-3}"
+    compress: "true"
+
 x-database-environment: &database-environment
   PGHOST: postgres
   PGPORT: 5432
@@ -17,6 +24,7 @@ x-runtime-environment: &runtime-environment
 services:
   postgres:
     image: postgres:17-alpine
+    logging: *default-logging
     restart: unless-stopped
     environment:
       POSTGRES_DB: masterdns
@@ -32,6 +40,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    logging: *default-logging
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
@@ -43,6 +52,7 @@ services:
       retries: 20
 
   migrate:
+    logging: *default-logging
     build:
       context: .
       dockerfile: Dockerfile
@@ -62,6 +72,7 @@ services:
     restart: "no"
 
   api:
+    logging: *default-logging
     build:
       context: .
       dockerfile: Dockerfile
@@ -89,6 +100,7 @@ services:
       retries: 12
 
   worker:
+    logging: *default-logging
     build:
       context: .
       dockerfile: Dockerfile
@@ -111,6 +123,7 @@ services:
         condition: service_healthy
 
   web:
+    logging: *default-logging
     build:
       context: .
       dockerfile: Dockerfile

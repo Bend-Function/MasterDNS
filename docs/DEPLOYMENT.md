@@ -52,6 +52,44 @@ curl -fsS http://127.0.0.1:${API_PORT:-4000}/api/health
 
 默认端口仅绑定 `127.0.0.1`，便于本机验收和同机反向代理接入。反向代理位于其他主机时，可将 `BIND_ADDRESS` 改为指定内网地址，并通过防火墙限制来源。正式环境应由反向代理终止 TLS，不应将 PostgreSQL 或 Redis 暴露到宿主机或公网。
 
+### 容器日志与磁盘占用
+
+六个 Compose 服务（包括 PostgreSQL、Redis 和一次性 `migrate`）统一使用 `json-file` 日志轮转，并压缩旧文件。可在已有 `.env` 中按需加入以下值；不填写或留空也会使用默认值：
+
+```dotenv
+DOCKER_LOG_MAX_SIZE=10m
+DOCKER_LOG_MAX_FILES=3
+```
+
+`DOCKER_LOG_MAX_SIZE` 为正整数加单位 `k`、`m` 或 `g`；`DOCKER_LOG_MAX_FILES` 为至少 1 的整数，包含当前文件。默认每容器约 30 MB 的未压缩日志预算；单实例六个服务约 180 MB，压缩通常会减少实际占用。这是轮转阈值，不是 Docker 总磁盘配额，单条日志和轮转过程可能产生短暂额外占用。超过文件数量时 Docker 删除最旧日志，排障需长期保留的片段应提前导出。
+
+新容器直接生效。已有容器只执行 `restart` 不会更新日志配置；`bash update.sh` 更新应用服务，但保留 PostgreSQL/Redis 容器，因此其日志设置还需在维护窗口应用。先按“升级与回退”完成代码升级与数据库备份，再执行以下步骤；每个命令成功后才继续：
+
+```bash
+docker compose config --quiet
+docker compose stop web api worker migrate
+docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 postgres redis
+docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 api
+docker compose up -d --no-deps --no-build --force-recreate --wait --wait-timeout 180 worker web
+docker compose rm -f migrate
+docker compose ps
+```
+
+这会短暂停服，重建容器时复用原有命名数据卷；最后移除已停止的旧迁移容器，下次迁移创建新容器时自动采用日志限制。旧容器及其本地日志会被替换或移除，如需诊断证据，提前用 `docker compose logs --since=24h > masterdns-before-log-rotation.log` 导出到有空间的目录；导出文件不受容器轮转限制。此配置本身没有数据库迁移。不要通过 `down -v` 或删除数据卷应用日志配置。
+
+检查已创建容器的实际设置（输出应包含 `json-file`、`max-size`、`max-file` 和 `compress`）：
+
+```bash
+for service in postgres redis api worker web; do
+  docker inspect --format '{{.Name}} {{json .HostConfig.LogConfig}}' "$(docker compose ps -q "$service")"
+done
+docker compose logs --tail=100 api worker
+```
+
+如果磁盘仍然占用很大，先用 `docker system df -v` 区分镜像、构建缓存和数据卷占用，用 `docker ps -a --size` 检查容器写入层；这些统计不完整包含容器日志，日志设置仍需单独核对。`update.sh` 会保留带 `masterdns-backup-*` 标签的回退镜像，每次升级也会生成数据库备份，应按实际回退保留期处理；不要把数据库卷当成日志删除。本次配置不会自动清理镜像、构建缓存、数据库或备份。
+
+日志轮转和既有容器生效规则参见 [Docker 官方 json-file 文档](https://docs.docker.com/engine/logging/drivers/json-file/)。
+
 ## 4. 反向代理要求
 
 - Web 和 API 全程使用 HTTPS。

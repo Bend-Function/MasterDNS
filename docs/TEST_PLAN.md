@@ -2,6 +2,12 @@
 
 ## 1. 测试层级
 
+### Docker 日志配置验收（2026-10-23）
+
+用仅含占位凭证的隔离环境运行 `docker compose --env-file /dev/null -f docker-compose.yml config --format json`，不要把真实部署的完整配置输出到测试记录。检查全部六个服务均解析出 `json-file`、字符串 `max-size: "10m"`、`max-file: "3"`、`compress: "true"`；同时检查自定义 `DOCKER_LOG_MAX_SIZE=5m` / `DOCKER_LOG_MAX_FILES=2` 生效、变量未设置或为空时回落到默认值。无需启动业务容器或访问云账号。
+
+有 Docker daemon 的隔离环境还应以小阈值持续输出测试日志，验证自动轮转、最旧文件淘汰、压缩及 `docker logs` 可读性；部署验收按[部署手册](DEPLOYMENT.md)重建后检查所有服务的 `HostConfig.LogConfig`，确认数据卷仍是原卷。配置解析通过不代表已完成真实轮转或生产磁盘回收。记录见[容器日志限制验证](validation/2026-10-23-docker-log-limits.md)。
+
 ### 单元测试
 
 - Provider 数据标准化和错误分类。

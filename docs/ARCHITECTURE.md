@@ -44,6 +44,8 @@ flowchart TB
 - 持久化：PostgreSQL、Drizzle ORM；Redis 用于队列、限流和部分分布式锁。
 - 部署：[Docker Compose](../docker-compose.yml) 中 Web、API、Worker、PostgreSQL、Redis 常驻，`migrate` 为一次性迁移和空库管理员初始化任务。
 
+2026-10-23 起，六个 Compose 服务共享 Docker `json-file` 日志配置，由 Docker 对容器 stdout/stderr 进行轮转及旧文件压缩。默认单文件 10 MB、每容器保留 3 份（含当前文件），通过 `DOCKER_LOG_MAX_SIZE` / `DOCKER_LOG_MAX_FILES` 调整；配置在容器创建时生效。该策略不改变数据库中审计、Operation 或探测历史的保留规则，也不限制镜像、构建缓存及数据卷大小。已有部署操作见[部署手册](DEPLOYMENT.md)。
+
 API 除配置和任务创建外，也执行凭证验证、资源预检等必要的厂商调用；长流程由 Worker 推进。PostgreSQL 保存平台的持久事实，远端云/DNS 的实际效果仍必须通过厂商接口观察确认。
 
 ## 3. 代码分层与实际依赖
