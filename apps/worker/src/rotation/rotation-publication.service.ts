@@ -4,7 +4,7 @@ import { scheduleRotationRecovery } from "./rotation-retry.js";
 import { supportsRotationTrigger } from "@masterdns/contracts";
 import { randomUUID } from "node:crypto";
 import { Injectable, Logger, type OnModuleInit, type OnModuleDestroy } from "@nestjs/common";
-import { and, asc, eq, inArray, isNull, ne, notExists, sql } from "drizzle-orm";
+import { and, asc, eq, exists, inArray, isNull, ne, notExists, or, sql } from "drizzle-orm";
 import {
   addressHealthStates,
   cloudAddresses,
@@ -73,6 +73,7 @@ export function livePublicationMatches(c: RotationContext, live: CloudInventory)
   );
 }
 export async function assertPublicationContext(tx: RotationTransaction, c: RotationContext, publication?: Publication) {
+  if (publication?.errorCode === "manual_terminated") throw new Error("manual_terminated");
   const error = publicationAuthorizationError(c);
   if (error) throw new Error(error);
   const h = await lockRotationHealth(tx, c);
@@ -153,7 +154,7 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
         and(
           sql`${managedAddressSlots.currentVersion} > 0`,
           isNull(managedAddressSlots.candidateAddressId),
-          notExists(
+          or(notExists(
             this.database.db
               .select({ id: endpointAddresses.id })
               .from(endpointAddresses)
@@ -164,7 +165,11 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
                   eq(endpointAddresses.state, "current"),
                 ),
               ),
-          ),
+          ), exists(this.database.db.select({ id: rotationPublications.id }).from(rotationPublications).where(and(
+            eq(rotationPublications.slotId, managedAddressSlots.id),
+            eq(rotationPublications.addressVersion, managedAddressSlots.currentVersion),
+            eq(rotationPublications.errorCode, "manual_terminated"),
+          )))),
         ),
       )
       .limit(200);
@@ -177,6 +182,17 @@ export class RotationPublicationService implements OnModuleInit, OnModuleDestroy
           .from(rotationIncidents)
           .where(and(eq(rotationIncidents.slotId, slotId), ne(rotationIncidents.status, "complete")));
         if (active) return;
+        // A terminated cleanup can leave a current Pool address whose publication
+        // is permanently fenced. Reverify it under a new version; never revive
+        // the cancelled publication or reuse its old health/manual authorization.
+        const [publication] = await tx.select().from(rotationPublications).where(and(eq(rotationPublications.slotId, slotId), eq(rotationPublications.addressVersion, c.slot.currentVersion)));
+        const missingLinks = await tx.select({ id: cloudEndpointLinks.endpointId }).from(cloudEndpointLinks).where(and(
+          eq(cloudEndpointLinks.slotId, slotId),
+          notExists(tx.select({ id: endpointAddresses.id }).from(endpointAddresses).where(and(
+            eq(endpointAddresses.endpointId, cloudEndpointLinks.endpointId), eq(endpointAddresses.family, cloudEndpointLinks.family), eq(endpointAddresses.state, "current"),
+          ))),
+        ));
+        if (publication?.errorCode !== "manual_terminated" && missingLinks.length === 0) return;
         await tx
           .update(managedAddressSlots)
           .set({

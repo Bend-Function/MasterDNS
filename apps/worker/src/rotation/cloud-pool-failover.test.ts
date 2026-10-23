@@ -37,9 +37,9 @@ async function manualPublication(f: Awaited<ReturnType<typeof fixture>>) {
   return incident!;
 }
 
-async function poolFixture(recoveryMode: "automatic" | "keep_current" = "automatic", finishLastPublication = true, manualPrimary = false) {
-  const primary = await fixture();
-  const backup = await fixture();
+async function poolFixture(recoveryMode: "automatic" | "keep_current" = "automatic", finishLastPublication = true, manualPrimary = false, cloudService: "ec2" | "lightsail" = "ec2") {
+  const primary = await fixture("4", cloudService);
+  const backup = await fixture("4", cloudService);
   const d = primary.d, pool = primary.pools[0]!, endpoint = primary.endpoints[0]!;
   await d.update(db.endpointPools).set({ recoveryMode, switchCooldownSeconds: 0 }).where(eq(db.endpointPools.id, pool.id));
   await d.update(db.cloudAccounts).set({ ownerUserId: primary.account.ownerUserId }).where(eq(db.cloudAccounts.id, backup.account.id));
@@ -147,6 +147,54 @@ it("reconciles retained static IPv4 while IPv6 remains managed by a cloud slot",
   expect(f.remote.get("zone-0:A")?.content).toBe("192.0.2.99");
   expect(f.remote.get("zone-0:AAAA")?.content).toBe("2001:db8::10");
 });
+
+it.each([false, true])("reverifies a retained Lightsail address after termination for assignment-pool failover (force=%s)", async force => {
+  const f = await poolFixture("automatic", true, false, "lightsail");
+  await f.reconcileDns();
+  await f.d.update(db.endpointPools).set({ strategy: "assignment_pool", selectionMode: "ordered" }).where(eq(db.endpointPools.id, f.pool.id));
+  await f.d.insert(db.rotationPolicies).values({ slotId: f.backup.slot.id, enabled: true });
+  const [incident] = await f.d.insert(db.rotationIncidents).values({
+    ownerUserId: f.account.ownerUserId, slotId: f.backup.slot.id, family: "4", trigger: "manual", phase: "cleanup",
+    currentSegmentId: randomUUID(), sourceEventId: randomUUID(), authorizationRevision: 1, policyRevision: 1, addressVersion: 1,
+    physicalKey: JSON.stringify(["aws", f.backup.account.externalAccountId, "lightsail", "us-east-1", f.backup.instance.externalId]),
+  }).returning();
+  const [original] = await f.d.update(db.rotationPublications).set({ incidentId: incident!.id, status: "applied" })
+    .where(eq(db.rotationPublications.slotId, f.backup.slot.id)).returning();
+  await f.d.transaction(tx => db.terminateRotationIncident(tx, incident!.id, f.account.ownerUserId));
+  await f.d.update(db.cloudAddresses).set({ inventoryPresent: false }).where(eq(db.cloudAddresses.id, f.address.id));
+  const oldWrites = f.writes.length;
+
+  // A new rebalance must not enqueue updates referencing the fenced publication,
+  // even when the cached endpoint address still appears healthy or force is set.
+  await (f.reconcile as unknown as { process(job: unknown): Promise<void> }).process({ data: {
+    poolId: f.pool.id, eventId: randomUUID(), trigger: "configuration", source: "user", force, policyRevision: f.pool.policyRevision,
+  } });
+  await f.reconcileDns();
+  expect(f.writes).toHaveLength(oldWrites);
+  const poolOperations = await f.d.select().from(db.operations).where(eq(db.operations.resourceId, f.pool.id));
+  expect(poolOperations.filter(operation => operation.status === "failed")).toHaveLength(0);
+
+  await f.service.recover();
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.backup.slot.id)))[0]).toMatchObject({
+    currentVersion: 1, candidateVersion: 2, candidateAddressId: f.backup.address.id,
+  });
+  expect((await f.d.select().from(db.addressHealthStates).where(eq(db.addressHealthStates.slotId, f.backup.slot.id)))[0]).toMatchObject({ healthState: "unknown" });
+  await f.service.recover();
+  expect(f.writes).toHaveLength(oldWrites);
+  expect((await f.d.select().from(db.managedAddressSlots).where(eq(db.managedAddressSlots.id, f.backup.slot.id)))[0]!.candidateVersion).toBe(2);
+
+  await f.round(f.backup.policy.id, "success", 2);
+  await f.service.recover();
+  await f.reconcileDns();
+  expect(f.remote.get("zone-0:A")?.content).toBe("192.0.2.20");
+  expect(f.remote.get("zone-1:A")?.content).toBe("192.0.2.20");
+  expect(f.remote.get("zone-0:AAAA")?.content).toBe("2001:db8::10");
+  expect((await f.d.select().from(db.rotationPublications).where(eq(db.rotationPublications.id, original!.id)))[0]).toMatchObject({ errorCode: "manual_terminated", addressVersion: 1 });
+  expect((await f.d.select().from(db.rotationPublications).where(and(eq(db.rotationPublications.slotId, f.backup.slot.id), eq(db.rotationPublications.addressVersion, 2))))[0]).toMatchObject({ status: "applied", incidentId: null });
+  expect((await f.d.select().from(db.rotationIncidents).where(eq(db.rotationIncidents.id, incident!.id)))[0]).toMatchObject({ status: "complete", errorCode: "manual_terminated" });
+  expect((await f.d.select().from(db.rotationPolicies).where(eq(db.rotationPolicies.slotId, f.backup.slot.id)))[0]!.enabled).toBe(false);
+});
+
 it.each(["normal", "force", "binding override"])("excludes a historical cloud address from assignment-pool failover with %s selection", async mode => {
   const f = await poolFixture();
   await f.d.update(db.endpointPools).set({ strategy: "assignment_pool", selectionMode: "ordered" }).where(eq(db.endpointPools.id, f.pool.id));

@@ -91,6 +91,8 @@ pnpm lint
 - 无效 Record ID 返回统一 `not_found`。
 - 非法 IPv4 在本地校验阶段被拒绝，不发送厂商请求。
 - 重复或冲突记录得到稳定 `conflict/validation_failed` 分类。
+- Cloudflare 更新的 HTTP 400/422 保留数字错误码、嵌套错误链及已知出错字段；任意消息、未知字段、请求头不进入可见详情，畸形或过长响应不改变分类、不导致诊断崩溃。变更历史打开详情后必须显示已存的 `errorDetail`，可区分本地云发布校验和厂商拒绝；使用 `pnpm --filter @masterdns/providers test` 与 `pnpm --filter @masterdns/web test` 验证。
+- 使用隔离 PostgreSQL/Redis 执行 Worker 的 `src/rotation/cloud-pool-failover.test.ts`：Lightsail 当前地址行仍存在但发布被手动终止时，普通/force 分配不得生成引用旧发布的失败更新；后台推进新候选版本，旧证据不能完成发布，复测成功后两个 DNS Provider 的 A 记录接管、AAAA 不变，旧任务与旧发布继续终止。
 - 模拟 SDK 超时后先读取远端再决定重试。
 - 模拟 429 并验证遵守等待时间；不主动消耗真实账号配额制造限流。
 - 使用权限不足的 Fake Credential 验证账号进入需处理状态；不修改真实 Token 权限来测试。

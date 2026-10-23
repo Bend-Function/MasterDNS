@@ -176,6 +176,7 @@ sequenceDiagram
 - `ReconcileProcessor` 使用 Pool 的 PostgreSQL advisory transaction lock，检查策略/决策版本，并调用无网络副作用的 `evaluateStrategy`。
 - `OperationProcessor` 通过 Operation 幂等键、步骤状态、Redis 租约和 DNS Zone 锁控制重复与并发写入；过期任务可被 supersede。
 - 操作可能 partial：已成功步骤与失败步骤分别保存，恢复不能简单地从第一步重放。
+- 步骤失败写入 `errorCode` 和 `errorDetail`，变更历史详情页同时呈现两者。`validation_failed` 同时用于本地发布前置校验和 DNS 厂商参数拒绝，不能只据该分类判断错误来源。Cloudflare HTTP 400/422 的详情保留状态、数字错误码及白名单请求字段（含嵌套错误链），不保存任意厂商消息、响应正文或请求头；诊断信息有数量、深度和 512 字符上限。
 - 同步器更新 DNS 清单并处理受管记录漂移；它与写入路径共享 Zone 锁规则。
 
 数据库与厂商之间没有分布式事务。系统采用持久意图、幂等、防并发和远端读回验证来逐步收敛；不能承诺任意云/DNS 请求具有全局 exactly-once 语义。
@@ -237,6 +238,8 @@ Lightsail 释放优先核对原静态 IP：NotFound 可确认已释放，不受�
 ### 7.5 DNS 发布和旧资源清理
 
 云端换址成功、DNS 发布成功和旧资源清理成功是三个独立结果。Publication 按 Slot/addressVersion 记录子 Pool 决策及 Operation，避免把 DNS 部分成功当作整体完成。清理还要检查授权、资源归属、引用及缓存宽限期。
+
+手动终止后，已应用的 Publication 也可能带有 `manual_terminated`，而对应 `endpoint_addresses` 仍保留 current 行。Reconcile 将这种当前版本排除在新 DNS 决策外，force 和绑定健康覆盖也不能重新授权旧发布。Publication 恢复扫描同时处理地址行缺失和当前版本发布已终止的情况：在无未完成 Incident、无候选地址时，为保留地址推进新的 candidateVersion，重置 Slot 健康证据。新版本必须重新达到外部成功阈值并通过云端只读清单核对，才能建立无 Incident 的独立 Publication 和新 Pool 决策。旧 Publication、终止任务、资源保留状态及手动关闭的轮换开关不改写；未决云步骤仍阻止实际发布。不会复活未发布候选或复用旧版本健康证据。
 
 Linode `instance_swap` 通过同区域临时实例交换 IPv4，保留生产实例和磁盘；临时实例的身份证据保存在步骤回执及资源快照中。终止或失败不代表临时资源已经删除。确认删除后，系统按回执中的账号、区域、实例 ID、名称和创建时间清理无业务引用的临时实例库存；后续成功同步也会补清历史残留，并拒绝旧扫描重建同一临时实例。实例已被管理或有业务/操作引用时保留关联，换址步骤与审计历史不随库存清理删除。默认 `additional_ipv4` 路径仍存在，两种策略均受能力与授权限制。
 

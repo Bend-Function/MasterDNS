@@ -22,7 +22,7 @@ afterAll(async () => {
     await admin.close();
   }
 });
-export async function fixture(family: "4" | "6" = "4") {
+export async function fixture(family: "4" | "6" = "4", cloudService: "ec2" | "lightsail" = "ec2") {
   const d = connection.db;
   const [owner] = await d.insert(db.users).values({ username: randomUUID(), passwordHash: "test" }).returning();
   const [account] = await d
@@ -37,12 +37,12 @@ export async function fixture(family: "4" | "6" = "4") {
       credentialTag: "tag",
     })
     .returning();
-  await d.insert(db.cloudScanScopes).values({ accountId: account!.id, service: "ec2", region: "us-east-1", generation: 1 });
+  await d.insert(db.cloudScanScopes).values({ accountId: account!.id, service: cloudService, region: "us-east-1", generation: 1 });
   const [instance] = await d
     .insert(db.cloudInstances)
     .values({
       accountId: account!.id,
-      service: "ec2",
+      service: cloudService,
       region: "us-east-1",
       externalId: `i-${randomUUID()}`,
       metadata: { present: true },
@@ -116,7 +116,7 @@ export async function fixture(family: "4" | "6" = "4") {
     await d.insert(db.cloudEndpointLinks).values({ endpointId: endpoint!.id, slotId: slot!.id, family });
   }
   const live = {
-    ref: { accountId: account!.id, service: "ec2" as const, region: "us-east-1", instanceId: instance!.externalId },
+    ref: { accountId: account!.id, service: cloudService, region: "us-east-1", instanceId: instance!.externalId },
     name: "test",
     state: "running",
     interfaces: [

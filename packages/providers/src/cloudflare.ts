@@ -189,7 +189,7 @@ export function mapCloudflareError(error: unknown): ProviderError {
     if (status === 403) return new ProviderError("Cloudflare permission denied", "permission_denied", "cloudflare", { cause: error });
     if (status === 404) return new ProviderError("Cloudflare resource not found", "not_found", "cloudflare", { cause: error });
     if (status === 409) return new ProviderError("Cloudflare record conflict", "conflict", "cloudflare", { cause: error });
-    if (status === 400 || status === 422) return new ProviderError("Cloudflare rejected the DNS record", "validation_failed", "cloudflare", { cause: error });
+    if (status === 400 || status === 422) return new ProviderError(cloudflareValidationDetail(error), "validation_failed", "cloudflare", { cause: error });
     if (status === 429) return new ProviderError("Cloudflare API rate limit exceeded", "rate_limited", "cloudflare", {
       cause: error,
       ...(Number.isFinite(retryAfterSeconds) ? { retryAfterMs: retryAfterSeconds * 1000 } : {}),
@@ -197,4 +197,25 @@ export function mapCloudflareError(error: unknown): ProviderError {
     if (status === undefined || status >= 500) return new ProviderError("Cloudflare API is temporarily unavailable", "transient_failure", "cloudflare", { cause: error });
   }
   return new ProviderError("Unexpected Cloudflare API error", "unknown_provider_error", "cloudflare", { cause: error });
+}
+
+function cloudflareValidationDetail(error: InstanceType<typeof Cloudflare.APIError>): string {
+  const details = new Set<string>();
+  // Provider messages may echo record values or credentials. Persist only
+  // numeric codes and known request field names, including nested errors.
+  const visit = (errors: unknown, depth: number) => {
+    if (!Array.isArray(errors) || depth > 4) return;
+    for (const value of errors.slice(0, 8)) {
+      if (details.size >= 8) break;
+      if (!value || typeof value !== "object") continue;
+      const entry = value as Record<string, unknown>;
+      const code = typeof entry.code === "number" && Number.isSafeInteger(entry.code) && entry.code >= 0 ? entry.code : undefined;
+      const source = entry.source && typeof entry.source === "object" ? entry.source as Record<string, unknown> : undefined;
+      const pointer = typeof source?.pointer === "string" && /^\/(?:type|name|content|ttl|priority|proxied|comment|tags(?:\/\d{1,4})?)$/.test(source.pointer) ? source.pointer : undefined;
+      if (code !== undefined || pointer) details.add([code !== undefined ? `code ${code}` : "", pointer ? `at ${pointer}` : ""].filter(Boolean).join(" "));
+      visit(entry.error_chain, depth + 1);
+    }
+  };
+  visit(error.errors, 0);
+  return `Cloudflare rejected the DNS record (HTTP ${error.status}${details.size ? `; ${[...details].join("; ")}` : ""})`.slice(0, 512);
 }

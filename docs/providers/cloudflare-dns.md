@@ -32,6 +32,19 @@ Token 需要具有目标账号的域名读取和 Zone 编辑权限。现有 Toke
 
 官方接口：[Create Zone](https://developers.cloudflare.com/api/resources/zones/methods/create/)、[List Zones](https://developers.cloudflare.com/api/resources/zones/methods/list/)。
 
+## DNS 更新失败排查
+
+`validation_failed` 是 MasterDNS 的统一分类，不是 Cloudflare 的具体错误码，也不表示节点健康检查一定失败。打开“变更历史”的操作详情，执行步骤会同时显示 `errorCode` 和已保存的 `errorDetail`：
+
+- `Cloudflare rejected the DNS record (HTTP ...; code ...; at /...)` 表示 Cloudflare 拒绝了请求。详情保留数字错误码和已知请求字段，包括 `error_chain` 中的嵌套错误；结合对应记录配置排查，不自动猜测或更改 TTL、代理开关或地址。
+- `Cloud publication identity is missing`、`Cloud publication is missing or superseded` 或 `Cloud publication authorization or address changed` 来自本地云发布校验。需检查当前地址、授权和发布版本，不能当作 Cloudflare 参数错误或通过跳过校验恢复。
+- 如果旧换址任务曾手动终止，当前地址仍存在而发布已作废，新版 Worker 会排除旧发布，并为该地址安排新版本健康复测；通过后生成新的 DNS 操作。无需重复执行引用旧发布的失败操作。其他本地发布校验失败仍需按具体详情检查。
+- 旧版 Worker 保存的 `Cloudflare rejected the DNS record` 未包含厂商代码，无法从历史记录恢复已经丢失的详情。升级后新执行的失败步骤才保存新增诊断；既有本地校验详情可直接展示。
+
+错误详情仅接受数值错误码及发送字段白名单，不透传任意厂商消息、DNS 值、请求头或完整 SDK 错误。嵌套解析和总长度受限，沿用现有 `operation_steps.error_detail`，不新增数据库迁移。Cloudflare 适配器的 DNS 参数与重试分类不变，云地址恢复仍需通过现有发布授权和健康校验。
+
+官方更新接口及响应结构：[Overwrite DNS Record](https://developers.cloudflare.com/api/resources/dns/subresources/records/methods/update/)。
+
 ## 本地验收
 
 ```sh

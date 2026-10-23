@@ -108,7 +108,18 @@ export class ReconcileProcessor implements OnModuleInit, OnModuleDestroy {
           .where(and(eq(domainBindings.poolId, pool.id), eq(healthCheckConfigs.enabled, true))),
       ]);
       const cloudTargets = await getCloudTargetsForSlots(tx, linkedSlots.map(link => link.slotId));
-      const addresses = storedAddresses.map(row => ({ ...row, endpoint_addresses: withPoolAddressAvailability(row.endpoint_addresses, linkedSlots, cloudTargets) }));
+      const terminatedPublications = linkedSlots.length ? await tx.select({ slotId: rotationPublications.slotId, addressVersion: rotationPublications.addressVersion })
+        .from(rotationPublications).where(and(inArray(rotationPublications.slotId, linkedSlots.map(link => link.slotId)), eq(rotationPublications.errorCode, "manual_terminated"))) : [];
+      const blockedAddresses = new Set(linkedSlots.filter(link => terminatedPublications.some(publication => publication.slotId === link.slotId
+        && publication.addressVersion === cloudContexts.get(link.slotId)?.slot.currentVersion)).map(link => `${link.endpointId}:${link.family}`));
+      const addresses = storedAddresses.map(row => {
+        const address = withPoolAddressAvailability(row.endpoint_addresses, linkedSlots, cloudTargets);
+        if (address.source === "cloud" && blockedAddresses.has(`${address.endpointId}:${address.family}`)) {
+          address.available = false;
+          address.healthState = "unknown";
+        }
+        return { ...row, endpoint_addresses: address };
+      });
       const deletingBindingIds = await getDeletingBindingIds(tx, poolBindings.map(binding => binding.id));
       const bindings = poolBindings.filter(binding => !deletingBindingIds.has(binding.id));
       const assignmentRows = assignments.map((row) => row.binding_assignments).filter(assignment => !deletingBindingIds.has(assignment.domainBindingId));

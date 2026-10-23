@@ -257,6 +257,8 @@ Pool 配置为默认值，Endpoint 配置覆盖 Pool，Domain Binding 配置覆�
 
 每个远端变更一条，包含 `operation_id`、顺序、`provider_account_id`、`zone_id`、目标记录、动作 create/update/delete、状态、尝试次数、下次重试时间、脱敏错误、远端请求 ID、远端验证快照。
 
+`error_code` 是统一分类，`error_detail` 保存最多 512 字符的安全诊断并在变更历史中展示。Cloudflare HTTP 400/422 仅增加状态、数字错误码和白名单字段，不保存完整厂商响应。发布记录作废后的恢复复用现有 Slot 候选版本和 Publication 表：保持旧版本及 `manual_terminated` 历史，重置健康证据后以更高 candidateVersion 复测，成功后创建新的独立发布记录；无需新增迁移。
+
 ### `failover_events`
 
 保存触发节点、受影响 Binding、策略决定、选择算法、候选集合、选择结果、健康证据、关联 Operation 和恢复事件。

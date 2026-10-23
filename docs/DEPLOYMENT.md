@@ -315,6 +315,8 @@ migration 只向前执行。若应用版本需要回退，应先确认旧版本�
 - 自动化没有切换：检查失败阈值、冷却时间、Pool 是否暂停，以及是否仍存在健康候选节点。
 - Probe 一直 unknown：检查 Agent 时间、在线状态、地址族能力、任务 deadline、有效票数和 private CIDR 策略；不要把 unknown 当作 failure。
 - DNS 部分发布：任务按持久恢复上限自动等待并仅重试失败步骤，成功记录保留；检查详情中的累计次数、下次处理和 Operation/Step。暂停或耗尽时不重投递；处理凭证/权限等原因后可显式恢复。无轮换事件的首次绑定发布沿用原有 Operation 恢复规则。
+- DNS 更新显示 `validation_failed`：打开“变更历史 → 操作详情 → 执行步骤”，读取错误码下方的失败详情。`Cloud publication ...` 是本地发布校验，`Cloudflare rejected ...` 是厂商拒绝；不能仅凭分类认定节点不可达。旧 Web 可通过已登录会话访问 `/api/v1/operations/<Operation ID>` 查看 `steps[].errorDetail`。Cloudflare 数字错误码需新版 Worker 执行后才能保存，旧历史不会回填；不要为收集信息反复重试未经确认的写入。具体边界见 [Cloudflare DNS 指南](providers/cloudflare-dns.md#dns-更新失败排查)。
+- 旧任务终止后出现 `Cloud publication is missing or superseded`：升级新版 Worker 后，当前地址对应的已终止发布会进入新版本复测，无需删除节点或反复重试旧 Operation。须有有效的外部健康策略、在线探针、当前云地址和管理授权；达到成功阈值后后台生成新发布/新 Operation。旧失败操作作为历史保留，应检查最新操作及绑定状态。新的活动或暂停任务、未决云步骤继续阻止冲突发布；新版不会重新启用被手动终止关闭的轮换开关。
 - cleanup 失败：Lightsail 先核对旧静态 IP 是否已删除；已删除则收尾，明确失败且原资源仍未附着则按默认最多 5 次恢复预算重试。无需终止后重新开自动轮换。持续 pending 会按云端等待窗口转为恢复等待，达到上限显示耗尽。核对授权、原 ARN、附着状态和资源详情中的具体原因；归属不明确时保留资源，见 [Lightsail 清理恢复](providers/aws-lightsail.md)。
 
 ## 云计算账号、地址绑定与轮换
